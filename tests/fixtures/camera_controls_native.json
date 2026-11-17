@@ -1,0 +1,24 @@
+{
+  "capture_parameters": {
+    "source": "Captured USB RX sequence45058, interface4, sender01 receiver0a, 02/EB",
+    "payload_hex": "00ff016142861a7117000000000000100000000000006f030000700001010000001c0000000000003f00000000000000001e80002d320000100000000000000000000100000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "mode_profile": {
+    "source": "CRC-valid captured USB RX sequence45059, 02/EB",
+    "payload_hex": "00ff016142c000070038",
+    "request_hex": "06ff0161420000010001000700"
+  },
+  "rejected_profile": {
+    "source": "Captured USB RX sequence45060, 02/E1 profile23",
+    "payload_hex": "e3"
+  },
+  "current_gets": {
+    "source": "Read-only hardware snapshot, USB sequences11548..11553",
+    "video_format": "006f03000070",
+    "exposure_mode": "000100",
+    "shutter": "df",
+    "iso": "0000",
+    "white_balance": "000014000000",
+    "color": "003f"
+  }
+}

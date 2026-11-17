@@ -1,0 +1,314 @@
+"""Retained-ECM core lifecycle fakes; no USB, sockets or camera commands."""
+
+import threading
+import types
+import unittest
+from unittest.mock import Mock
+
+from osmo360_camera import _stream_session as m
+from test_stream_session import Environment, Prepared
+from test_fast_sleep import Preview, IMU, SleepingPrepared
+
+
+class Retained(Prepared):
+    def __init__(self, env, **options):
+        super().__init__(env, **options)
+        self.sleep_id, self.wake_id = options["sleep_id"], options["wake_id"]
+        self.arm_attempted = False
+        self.arm_error = None
+        self.old_preview = options["preview"]
+
+    def prepare(self):
+        self.env.events.append("retained.prepare")
+        if self.env.control.last["state"] != "AWAKE":
+            raise AssertionError("Not AWAKE")
+        return self
+
+    def arm_watcher(self):
+        self.env.events.append("retained.arm")
+        if self.env.control.last["state"] != "SLEEP":
+            raise AssertionError("Not SLEEP")
+        self.arm_attempted = self.possible_future_apply = True
+        if self.arm_error:
+            raise self.arm_error
+        self.old_preview._lease.stop(close_camera=False)
+
+    def attach_data_first(self, **options):
+        preview, imu = super().attach_data_first(**options)
+        self.possible_future_apply = False
+        self.env.camera._usb_preview, self.env.camera._imu = preview, imu
+        return preview, imu
+
+
+class RetainedFactory:
+    def __init__(self, env):
+        self.env, self.created, self.staged = env, [], False
+
+    def preload_assets(self, camera, control, **options):
+        self.env.events.append("retained.preload")
+        if control.last["state"] != "AWAKE":
+            raise AssertionError("Staged while asleep")
+        self.staged = True
+        return dict(staged=True)
+
+    def __call__(self, camera, control, **options):
+        if not self.staged:
+            raise AssertionError("Retained cache missing")
+        value = Retained(self.env, **options)
+        self.created.append(value)
+        return value
+
+
+class RetainedSessionTests(unittest.TestCase):
+    def setup_session(self):
+        env = Environment()
+        previews, prepared = [], []
+
+        def preview(**options):
+            value = Preview(env)
+            value._lease.stop = Mock(
+                side_effect=lambda **kw: env.events.append("lease.local_stop")
+            )
+            previews.append(value)
+            env.camera._usb_preview = value
+            return value
+
+        def imu(**options):
+            value = IMU(env)
+            env.camera._imu = value
+            return value
+
+        env.camera.usb_preview, env.camera.imu = preview, imu
+        env.control.lock, env.control.clock = env.camera._control_lock, env.clock
+        env.control.bootstrap = types.SimpleNamespace(transport=env.camera._transport)
+        env.control.resolve_pending = lambda: env.events.append("resolve_pending")
+        env.control._submit = lambda action, proof: env.control._submit_sleep(proof)
+
+        def factory(camera, control, **options):
+            value = SleepingPrepared(env, **options)
+            prepared.append(value)
+            return value
+
+        retained = RetainedFactory(env)
+        session = m.USBStreamSession(
+            env.camera,
+            control=env.control,
+            prepared_factory=factory,
+            retained_factory=retained,
+            retain_ecm=True,
+            fast_sleep=True,
+            idle_probe=lambda camera: m._IdleEvidence(env.clock(), 0, 1, True),
+            clock=env.clock,
+            sleep=env.clock.sleep,
+        ).start()
+
+        def release():
+            for value in previews:
+                value.release.set()
+            if session._prepare_thread:
+                session._prepare_thread.join(3)
+
+        self.addCleanup(release)
+        return env, session, previews[0], retained, prepared
+
+    def test_retained_sleep_stops_producers_but_preserves_plan_lease_and_has_no_worker(
+        self,
+    ):
+        env, session, old, factory, prepared = self.setup_session()
+        session.sleep()
+        self.assertEqual(session.state, "SLEEP")
+        self.assertIs(session._preview, old)
+        self.assertIsNone(session._prepare_thread)
+        self.assertTrue(session._prepare_done.is_set())
+        self.assertFalse(session.report["preparing_wake"])
+        self.assertEqual(prepared, [])
+        self.assertNotIn("usb.full_stop", env.events)
+        old._lease.stop.assert_not_called()
+        self.assertNotIn("retained.arm", env.events)
+        self.assertLess(
+            env.events.index("retained.preload"), env.events.index("preview.start")
+        )
+        self.assertLess(
+            env.events.index("retained.prepare"), env.events.index("owner.sleep")
+        )
+        self.assertLess(
+            env.events.index("imu.stop"), env.events.index("video.local_stop")
+        )
+        self.assertLess(
+            env.events.index("video.local_stop"), env.events.index("owner.sleep")
+        )
+
+    def test_wake_arms_near_wake_before_one_input_then_returns_fresh_objects(self):
+        env, session, old, factory, _ = self.setup_session()
+        old_imu = session._imu
+        session.sleep()
+        env.clock.sleep(300)
+        self.assertNotIn("retained.arm", env.events)
+        session.wake(timeout=5)
+        self.assertEqual(env.events.count("owner.wake"), 1)
+        self.assertLess(
+            env.events.index("retained.arm"), env.events.index("owner.wake")
+        )
+        self.assertLess(
+            env.events.index("lease.local_stop"), env.events.index("owner.wake")
+        )
+        old._lease.stop.assert_called_once_with(close_camera=False)
+        self.assertIsNot(session._preview, old)
+        self.assertIsNot(session._imu, old_imu)
+        self.assertTrue(session._prepared.report["media_ready_proven"])
+        self.assertGreater(session.read_video().timestamp_ns, 300_000_000_000)
+        self.assertGreater(session.read_imu().timestamp_ns, 300_000_000_000)
+
+    def test_stable_sleep_close_prepares_schema_one_ready_without_holding_core_lock_while_joining(
+        self,
+    ):
+        env, session, old, factory, prepared = self.setup_session()
+        session.sleep()
+        backend = session._prepared
+        callback_lock = []
+
+        def publish(candidate, floor, **options):
+            acquired = session._lock.acquire(blocking=False)
+            callback_lock.append(acquired)
+            if acquired:
+                session._lock.release()
+            env.events.append("publish.READY")
+            return dict(schema=1)
+
+        session._prepare_ready_callback = publish
+        errors = []
+        finished = threading.Event()
+
+        def close():
+            try:
+                session.close()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=close)
+        thread.start()
+        self.assertTrue(old.entered.wait(1))
+        self.assertFalse(finished.wait(0.02))
+        acquired = session._lock.acquire(timeout=0.2)
+        self.assertTrue(acquired)
+        if acquired:
+            session._lock.release()
+        old.release.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(callback_lock, [True])
+        self.assertEqual(session.state, "DETACHED")
+        self.assertIsNone(session._retained_backend)
+        self.assertIs(session._prepared, prepared[0])
+        self.assertIsNot(session._prepared, backend)
+        self.assertLess(
+            env.events.index("usb.full_stop"), env.events.index("prepared.after_sleep")
+        )
+        self.assertLess(
+            env.events.index("publish.READY"), env.events.index("owner.detach")
+        )
+        self.assertNotIn("owner.wake", env.events)
+        self.assertNotIn("owner.finalize", env.events)
+
+    def test_unknown_arm_cannot_trigger_normal_close_or_full_preparation(self):
+        env, session, old, factory, prepared = self.setup_session()
+        session.sleep()
+        factory.created[0].arm_error = OSError("lost helper launch reply")
+        with self.assertRaises(OSError):
+            session.wake(timeout=5)
+        with self.assertRaises(m.StreamSessionError):
+            session.close()
+        self.assertTrue(session.owns_camera_resources)
+        self.assertFalse(session.cleanup_safe)
+        self.assertEqual(prepared, [])
+        self.assertNotIn("usb.full_stop", env.events)
+        self.assertNotIn("owner.wake", env.events)
+        self.assertNotIn("owner.detach", env.events)
+        self.assertNotIn("owner.finalize", env.events)
+
+    def test_next_accepted_sleep_failure_retires_previous_warm_cleanup_proof(self):
+        env, session, old, factory, prepared = self.setup_session()
+        session.sleep()
+        session.wake(timeout=5)
+        previous = session._retained_backend
+        self.assertTrue(previous.lease_proven)
+        previous.stop = Mock(
+            side_effect=AssertionError("Old cleanup proof must not be reused")
+        )
+        # Keep the second awake generation faithful to the real local-worker ABI.
+        current_preview, current_imu = Preview(env), IMU(env)
+        current_preview._lease.stop = Mock()
+        session._preview = env.camera._usb_preview = previous.preview = current_preview
+        session._imu = env.camera._imu = previous.imu = current_imu
+        env.present = True  # Fresh awake Datalink registered its own APP again.
+        self.addCleanup(current_preview.release.set)
+        wait = env.control.wait
+
+        def wait_lost(identifier, target, **options):
+            if target == "SLEEP":
+                env.control.pending_command = identifier
+                raise TimeoutError("Accepted next Sleep status is unreadable")
+            return wait(identifier, target, **options)
+
+        env.control.wait = wait_lost
+        with self.assertRaises(TimeoutError):
+            session.sleep()
+        current = factory.created[-1]
+        self.assertIs(session._prepared, current)
+        self.assertIs(session._retained_backend, current)
+        self.assertIsNot(current, previous)
+        self.assertFalse(current.lease_proven)
+        self.assertEqual(current.sleep_id, "0000000000000003")
+        with self.assertRaises(m.StreamSessionError):
+            session.close()
+        previous.stop.assert_not_called()
+        current_preview._lease.stop.assert_not_called()
+        self.assertNotIn("usb.full_stop", env.events)
+        self.assertEqual(prepared, [])
+        self.assertEqual(env.events.count("owner.sleep"), 2)
+        self.assertEqual(env.events.count("owner.wake"), 1)
+        self.assertNotIn("owner.detach", env.events)
+        self.assertNotIn("owner.finalize", env.events)
+
+    def test_classic_resumed_core_stages_retained_cache_while_awake_before_next_sleep(
+        self,
+    ):
+        env, session, old, factory, _ = self.setup_session()
+        # A restored schema1 READY core enters AWAKE through wake(), not start().
+        # Its new retained factory therefore has no preloaded assets yet.
+        factory.staged = False
+        env.events.clear()
+        session.sleep()
+        self.assertTrue(factory.staged)
+        self.assertLess(
+            env.events.index("retained.preload"), env.events.index("retained.prepare")
+        )
+        self.assertLess(
+            env.events.index("retained.prepare"), env.events.index("owner.sleep")
+        )
+
+    def test_retained_flags_reject_invalid_combinations_before_any_device_work(self):
+        env = Environment()
+        for fast, retain, factory in (
+            (False, True, lambda: None),
+            (True, 1, lambda: None),
+            (True, True, None),
+        ):
+            with self.subTest(fast=fast, retain=retain), self.assertRaises(ValueError):
+                m.USBStreamSession(
+                    env.camera,
+                    control=env.control,
+                    prepared_factory=env.prepared_factory,
+                    idle_probe=lambda camera: None,
+                    fast_sleep=fast,
+                    retain_ecm=retain,
+                    retained_factory=factory,
+                )
+        self.assertEqual(env.events, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,33 @@
+{
+  "provenance": "Captured firmware25.29 USB replies, readonly GetVersion PC0A00, SM=TM7FE",
+  "frames": [
+    {
+      "hex": "55010e3400160001ee02b0fe070100fe070a0000124f513030310000000000000000000000010000001456080007000000001f24",
+      "source": 256,
+      "target": 2560,
+      "sequence": 45058,
+      "source_machine": 2046,
+      "target_machine": 2046,
+      "command_set": 0,
+      "command": 1,
+      "is_reply": true,
+      "ack_type": 2,
+      "ttl": 29,
+      "payload_hex": "00124f51303031000000000000000000000001000000145608000700000000"
+    },
+    {
+      "hex": "55010e3400160001f603b0fe070801fe070a0000124f51313031204143205665722e286e001d19000a1d19000a010000c0008a80",
+      "source": 2049,
+      "target": 2560,
+      "sequence": 45059,
+      "source_machine": 2046,
+      "target_machine": 2046,
+      "command_set": 0,
+      "command": 1,
+      "is_reply": true,
+      "ack_type": 2,
+      "ttl": 30,
+      "payload_hex": "00124f51313031204143205665722e286e001d19000a1d19000a010000c000"
+    }
+  ]
+}

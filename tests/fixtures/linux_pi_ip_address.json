@@ -1,0 +1,176 @@
+{
+  "ipv4_only": {
+    "argv": [
+      "ip",
+      "-j",
+      "-4",
+      "address",
+      "show"
+    ],
+    "code": 0,
+    "rows": [
+      {
+        "ifindex": 1,
+        "ifname": "lo",
+        "flags": [
+          "LOOPBACK",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 65536,
+        "qdisc": "noqueue",
+        "operstate": "UNKNOWN",
+        "group": "default",
+        "txqlen": 1000,
+        "addr_info": [
+          {
+            "family": "inet",
+            "local": "127.0.0.1",
+            "prefixlen": 8,
+            "scope": "host",
+            "label": "lo",
+            "valid_life_time": 4294967295,
+            "preferred_life_time": 4294967295
+          }
+        ]
+      },
+      {
+        "ifindex": 3,
+        "ifname": "wlan0",
+        "flags": [
+          "BROADCAST",
+          "MULTICAST",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 1500,
+        "qdisc": "fq_codel",
+        "operstate": "UP",
+        "group": "default",
+        "txqlen": 1000,
+        "addr_info": [
+          {
+            "family": "inet",
+            "local": "192.0.2.133",
+            "prefixlen": 24,
+            "metric": 600,
+            "broadcast": "192.0.2.255",
+            "scope": "global",
+            "dynamic": true,
+            "label": "wlan0",
+            "valid_life_time": 23990,
+            "preferred_life_time": 23990
+          }
+        ]
+      }
+    ]
+  },
+  "all_families": {
+    "argv": [
+      "ip",
+      "-j",
+      "address",
+      "show"
+    ],
+    "code": 0,
+    "rows": [
+      {
+        "ifindex": 1,
+        "ifname": "lo",
+        "flags": [
+          "LOOPBACK",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 65536,
+        "qdisc": "noqueue",
+        "operstate": "UNKNOWN",
+        "group": "default",
+        "txqlen": 1000,
+        "link_type": "loopback",
+        "address": "00:00:00:00:00:00",
+        "broadcast": "00:00:00:00:00:00",
+        "addr_info": [
+          {
+            "family": "inet",
+            "local": "127.0.0.1",
+            "prefixlen": 8,
+            "scope": "host",
+            "label": "lo",
+            "valid_life_time": 4294967295,
+            "preferred_life_time": 4294967295
+          },
+          {
+            "family": "inet6",
+            "local": "::1",
+            "prefixlen": 128,
+            "scope": "host",
+            "noprefixroute": true,
+            "valid_life_time": 4294967295,
+            "preferred_life_time": 4294967295
+          }
+        ]
+      },
+      {
+        "ifindex": 2,
+        "ifname": "eth0",
+        "flags": [
+          "NO-CARRIER",
+          "BROADCAST",
+          "MULTICAST",
+          "UP"
+        ],
+        "mtu": 1500,
+        "qdisc": "fq_codel",
+        "operstate": "DOWN",
+        "group": "default",
+        "txqlen": 1000,
+        "link_type": "ether",
+        "address": "02:11:22:33:44:50",
+        "broadcast": "ff:ff:ff:ff:ff:ff",
+        "addr_info": []
+      },
+      {
+        "ifindex": 3,
+        "ifname": "wlan0",
+        "flags": [
+          "BROADCAST",
+          "MULTICAST",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 1500,
+        "qdisc": "fq_codel",
+        "operstate": "UP",
+        "group": "default",
+        "txqlen": 1000,
+        "link_type": "ether",
+        "address": "02:11:22:33:44:51",
+        "broadcast": "ff:ff:ff:ff:ff:ff",
+        "addr_info": [
+          {
+            "family": "inet",
+            "local": "192.0.2.133",
+            "prefixlen": 24,
+            "metric": 600,
+            "broadcast": "192.0.2.255",
+            "scope": "global",
+            "dynamic": true,
+            "label": "wlan0",
+            "valid_life_time": 23990,
+            "preferred_life_time": 23990
+          },
+          {
+            "family": "inet6",
+            "local": "fe80::11:22ff:fe33:4451",
+            "prefixlen": 64,
+            "scope": "link",
+            "valid_life_time": 4294967295,
+            "preferred_life_time": 4294967295
+          }
+        ]
+      }
+    ]
+  },
+  "source": "Actual Ubuntu 24.04 Raspberry Pi iproute2 output; MAC/IP values anonymized, shape retained."
+}

@@ -1,0 +1,10 @@
+datalink.py, nal.py, protocol.py and util.py copied from MIT osmo-client
+commit96cff353fb2ea582ed2e9835b183a82aeecf430b.
+Existing vendor/duml.py is byte-identical to this commit.
+See LICENSE.osmo-client. Local changes: Datalink.stop closes its UDP socket
+to interrupt a pending handshake during wrapper shutdown; optional explicit
+source/interface binding applies to both TCP poke and UDP. Darwin IP_BOUND_IF
+fallback25 verified against local Apple SDK netinet/in.h:432. Linux uses the
+Python SO_BINDTODEVICE constant with no permission fallback. Linux USB streaming
+and explicit interface binding were hardware-tested on Raspberry Pi 5.
+preview_metadata.py is the project-owned decoder for native preview SEI metadata.

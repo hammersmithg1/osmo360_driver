@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Linux USB networking needs root. Do not run this alongside rover's
+       camera node: that node already owns the same camera and topics. -->
+  <arg name="enabled" default="false"/>
+  <node pkg="osmo360_driver" exec="osmo360" name="osmo360" output="screen"
+        sigterm_timeout="120" sigkill_timeout="30">
+    <param name="enabled" value="$(var enabled)"/>
+  </node>
+</launch>

@@ -1,0 +1,7 @@
+DUML codec from https://github.com/luisreysan/osmo-client
+Pinned commit 96cff353fb2ea582ed2e9835b183a82aeecf430b.
+MIT license: LICENSE.osmo-client.
+
+Local adaptations include USB interface binding, controlled socket shutdown,
+and Python logging in place of console output. Unused desktop-app utilities
+are omitted. preview_metadata.py is project-owned protocol parsing code.
