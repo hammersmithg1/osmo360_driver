@@ -132,6 +132,39 @@ class DeviceInstallerTests(unittest.TestCase):
         self.assertFalse(m.ROOT.exists())
         self.assertTrue(m.remove("cccccccccccc")["removed"])
 
+    def test_explicit_removal_accepts_previous_profile_and_preserves_running_ram(self):
+        current_request, current_packed, current_manifest = self.request, self.packed, self.manifest
+        previous = dict(self.files, **{"retained_sleep_060.py": b"# previous immutable helper\n"})
+        pins = {name: m.sha(data) for name, data in previous.items()}
+        core = dict(schema=1, installer_sha256=m.sha(self.source), files={
+            name: dict(size=len(data), sha256=m.sha(data)) for name, data in previous.items()
+        })
+        self.manifest = dict(core, profile=m.sha(m.canonical(core)))
+        plain = m.canonical(dict(schema=1, files={name: data.decode("ascii") for name, data in previous.items()}))
+        self.packed = zlib.compress(plain, 9)
+        self.request = dict(self.manifest, autostart=True, packed=dict(
+            bytes=len(self.packed), sha256=m.sha(self.packed),
+            plain_bytes=len(plain), plain_sha256=m.sha(plain),
+        ))
+        self.write_bootstrap()
+        # Model the old installer's own immutable allowlist, then run current removal.
+        with patch.object(m, "FILES", pins):
+            self.assertTrue(self.install()["installed"])
+        owner = self.ram / "osmo-usb-standby-aaaaaaaaaaaa"
+        owner.mkdir(mode=0o700)
+        (owner / "role.txt").write_bytes(b"peripheral\n")
+        (owner / "status.json").write_bytes(b'{"state":"AWAKE"}\n')
+        snapshot = {path.name: path.read_bytes() for path in owner.iterdir()}
+        removed = m.remove("bbbbbbbbbbbb")
+        self.assertTrue(removed["reboot_required"])
+        self.assertEqual({path.name: path.read_bytes() for path in owner.iterdir()}, snapshot)
+        self.assertEqual(self.hook.read_bytes(), self.original)
+        self.assertFalse(m.ROOT.exists())
+        self.request, self.packed, self.manifest = current_request, current_packed, current_manifest
+        self.write_bootstrap()
+        self.assertEqual(self.install()["profile"], current_manifest["profile"])
+        self.assertEqual({path.name: path.read_bytes() for path in owner.iterdir()}, snapshot)
+
     def test_absent_status_and_foreign_root(self):
         self.assertFalse(m.status()["installed"])
         m.ROOT.mkdir(mode=0o700)

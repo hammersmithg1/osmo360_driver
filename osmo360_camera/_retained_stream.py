@@ -27,7 +27,7 @@ from ._prepared_stream import (
     upload,
     SOURCES as BASE_SOURCES,
 )
-from ._preview_lease import PreviewLease
+from ._preview_lease import PreviewLease, PreviewLeaseError
 from ._usb_bundle import NAMES
 from ._usb_bootstrap import BootstrapError
 from . import _linux_network
@@ -40,7 +40,7 @@ from .vendor.util import bind_socket
 
 HELPER = "retained_sleep_060.py"
 # The camera source is installed only after its independent source/HW review.
-HELPER_SHA = "126bc7ea2606f9e5160fec35466414393a420065a9a45de7c10c269df2877960"
+HELPER_SHA = "323527c16a9094ad90152e30d1e284a3297f450a7cbe8abdf91dab7ca083dde9"
 SOURCES = dict(BASE_SOURCES, **{HELPER: HELPER_SHA})
 Q = shlex.quote
 QUERY = struct.Struct("!8s16sQ")
@@ -344,6 +344,8 @@ class RetainedStream:
         self.attach_attempted = self.imu_started = self.abandoned = False
         self.possible_future_apply = self.lease_proven = False
         self.sequence = None
+        self._provisional_lease = None
+        self._provisional_row = None
         self.report = dict(retained_ecm=True, errors=[], native_restored=False)
 
     def prepare(self):
@@ -447,17 +449,69 @@ class RetainedStream:
             )
             return self
 
+    def _stop_provisional(self):
+        """Retire liveness only; unknown native work never permits CLOSE."""
+        lease = self._provisional_lease
+        if lease is None:
+            return
+        try:
+            lease.stop(close_camera=False)
+        except Exception as error:
+            if self._provisional_row is not None:
+                self._provisional_row["stop_error"] = repr(error)
+            raise
+        else:
+            if self._provisional_row is not None:
+                self._provisional_row["stopped_locally"] = True
+                self._provisional_row["stopped_host_monotonic_ns"] = time.monotonic_ns()
+        finally:
+            self.sequence = max(self.sequence, lease._sequence)
+            if self._provisional_row is not None:
+                self._provisional_row.update(
+                    last_sent_sequence=lease._sequence,
+                    last_ack=deepcopy(lease.last_ack),
+                )
+        self._provisional_lease = self._provisional_row = None
+
+    def _start_provisional(self, ready, remaining):
+        """Preserve our existing RAM plan while the final receipt is pending.
+
+        A trusted host NIC authorizes only original-nonce lease DATA here.
+        It does not prove the final reset, permit media/DIAG, or release any
+        controller quarantine or native transition guard.
+        """
+        config = dict(self.plan["lease"], interface=ready["ncm_interface"])
+        lease = self._provisional_lease = self.lease_factory(config)
+        lease._sequence = self.sequence
+        row = self._provisional_row = dict(
+            interface=ready["ncm_interface"],
+            ifindex=self.network.identity.ifindex,
+            started_host_monotonic_ns=time.monotonic_ns(),
+            first_sent_after=self.sequence,
+            completion_proven=False,
+        )
+        self.report.setdefault("lease_handoff", []).append(row)
+        lease.start(timeout=min(3, remaining()))
+        if (not lease.healthy or not lease.last_ack
+                or lease.last_ack["sequence"] <= self.sequence):
+            raise PreparedStreamError("Provisional original-nonce lease ACK required")
+        row["first_ack"] = deepcopy(lease.last_ack)
+        row["first_ack_host_monotonic_ns"] = time.monotonic_ns()
+        remaining()
+
     def _completion(self, remaining):
         ticket = completion_ticket(
             self.manifest["lease_nonce"], self.nonce, self.wake_id
         )
         sock = None
         generations = 0
+        completed = False
         try:
             while True:
                 remaining()
                 absent, _ = self.network._old_index_absent(self.network.identity)
                 if absent:
+                    self._stop_provisional()
                     if sock is not None:
                         sock.close()
                         sock = None
@@ -475,6 +529,13 @@ class RetainedStream:
                     self.report.setdefault("network_generations", []).append(
                         deepcopy(ready)
                     )
+                    try:
+                        self._start_provisional(ready, remaining)
+                    except (OSError, PreviewLeaseError):
+                        if self.network._old_index_absent(self.network.identity)[0]:
+                            self._stop_provisional()
+                            continue
+                        raise
                     sock = self.socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
                     bind_socket(
                         sock, self.plan["lease"]["host_ip"], ready["ncm_interface"]
@@ -524,10 +585,16 @@ class RetainedStream:
                     completion=value, completion_verified=True, generations=generations
                 )
                 ready["owned_session_static"] = True
+                completed = True
                 return ready
         finally:
             if sock is not None:
                 sock.close()
+            if not completed:
+                try:
+                    self._stop_provisional()
+                except Exception as error:
+                    self.report["provisional_stop_error"] = repr(error)
 
     def attach_data_first(self, *, timeout=45, native_floor_ns, wake_host_ns):
         if not self.possible_future_apply or self.attach_attempted or self.closed:
@@ -561,19 +628,25 @@ class RetainedStream:
                 self.plan,
                 self.baseline,
             )
-            config = dict(self.plan["lease"], interface=ready["ncm_interface"])
-            lease = fresh._lease = self.lease_factory(config)
-            lease._sequence = self.sequence
-            lease.start(timeout=min(3, remaining()))
-            if (
-                not lease.healthy
-                or not lease.last_ack
-                or lease.last_ack["sequence"] <= self.sequence
-            ):
-                raise PreparedStreamError(
-                    "Fresh original nonce/next-sequence lease ACK required"
+            lease = self._provisional_lease
+            if lease is None:
+                raise PreparedStreamError("Final generation has no owned provisional lease")
+            fresh._lease = lease
+            before = lease._sequence
+            ack = lease.renew()
+            if (not lease.healthy or not ack or ack["sequence"] <= before
+                    or self.network._old_index_absent(self.network.identity)[0]):
+                raise PreparedStreamError("Fresh final-generation lease ACK required")
+            if self._provisional_row is not None:
+                self._provisional_row.update(
+                    completion_proven=True, adopted_ack=deepcopy(ack),
+                    adopted_host_monotonic_ns=time.monotonic_ns(),
                 )
+            # This exact completed plan plus a new ACK permits normal cleanup,
+            # even if the host budget expires immediately after the proof.
             self.lease_proven, self.possible_future_apply = True, False
+            config = dict(self.plan["lease"], interface=ready["ncm_interface"])
+            self._provisional_lease = self._provisional_row = None
             self.report["lease_ack"] = deepcopy(lease.last_ack)
             # A late ACK still proves the original plan for normal cleanup.
             remaining()
@@ -608,6 +681,12 @@ class RetainedStream:
             )
             return fresh, self.imu
         except BaseException as error:
+            try:
+                self._stop_provisional()
+            except Exception as cleanup:
+                self.report["provisional_stop_error"] = repr(cleanup)
+                if hasattr(error, "add_note"):
+                    error.add_note("Provisional local stop: " + repr(cleanup))
             self.report["errors"].append(repr(error))
             if not self.lease_proven:
                 self.report["recovery_required"] = True

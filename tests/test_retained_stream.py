@@ -71,6 +71,12 @@ class Lease:
         self.last_ack, self.healthy = dict(sequence=self._sequence, state=1), True
         return self
 
+    def renew(self):
+        self.events.append("lease.RENEW_ACK")
+        self._sequence += 1
+        self.last_ack = dict(sequence=self._sequence, state=1)
+        return self.last_ack
+
     def stop(self, *, close_camera=True):
         self.events.append("lease.CLOSE" if close_camera else "lease.local_stop")
         self.healthy = False
@@ -251,7 +257,7 @@ class RetainedTests(unittest.TestCase):
                 duplicate.encode(), manifest=value.manifest, ticket=ticket, challenge=42
             )
 
-    def test_two_generations_can_provision_only_network_until_final_udp_and_lease_ack(
+    def test_two_generations_preserve_only_liveness_until_final_udp_and_fresh_ack(
         self,
     ):
         value = self.armed()
@@ -275,9 +281,13 @@ class RetainedTests(unittest.TestCase):
 
             def recvfrom(self, limit):
                 if self.generation == 1:
+                    # Carry the last SENT sequence, including a heartbeat whose
+                    # ACK was lost with the disappearing USB generation.
+                    value._provisional_lease._sequence += 1
                     middle.gone = True
                     raise socket.timeout()
-                test.assertNotIn("lease.ACK", test.events)
+                test.assertEqual(test.events.count("lease.ACK"), 2)
+                test.assertFalse(value.lease_proven)
                 test.assertNotIn("video_start", test.events)
                 test.assertNotIn("imu_start", test.events)
                 return self.raw, (
@@ -299,7 +309,7 @@ class RetainedTests(unittest.TestCase):
         ):
             preview, imu = value.attach_data_first(native_floor_ns=1, wake_host_ns=2)
         self.assertEqual(binding.call_count, 2)
-        self.assertEqual(preview._lease.last_ack["sequence"], 45)
+        self.assertEqual(preview._lease.last_ack["sequence"], 48)
         self.assertEqual(preview._plan["work_dir"], self.old._plan["work_dir"])
         self.assertTrue(value.lease_proven)
         self.assertFalse(value.possible_future_apply)
@@ -309,41 +319,174 @@ class RetainedTests(unittest.TestCase):
         self.assertEqual(imu.options["read_buffer_bytes"], 65536)
         self.assertTrue(all(sock.closed for sock in sockets))
         self.assertLess(
-            self.events.index("network.original_state"), self.events.index("lease.ACK")
+            self.events.index("network.original_state"), self.events.index("lease.RENEW_ACK")
         )
         self.assertLess(
-            self.events.index("lease.ACK"), self.events.index("video_start")
+            self.events.index("lease.RENEW_ACK"), self.events.index("video_start")
         )
+        self.assertEqual(self.events.count("lease.local_stop"), 1)
+        self.assertNotIn("lease.CLOSE", self.events)
+        self.assertEqual([row["first_sent_after"] for row in value.report["lease_handoff"]], [44, 46])
+        self.assertTrue(value.report["lease_handoff"][0]["stopped_locally"])
+        self.assertTrue(value.report["lease_handoff"][1]["completion_proven"])
         self.assertFalse(
             any("apply.sh" in command for command in self.control.commands)
         )
 
-    def test_no_completion_never_starts_new_lease_video_or_diag_or_normal_rollback(
+    def test_no_completion_stops_provisional_locally_without_media_input_or_rollback(
         self,
     ):
         value = self.armed()
-        value._completion = Mock(side_effect=TimeoutError("no final receipt"))
-        with self.assertRaises(m.UnknownFutureApply):
-            value.attach_data_first(native_floor_ns=1, wake_host_ns=2)
-        self.assertNotIn("lease.ACK", self.events)
+        final = Network(self.events, 1)
+        self.network.next = final
+        commands = list(self.control.commands)
+        self.control.pending_task, self.control._unknown_task = 7, True
+        test = self
+
+        class Sock:
+            def settimeout(self, timeout):
+                pass
+
+            def sendto(self, raw, peer):
+                pass
+
+            def recvfrom(self, limit):
+                test.clock.sleep(0.2)
+                raise socket.timeout()
+
+            def close(self):
+                pass
+
+        value.socket_factory = lambda *args: Sock()
+        with patch.object(m, "bind_socket"), self.assertRaises(m.UnknownFutureApply):
+            value.attach_data_first(timeout=1, native_floor_ns=1, wake_host_ns=2)
+        self.assertIn("lease.ACK", self.events)
+        self.assertIn("lease.local_stop", self.events)
+        self.assertNotIn("lease.CLOSE", self.events)
         self.assertNotIn("video_start", self.events)
         self.assertNotIn("imu_start", self.events)
+        self.assertFalse(value.lease_proven)
+        self.assertTrue(value.possible_future_apply)
+        self.assertIsNone(value._provisional_lease)
+        self.assertEqual(self.control.commands, commands)
+        self.assertEqual(self.control.pending_task, 7)
+        self.assertTrue(self.control._unknown_task)
         with self.assertRaises(m.UnknownFutureApply):
             value.stop()
         self.assertIs(self.camera._usb_preview, self.old)
 
+    def test_stalled_completion_survives_old_lease_expiry_without_starting_media(self):
+        value = self.armed()
+        final = Network(self.events, 1)
+        test = self
+
+        def rebind(**options):
+            test.clock.sleep(4)
+            return final, final.report['ready']
+
+        self.network.rebind_after_usb_reset = rebind
+        leases = []
+
+        class TimedLease(Lease):
+            def start(self, **options):
+                super().start(**options)
+                self.last_ack.update(camera_monotonic=test.clock(), expires=test.clock() + 10)
+                return self
+
+            def renew(self):
+                result = super().renew()
+                result.update(camera_monotonic=test.clock(), expires=test.clock() + 10)
+                return result
+
+        def create(config):
+            lease = TimedLease(self.events, config)
+            leases.append(lease)
+            return lease
+
+        value.lease_factory = create
+
+        class Sock:
+            def settimeout(self, timeout):
+                pass
+
+            def sendto(self, raw, peer):
+                _, ticket, challenge = m.QUERY.unpack(raw)
+                reply = test.receipt(value, ticket, challenge)
+                reply.update(now=test.clock(), lease_expires=leases[-1].last_ack['expires'])
+                self.raw = json.dumps(reply).encode()
+
+            def recvfrom(self, limit):
+                test.assertFalse(value.lease_proven)
+                test.assertNotIn('video_start', test.events)
+                test.assertNotIn('imu_start', test.events)
+                test.assertLess(test.clock(), leases[-1].last_ack['expires'])
+                if test.clock() < 12:
+                    test.clock.sleep(1)
+                    # Simulate the ordinary one-second heartbeat worker while
+                    # final native proof is deliberately withheld past t10.
+                    leases[-1].renew()
+                    raise socket.timeout()
+                return self.raw, (test.plan['lease']['camera_ip'], value.manifest['completion_port'])
+
+            def close(self):
+                pass
+
+        value.socket_factory = lambda *args: Sock()
+        with patch.object(m, 'bind_socket'), patch.object(
+            m._linux_network, 'evaluate', return_value=dict(ok=True, ncm_interface='usb1')
+        ):
+            preview, imu = value.attach_data_first(timeout=20, native_floor_ns=1, wake_host_ns=2)
+        self.assertGreater(self.clock(), 10)
+        self.assertEqual(len(leases), 1)
+        self.assertIs(preview._lease, leases[0])
+        self.assertTrue(value.lease_proven)
+        self.assertFalse(value.possible_future_apply)
+        self.assertEqual(leases[0].last_ack, value.report['lease_handoff'][0]['adopted_ack'])
+        self.assertNotIn('lease.CLOSE', self.events)
+        self.assertFalse(value.imu_started)
+
+    def test_final_completion_without_fresh_ack_keeps_unknown_guard_and_never_closes_plan(self):
+        value = self.armed()
+        value.network = Network(self.events, 1)
+        commands = list(self.control.commands)
+
+        def completion(remaining):
+            ready = dict(ok=True, ncm_interface='usb1')
+            value._start_provisional(ready, remaining)
+            value._provisional_lease.renew = Mock(side_effect=TimeoutError('final ACK lost'))
+            return ready
+
+        value._completion = completion
+        with self.assertRaises(m.UnknownFutureApply):
+            value.attach_data_first(native_floor_ns=1, wake_host_ns=2)
+        self.assertFalse(value.lease_proven)
+        self.assertTrue(value.possible_future_apply)
+        self.assertEqual(self.control.commands, commands)
+        self.assertIs(self.camera._usb_preview, self.old)
+        self.assertNotIn('video_start', self.events)
+        self.assertNotIn('imu_start', self.events)
+        self.assertNotIn('lease.CLOSE', self.events)
+        self.assertIn('lease.local_stop', self.events)
+
     def test_late_fresh_ack_still_allows_original_plan_cleanup_without_reapply(self):
         value = self.armed()
-        value._completion = Mock(return_value=dict(ok=True, ncm_interface="usb1"))
+        value.network = Network(self.events, 1)
+
+        def completion(remaining):
+            ready = dict(ok=True, ncm_interface="usb1")
+            value._start_provisional(ready, remaining)
+            return ready
+
+        value._completion = completion
         value.lease_factory = lambda config: Lease(self.events, config)
-        original = Lease.start
+        original = Lease.renew
 
         def late(lease, **options):
             result = original(lease, **options)
             self.clock.now = 2.0
             return result
 
-        with patch.object(Lease, "start", late):
+        with patch.object(Lease, "renew", late):
             with self.assertRaises(TimeoutError):
                 value.attach_data_first(timeout=1, native_floor_ns=1, wake_host_ns=2)
         self.assertTrue(value.lease_proven)

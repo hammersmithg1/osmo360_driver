@@ -120,6 +120,20 @@ class LeaseACKTests(unittest.TestCase):
         self.assertEqual(lease.stats["acknowledged"], 1)
         self.assertTrue(lease.healthy)
 
+    def test_explicit_fresh_renew_reuses_active_socket_and_refuses_closed_owner(self):
+        lease, sock, _ = self.exchange([ack(), ack()])
+        with self.assertRaises(lease_module.PreviewLeaseError):
+            lease.renew()
+        self.assertEqual(sock.sent, [])
+        lease._started = True
+        first, second = lease.renew(), lease.renew()
+        self.assertEqual((first['sequence'], second['sequence']), (1, 2))
+        self.assertTrue(all(lease_module.REQUEST.unpack(data)[-1] == 0 for data, _ in sock.sent))
+        lease.stop(close_camera=False)
+        self.assertEqual(len(sock.sent), 2)
+        with self.assertRaises(lease_module.PreviewLeaseError):
+            lease.renew()
+
     def test_wrong_peer_length_magic_nonce_sequence_and_state_are_ignored(self):
         invalid = [
             ack(source=("192.168.1.1", 55000)),

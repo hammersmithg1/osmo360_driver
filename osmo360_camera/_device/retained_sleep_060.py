@@ -445,12 +445,8 @@ def spawn(work, mode):
 
 
 def publish_done(work, cfg, b, done):
-    if (done.get('nonce') != cfg['nonce'] or done.get('terminal') is not True
-            or done.get('reset_attempted') != 1 or time.monotonic() >= done['lease_expires']
-            or (Path(cfg['lease_work']) / 'lease.closed').exists()
-            or any(done.get('closed', {}).get(name, {}).get('closed_verified_ebadf') is not True
-                   for name in ('alarm90', 'alarm240'))):
-        raise ValueError('Final fresh DONE and both closed RTCs required')
+    state, now = completion_live_lease(cfg, b, done)
+    completion_terminal(cfg, done, now)
     output = Path('/blackbox/export_tmp/osmo_rebind_' + cfg['nonce'] + '.json')
     b.private(output.parent, directory=True)
     b.write_new(output, done)  # Fresh exclusive diagnostic; never update/replay.
@@ -476,7 +472,7 @@ def completion_terminal(cfg, done, now, *, closed=True):
             or done.get('reset_attempted') != 1 or done.get('standby_owner') != cfg['standby_owner']
             or done.get('sys_service') != cfg['sys_service'] or done.get('wake_command_id') != cfg['wake_command_id']
             or any(done.get(key) is not True for key in ('unbind_completed', 'bind_completed', 'same_six_links', 'lease_fresh'))
-            or not finite(done.get('lease_expires')) or now >= done['lease_expires']
+            or not finite(done.get('lease_expires'))
             or done['original_udc_identity'] != done['pre']['udc_identity']
             or done['active_udc_identity'][0] != done['original_udc_identity'][0]
             or done['active_udc_identity'] != done['post']['udc_identity']
@@ -504,34 +500,73 @@ def completion_reply(cfg, done, raw, peer, state, now):
 
 
 def completion_lease(cfg, done, state, now):
-    if (state.get('nonce') != cfg['lease_nonce'] or state.get('state') != 'active'
+    if (type(state) is not dict or not finite(now)
+            or state.get('nonce') != cfg['lease_nonce'] or state.get('state') != 'active'
             or type(state.get('seq')) is not int or state['seq'] < done['lease_sequence']
             or not finite(state.get('expires')) or not finite(state.get('updated'))
             or not now < state['expires'] <= state['updated'] + 10.000001 or state['updated'] > now + .5):
         raise ValueError('Current owned unclosed lease and final DONE required')
 
 
+def completion_live_lease(cfg, b, done):
+    """Read current liveness; immutable DONE only records the reset-time lease."""
+    lease = Path(cfg['lease_work'])
+    if (lease / 'lease.closed').exists():
+        raise ValueError('Completion lease was closed')
+    state = b.read_json(lease / 'lease.state')
+    now = time.monotonic()
+    completion_lease(cfg, done, state, now)
+    if (lease / 'lease.closed').exists():
+        raise ValueError('Completion lease closed during read')
+    return state, now
+
+
+def completion_deadline(cfg, guard, now):
+    """The original90s arm budget is never renewed by heartbeats or queries."""
+    if (type(guard) is not dict or guard.get('nonce') != cfg['nonce']
+            or not token(guard.get('owner')) or not finite(now)
+            or not finite(guard.get('deadline_boottime'))):
+        raise ValueError('Original correlated completion guard required')
+    deadline = guard['deadline_boottime']
+    if now >= deadline:
+        raise TimeoutError('Original completion guard deadline expired')
+    if deadline - now > 90.000001:
+        raise ValueError('Completion budget exceeds the original90s guard')
+    return deadline
+
+
+def completion_guard(work, cfg):
+    fd = os.open(work / 'guard.json', os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        raw = stream.read(MAX_JSON + 1)
+    if len(raw) > MAX_JSON:
+        raise ValueError('Bounded original completion guard required')
+    guard = json.loads(raw)
+    completion_deadline(cfg, guard, boot())
+    return guard
+
+
 def completion_server(work, cfg):
     """Finite UDP reader only: no UDC, key, power or lease-writing path."""
+    guard = completion_guard(work, cfg)
+    deadline = completion_deadline(cfg, guard, boot())
     def expired(*args): raise TimeoutError('Finite completion responder alarm')
     previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, 10)
-    try: return _completion_server(work, cfg)
+    signal.setitimer(signal.ITIMER_REAL, max(.001, deadline - boot()))
+    try: return _completion_server(work, cfg, guard=guard)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
 
 
-def _completion_server(work, cfg):
+def _completion_server(work, cfg, *, guard=None):
     observer, owner, base = modules(work, cfg); b = observer.base
     done = b.read_json(work / 'result.json')
     if cfg['completion_port'] is None: raise ValueError('Completion responder was not requested')
-    started = boot()
-    lease = Path(cfg['lease_work'])
+    guard = completion_guard(work, cfg) if guard is None else guard
+    deadline = completion_deadline(cfg, guard, boot())
     def current():
-        now = time.monotonic()
-        if boot() >= started + 10 or now >= done['lease_expires'] or (lease / 'lease.closed').exists():
-            raise TimeoutError('Finite completion responder expired')
+        completion_deadline(cfg, guard, boot())
         if not base.alive(cfg['standby_owner']) or not base.alive(cfg['sys_service']):
             raise ValueError('Original owner/system exited')
         post = done['post']; net = Path('/sys/class/net') / post['ifname']
@@ -539,11 +574,8 @@ def _completion_server(work, cfg):
                 or int(attribute(net / 'ifindex')) != post['ifindex']
                 or ipv4(post['ifname']) != cfg['camera_ip'] + '/30'):
             raise ValueError('Completion responder USB identity changed')
-        state = b.read_json(lease / 'lease.state')
-        now = time.monotonic()
-        if boot() >= started + 10 or now >= done['lease_expires']:
-            raise TimeoutError('Finite completion responder expired during read')
-        completion_lease(cfg, done, state, now)
+        state, now = completion_live_lease(cfg, b, done)
+        completion_deadline(cfg, guard, boot())
         return state, now
     state, now = current()
     completion_terminal(cfg, done, now, closed=False)
@@ -560,9 +592,9 @@ def _completion_server(work, cfg):
         done = final
         state, now = current()
         completion_terminal(cfg, done, now)
-        for _ in range(200):
+        while True:
             state, now = current()
-            sock.settimeout(max(.001, min(.1, started + 10 - boot(), done['lease_expires'] - now)))
+            sock.settimeout(max(.001, min(.1, deadline - boot(), state['expires'] - now)))
             try: raw, peer = sock.recvfrom(65)
             except socket.timeout: continue
             state, now = current()
@@ -597,9 +629,10 @@ def supervise(work, cfg):
                 result = b.read_json(work / 'result.json')
                 if (result.get('nonce') != cfg['nonce'] or result.get('terminal') is not True or result.get('reset_attempted') != 1
                         or result.get('worker', {}).get('pid') != child.pid or not finite(result.get('completed_boottime'))
-                        or result['completed_boottime'] >= deadline or boot() >= deadline
-                        or not finite(result.get('lease_expires')) or time.monotonic() >= result['lease_expires']):
+                        or result['completed_boottime'] >= deadline or boot() >= deadline):
                     raise ValueError('Late/unowned terminal result')
+                completion_terminal(cfg, result, time.monotonic(), closed=False)
+                completion_live_lease(cfg, b, result)
                 if cfg['completion_port'] is not None:
                     if responder is None:
                         responder_deadline = boot() + 1
@@ -614,6 +647,7 @@ def supervise(work, cfg):
                             or ready.get('port') != cfg['completion_port'] or ready.get('ifname') != result['post']['ifname']):
                         raise ValueError('Owned completion responder readiness required')
                 if select.select([short.fd, hard.fd], [], [], 0)[0]: raise TimeoutError('RTC already expired')
+                completion_live_lease(cfg, b, result)
                 closed = dict(alarm90=short.cancel())
                 if boot() >= deadline: raise TimeoutError('Late guard cancellation')
                 closed['alarm240'] = hard.cancel()

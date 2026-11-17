@@ -123,6 +123,12 @@ class PreviewLease:
             except (OSError, PreviewLeaseError) as error:
                 self.error = str(error)
 
+    def renew(self):
+        """Obtain one fresh data-only ACK on this existing owned socket."""
+        if not self._started or self._stop.is_set() or self._socket is None:
+            raise PreviewLeaseError("Renew requires an active owned lease")
+        return self._exchange()
+
     def stop(self, *, close_camera=True):
         """Stop owned IMU/video before this call: close triggers USB rebind."""
         self._stop.set()

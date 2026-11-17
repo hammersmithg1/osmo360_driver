@@ -96,7 +96,14 @@ class VideoFirstTests(unittest.TestCase):
         fixture.setUp()
         value = fixture.armed()
         value.__class__ = retained.RetainedStream
-        value._completion = Mock(return_value=dict(ok=True, ncm_interface="usb1"))
+        value.network = retained_fixtures.Network(fixture.events, 1)
+
+        def completion(remaining):
+            ready = dict(ok=True, ncm_interface="usb1")
+            value._start_provisional(ready, remaining)
+            return ready
+
+        value._completion = completion
         preview, imu = value.attach_data_first(native_floor_ns=1, wake_host_ns=2)
         self.assertIn("video_start", fixture.events)
         self.assertNotIn("imu_start", fixture.events)

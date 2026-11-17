@@ -35,7 +35,7 @@ FILES = {
     'gui_qs_exit_forward_probe.py': '9db827623c2e7f9767fc8a52ba5dfc601a768fafdbc1687666b1cbe7cf26e959',
     'prepared_preview_wake_047.py': '246c4e253c07c675f4992b6b4ec494fda3c2d973ad7ad91801134203e569d3a5',
     'prepared_preview_wake_045.py': '33c8a2a1af90fe94dd7c93b58d4f15234b5c5dc0f35e088420c16c1118a654fc',
-    'retained_sleep_060.py': '126bc7ea2606f9e5160fec35466414393a420065a9a45de7c10c269df2877960',
+    'retained_sleep_060.py': '323527c16a9094ad90152e30d1e284a3297f450a7cbe8abdf91dab7ca083dde9',
 }
 GROUPS = {'owner': tuple(FILES)[:2], 'prepared': tuple(FILES)[2:4],
           'retained': tuple(FILES)[2:]}
@@ -442,7 +442,7 @@ def stage(profile, group, destination, boot_id):
     patterns = {
         'owner': re.escape(str(RAM)) + r'/osmo-usb-standby-[0-9a-f]{12}',
         'prepared': re.escape(str(RAM)) + r'/osmo-prepared-assets-[0-9a-f]{12}',
-        'retained': re.escape(str(RAM)) + r'/osmo-usb-standby-[0-9a-f]{12}/retained-assets-126bc7ea2606',
+        'retained': re.escape(str(RAM)) + r'/osmo-usb-standby-[0-9a-f]{12}/retained-assets-323527c16a90',
     }
     if not re.fullmatch(patterns[group], str(destination)):
         raise ValueError('Exact existing RAM destination required')
