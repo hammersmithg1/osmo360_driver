@@ -317,7 +317,8 @@ class Datalink:
         self.stopped = threading.Event()
         self.ready = threading.Event()        # handshake done and live view requested: send() works
         self.last_video = 0.0                 # monotonic() of the last video packet
-        self.stats = {"packets": 0, "video_packets": 0, "video_bytes": 0}
+        self.stats = {"packets": 0, "video_packets": 0, "video_bytes": 0,
+                      "truncated_pictures": 0, "keyframes": 0}
         self.kinds: Counter = Counter()       # packets received, by type
         self.replies: dict[tuple[int, int, int], str] = {}   # (cmd set, cmd id, sender) -> reply payload
         self._session = random.randrange(0x1000, 0xFFFE)
@@ -665,6 +666,7 @@ class Datalink:
                 packet, _ = self._sock.recvfrom(65535)
             except socket.timeout:
                 frames.finish_if_idle(time.perf_counter())
+                self._update_video_stats()
                 continue
             except OSError:
                 break
@@ -682,6 +684,7 @@ class Datalink:
                 self.stats["video_packets"] += 1
                 self.stats["video_bytes"] += len(packet) - VIDEO_HEADER_SIZE
                 frames.add(seq, packet[GROUP_OFFSET], packet[VIDEO_HEADER_SIZE:], now)
+                self._update_video_stats()
                 continue
             if kind == Packet.LINK and len(packet) >= 34:
                 # Until video flows (or while it is stalled), acknowledge the video cursor the camera
@@ -704,7 +707,16 @@ class Datalink:
                 if self.on_message:
                     self.on_message(message)
 
+    def _update_video_stats(self) -> None:
+        if self.frames is not None:
+            # This existing assembler counter counts incomplete/dropped pictures,
+            # not the number of lost UDP packets. Preserve that distinction.
+            self.stats.update(truncated_pictures=self.frames.truncated,
+                              keyframes=self.frames.keyframes)
+
     def _deliver_video(self, data: bytes, first_packet: float) -> None:
+        # Include the current partial-AU loss in callback diagnostics as well.
+        self._update_video_stats()
         if self.on_video:
             self.on_video(data, first_packet)
 

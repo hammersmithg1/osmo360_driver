@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import socket
+import struct
 import threading
 from types import SimpleNamespace
 from unittest import TestCase, mock, skipUnless
@@ -13,6 +14,7 @@ from unittest import TestCase, mock, skipUnless
 from osmo360_camera.video import VideoStream, VideoStreamError, _decoder_bytes
 from osmo360_camera.vendor.preview_metadata import records_from_video
 from osmo360_camera.vendor import datalink, util
+from test_preview_metadata import sei
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,6 +192,54 @@ class VideoTests(TestCase):
                 self.assertEqual(frame.raw_h264, raw)
                 self.assertEqual(stream.stats["metadata_errors"], 0)
                 self.assertEqual(stream.stats["missing_timestamps"], 0)
+
+    def test_missing_clock_evidence_distinguishes_absent_sei_and_explicit_zero_clock(self):
+        picture = b'\0\0\1\x41\x12\x34'
+        body = bytearray(68)
+        struct.pack_into('<II', body, 12, 1, 100)
+        zero = sei(struct.pack('<HHBI', 12, 5 + len(body), 1, 0) + body) + picture
+        codec = FakeCodec()
+        stream = VideoStream(queue_size=2)
+        stream._started = True  # Isolate inbound processing; no network thread.
+        stream._decoder, stream._av = codec, SimpleNamespace(Packet=FakePacket)
+        stream._link = SimpleNamespace(stats={'truncated_pictures': 1, 'video_packets': 20})
+        stream._on_video(picture, 0.0)
+        stream._on_video(zero, 0.0)
+        first, second = stream.read(0), stream.read(0)
+        self.assertIsNone(first.timestamp_ns)
+        self.assertIsNone(second.timestamp_ns)
+        self.assertEqual((first.raw_h264, second.raw_h264), (picture, zero))
+        self.assertEqual(len(codec.inputs), 2)
+        stats = stream.stats
+        self.assertEqual(stats['metadata_errors'], 0)
+        self.assertEqual(stats['missing_timestamps'], 2)
+        missing = stats['missing_timestamp']
+        self.assertEqual(missing['reason'], 'frame_clock_unavailable')
+        self.assertEqual(missing['nal_types'], [6, 1])
+        self.assertEqual(missing['access_unit_sha256'], hashlib.sha256(zero).hexdigest())
+        self.assertFalse(missing['metadata_records'][0]['frame_clock_available'])
+        self.assertEqual(missing['network']['truncated_pictures'], 1)
+        self.assertGreater(missing['received_monotonic_ns'], 0)
+        self.assertEqual(stats['first_missing_timestamp']['reason'], 'no_f5_sei')
+        missing['metadata_records'][0]['raw_tlv_hex'] = 'caller mutation'
+        self.assertNotEqual(stream.stats['missing_timestamp']['metadata_records'][0]['raw_tlv_hex'], 'caller mutation')
+
+    def test_unknown_motion_version_diagnostic_is_bounded_without_inventing_clock(self):
+        body = b'\x55' * 12000
+        raw = sei(struct.pack('<HHBI', 12, 5 + len(body), 2, len(body)) + body)
+        stream = VideoStream(decode=False)
+        stream._started = True  # Isolate inbound processing; no network thread.
+        stream._on_video(raw, 0.0)
+        self.assertIsNone(stream.read(0).timestamp_ns)
+        diagnostic = stream.stats['missing_timestamp']
+        self.assertEqual(diagnostic['reason'], 'unsupported_motion_version')
+        entry = diagnostic['f5_sei'][0]
+        self.assertTrue(entry['truncated'])
+        self.assertLessEqual(len(entry['nal_hex']), 16384)
+        self.assertEqual(entry['nal_sha256'], hashlib.sha256(raw[4:]).hexdigest())
+        self.assertTrue(diagnostic['metadata_records'][0]['raw_tlv_truncated'])
+        self.assertLessEqual(len(diagnostic['metadata_records'][0]['raw_tlv_hex']), 8192)
+        self.assertEqual(stream.stats['metadata_errors'], 0)
 
     def test_calibration_survives_raw_queue_eviction_and_caller_mutation(self):
         last = b"\0\0\0\1" + bytes.fromhex(FIXTURE["current"][-1]["nal_hex"])
@@ -492,6 +542,20 @@ class VideoTests(TestCase):
 
 
 class ExplicitBindingTests(TestCase):
+    def test_partial_assembled_picture_exposes_loss_before_video_callback(self):
+        # Exercise the actual assembler's loss path without opening a socket.
+        link = datalink.Datalink.__new__(datalink.Datalink)
+        link.stats = {}
+        snapshots = []
+        link.on_video = lambda raw, first: snapshots.append(dict(link.stats))
+        link.frames = datalink._FrameAssembler(link._deliver_video)
+        link.frames._synced = True
+        link.frames._data.extend(b'\0\0\1\x41\x12\x34')
+        with mock.patch.object(datalink, 'log'):
+            link.frames.finish(short=True)
+        self.assertEqual(snapshots, [{'truncated_pictures': 1, 'keyframes': 0}])
+        self.assertEqual(link.stats['truncated_pictures'], link.frames.truncated)
+
     def test_darwin_interface_option_precedes_explicit_source_bind(self):
         sock = mock.Mock()
         with (

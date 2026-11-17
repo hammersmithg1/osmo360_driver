@@ -2,6 +2,7 @@
 
 from collections import Counter
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -90,8 +91,10 @@ class RosTopicsTests(unittest.TestCase):
         topics = self.OsmoTopics(self.node, sink=sink, has_sink_consumers=lambda: False)
         for stamp in range(8000):
             topics.imu(object(), stamp)  # No sample fields are needed without consumers.
-        topics.video(object(), b'jpeg', 8001)
+        topics.video(self.frame, b'jpeg', 8001)
+        topics.video_unstamped(SimpleNamespace(timestamp_ns=None), b'jpeg', 8002)
         self.assertEqual(self.created, {})
+        self.assertEqual(topics.sequence, 2)
         sink.assert_not_called()
         self.assertTrue(all(p.queries == 1 for p in self.node.publishers.values()))
 
@@ -157,6 +160,60 @@ class RosTopicsTests(unittest.TestCase):
         active[0] = True
         topics.imu(self.sample, 1000)
         self.assertEqual(order, ['sink', 'dds', 'sink'])
+
+    def test_unstamped_au_keeps_original_h264_chain_but_cannot_enter_slam_images(self):
+        saved = []
+        topics = self.OsmoTopics(self.node, sink=lambda *args: saved.append(args))
+        for publisher in self.node.publishers.values():
+            publisher.count = 1
+        topics.refresh_subscribers()
+        # Distinct Annex-B units represent an IDR followed by two dependent
+        # pictures. Dropping the middle unit because SEI time is missing would
+        # also remove bytes required to decode subsequent pictures.
+        access_units = [b'\0\0\0\1\x65IDR', b'\0\0\0\1\x41P1', b'\0\0\0\1\x41P2']
+        frames = [SimpleNamespace(raw_h264=raw, timestamp_ns=native,
+                                 host_receive_monotonic_ns=received, metadata={'sequence': index})
+                  for index, (raw, native, received) in enumerate(zip(
+                      access_units, [100, None, 180], [1000, 1040, 1080]))]
+        topics.video(frames[0], b'jpeg0', 10_100)
+        topics.video_unstamped(frames[1], b'jpeg1', 10_140)
+        topics.video(frames[2], b'jpeg2', 10_180)
+        archived = {topic: [(message, stamp) for _, name, message, stamp in saved if name == topic]
+                    for topic in self.node.publishers}
+        for records in (archived['/osmo360/video/h264'],
+                        [(message, None) for message in self.node.publishers['/osmo360/video/h264'].messages]):
+            self.assertEqual([message.data for message, _ in records], access_units)
+            self.assertEqual(b''.join(message.data for message, _ in records), b''.join(access_units))
+        self.assertEqual([stamp for _, stamp in archived['/osmo360/video/h264']], [10_100, 10_140, 10_180])
+        for messages in ([message for message, _ in archived['/osmo360/image/compressed']],
+                         self.node.publishers['/osmo360/image/compressed'].messages):
+            self.assertEqual([message.data for message in messages], [b'jpeg0', b'jpeg2'])
+        expected_timing = [[10_100, 100, 1000, 0, 1], [10_140, 0, 1040, 1, 0], [10_180, 180, 1080, 2, 1]]
+        self.assertEqual([message.data for message, _ in archived['/osmo360/video/timing']], expected_timing)
+        self.assertEqual([message.data for message in self.node.publishers['/osmo360/video/timing'].messages], expected_timing)
+        metadata = [json.loads(message.data) for message, _ in archived['/osmo360/video/metadata']]
+        self.assertEqual([value['sequence'] for value in metadata], [0, 1, 2])
+        self.assertEqual([value['_rover_timing'] for value in metadata], [
+            {'valid_native': True, 'stamp_source': 'camera_native'},
+            {'valid_native': False, 'stamp_source': 'host_receive'},
+            {'valid_native': True, 'stamp_source': 'camera_native'},
+        ])
+        self.assertTrue(all('_rover_timing' not in frame.metadata for frame in frames))
+        self.assertEqual(topics.sequence, 3)
+
+    def test_unstamped_frame_creates_no_slam_message_even_with_slam_only_subscriber(self):
+        topics = self.OsmoTopics(self.node)
+        publisher = self.node.publishers['/osmo360/image/compressed']
+        publisher.count = 1
+        topics.refresh_subscribers()
+        frame = SimpleNamespace(timestamp_ns=None)
+        topics.video_unstamped(frame, b'jpeg', 1000)
+        self.assertEqual(self.created, {})
+        self.assertEqual(publisher.messages, [])
+        self.assertEqual(topics.sequence, 1)
+        with self.assertRaisesRegex(ValueError, 'video_unstamped'):
+            topics.video(frame, b'jpeg', 1000)
+        self.assertEqual(publisher.messages, [])
 
 
 if __name__ == '__main__':

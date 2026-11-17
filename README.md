@@ -252,13 +252,25 @@ an unknown pending camera operation. Restarting the Pi is not required.
 | `/osmo360/image/compressed` | `sensor_msgs/CompressedImage`, dual-fisheye JPEG, quality 92 |
 | `/osmo360/video/h264` | `sensor_msgs/CompressedImage`, custom `format=h264`, original Annex-B AU |
 | `/osmo360/imu` | `sensor_msgs/Imu`, native SSC axes, rad/s and m/s², all received samples |
-| `/osmo360/video/timing` | `std_msgs/UInt64MultiArray`: `[ros_ns, native_ns, host_receive_monotonic_ns, sequence]` |
+| `/osmo360/video/timing` | `std_msgs/UInt64MultiArray`: `[ros_ns, native_ns, host_receive_monotonic_ns, sequence, valid_native]` |
 | `/osmo360/imu/timing` | `std_msgs/UInt64MultiArray`: `[ros_ns, native_ns, host_receive_monotonic_ns, native_ticks, accel_status, gyro_status]` |
 | `/osmo360/video/metadata` | `std_msgs/String`, original metadata JSON; bytes encoded as `{encoding: hex, data: ...}` |
 | `/osmo360/status` | `std_msgs/String`, state, actual settings, queue counters, calibration and clock epoch |
 
 Standard compressed-image consumers should use the JPEG topic. The `h264` topic
 is an original-video archive channel; it needs an H.264 decoder, not compressed_image_transport.
+
+SDK video frames can lack native timestamps after missing/unsupported SEI.
+These pictures remain visible in the live preview, and their original H.264 AUs
+stay in the same archive stream so subsequent P-frames retain their references.
+Their archive stamp is the actual host receive time, `valid_native=0`,
+`native_ns=0` (unavailable), and video metadata explicitly records
+`_rover_timing={valid_native:false, stamp_source:"host_receive"}`. Such frames
+are omitted from the synchronized JPEG topic. Normal frames use the shared
+camera clock and `valid_native=1` / `stamp_source:"camera_native"`. IMU and the
+clock mapping keep running; arrival time never replaces an unknown exposure
+time in the SLAM image stream. `timestamp_missing_frames` and SDK bounded SEI
+diagnostics expose these quality events; they do not claim lossless transport.
 Frame IDs: `osmo360_dual_fisheye` and `osmo360_imu_native`. Orientation is absent
 (`orientation_covariance[0] = -1`), gyro/accel covariances unknown (zero).
 No uncalibrated body TF, CameraInfo or fused quaternion is invented.

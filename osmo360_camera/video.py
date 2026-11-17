@@ -92,6 +92,46 @@ def _metadata_diagnostic(raw, error):
     return result
 
 
+def _missing_timestamp_diagnostic(raw, records, received):
+    """Bounded metadata evidence; no image slices or guessed camera clocks."""
+    result = dict(
+        received_monotonic_ns=received, access_unit_bytes=len(raw),
+        access_unit_sha256=hashlib.sha256(raw).hexdigest(),
+        nal_types=[], f5_sei=[], metadata_records=[],
+    )
+    for offset, nal in nals(raw):
+        if len(result['nal_types']) == 64:
+            result['nal_scan_truncated'] = True
+            break
+        if not nal:
+            continue
+        kind = nal[0] & 31
+        result['nal_types'].append(kind)
+        if kind == 6 and len(nal) > 1 and nal[1] == 245:
+            if len(result['f5_sei']) == 2:
+                result['f5_scan_truncated'] = True
+                continue
+            result['f5_sei'].append(dict(
+                nal_offset=offset, nal_bytes=len(nal),
+                nal_sha256=hashlib.sha256(nal).hexdigest(),
+                nal_hex=nal[:8192].hex(), truncated=len(nal) > 8192,
+            ))
+    fields = ('motion_version', 'motion_declared_body_length', 'motion_body_length',
+              'motion_decode_error', 'frame_clock_available', 'header_hex')
+    for record in records[:4]:
+        entry = {key: record[key] for key in fields if key in record}
+        raw_tlv = record.get('raw_tlv_hex', '')
+        entry.update(raw_tlv_hex=raw_tlv[:8192], raw_tlv_truncated=len(raw_tlv) > 8192)
+        result['metadata_records'].append(entry)
+    if len(records) > 4:
+        result['metadata_records_truncated'] = True
+    result['reason'] = ('no_f5_sei' if not records else
+                        'frame_clock_unavailable' if any(r.get('frame_clock_available') is False for r in records) else
+                        'unsupported_motion_version' if any(r.get('motion_decode_error') == 'unsupported_version' for r in records) else
+                        'no_frame_clock_in_sei')
+    return result
+
+
 def _decoder_bytes(data):
     """Remove whole F5 SEI NALs only, preserving every other Annex-B byte.
 
@@ -159,6 +199,7 @@ class VideoStream:
         self._started = self._closed = self._stop_requested = self._done = False
         self._thread = self._link = self._decoder = self._av = self._error = None
         self._metadata_error = None
+        self._missing_timestamp = self._first_missing_timestamp = None
         self._counts = dict(
             encoded_units=0,
             encoded_bytes=0,
@@ -201,6 +242,8 @@ class VideoStream:
                 error=str(self._error) if self._error else None,
                 error_cause=error_cause,
                 metadata_error=deepcopy(self._metadata_error),
+                missing_timestamp=deepcopy(self._missing_timestamp),
+                first_missing_timestamp=deepcopy(self._first_missing_timestamp),
                 network=dict(self._link.stats) if self._link else {},
             )
 
@@ -327,8 +370,15 @@ class VideoStream:
                 {key: value for key, value in record.items() if key != "quaternions"}
             )
         if stamp is None:
+            diagnostic = _missing_timestamp_diagnostic(raw, records, received)
+            if self._link is not None:
+                diagnostic['network'] = {key: self._link.stats[key] for key in
+                    ('truncated_pictures', 'video_packets', 'video_bytes') if key in self._link.stats}
             with self._condition:
                 self._counts["missing_timestamps"] += 1
+                self._missing_timestamp = diagnostic
+                if self._first_missing_timestamp is None:
+                    self._first_missing_timestamp = deepcopy(diagnostic)
         if not self.decode:
             self._publish(
                 VideoFrame(stamp, received, None, raw, frame_metadata), epoch=epoch

@@ -3,6 +3,8 @@
 Browser JPEG is a viewing copy. /video/h264 retains the original Annex-B
 access units, including DJI metadata. SLAM can consume /image/compressed;
 offline tools can decode the original H.264 without the extra JPEG generation.
+Access units without a native timestamp stay in the same H.264 sequence, but
+their host-arrival-stamped JPEG is excluded from the SLAM image topic.
 """
 
 import json
@@ -54,9 +56,20 @@ class OsmoTopics:
             self.publishers[topic].publish(message)
 
     def video(self, frame, jpeg, stamp_ns):
+        if frame.timestamp_ns is None:
+            raise ValueError('Use video_unstamped for an access unit without native time')
+        self._video(frame, jpeg, stamp_ns, valid_native=True)
+
+    def video_unstamped(self, frame, jpeg, stamp_ns):
+        """Keep the AU for decoding; stamp_ns is mapped host receive time."""
+        if frame.timestamp_ns is not None:
+            raise ValueError('video_unstamped requires a missing native timestamp')
+        self._video(frame, jpeg, stamp_ns, valid_native=False)
+
+    def _video(self, frame, jpeg, stamp_ns, *, valid_native):
         subscribers = self._subscribed_topics
         sink_active = self.sink is not None and self.has_sink_consumers()
-        if sink_active or '/osmo360/image/compressed' in subscribers:
+        if valid_native and (sink_active or '/osmo360/image/compressed' in subscribers):
             self.emit('/osmo360/image/compressed', compressed_image(
                 jpeg, stamp_ns, 'osmo360_dual_fisheye', 'bgr8; jpeg compressed bgr8'),
                 stamp_ns, sink_active, subscribers)
@@ -66,11 +79,16 @@ class OsmoTopics:
                 stamp_ns, sink_active, subscribers)
         if sink_active or '/osmo360/video/timing' in subscribers:
             self.emit('/osmo360/video/timing', UInt64MultiArray(data=[
-                stamp_ns, frame.timestamp_ns, frame.host_receive_monotonic_ns, self.sequence]),
+                stamp_ns, frame.timestamp_ns if valid_native else 0,
+                frame.host_receive_monotonic_ns, self.sequence, int(valid_native)]),
                 stamp_ns, sink_active, subscribers)
         if sink_active or '/osmo360/video/metadata' in subscribers:
+            metadata = dict(frame.metadata, _rover_timing={
+                'valid_native': valid_native,
+                'stamp_source': 'camera_native' if valid_native else 'host_receive',
+            })
             self.emit('/osmo360/video/metadata', String(data=json.dumps(
-                json_value(frame.metadata), allow_nan=False, separators=(',', ':'))),
+                json_value(metadata), allow_nan=False, separators=(',', ':'))),
                 stamp_ns, sink_active, subscribers)
         self.sequence += 1
 

@@ -6,7 +6,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from osmo360_camera import controls
 from osmo360_camera.transport import RequestTimeout
@@ -272,3 +272,34 @@ class RuntimeTests(unittest.TestCase):
                 validate_settings(values)
         self.assertEqual(validate_settings({'iso': 400, 'white_balance': 5000}), {'iso': 400, 'white_balance': 5000})
         self.assertEqual(json_value({'calibration': b'\x00\xff'}), {'calibration': {'encoding': 'hex', 'data': '00ff'}})
+
+    def test_missing_video_clock_keeps_live_view_and_following_native_clock(self):
+        received, unstamped = [], []
+        owner = OsmoCamera(host_offset_ns=5000)
+        frames = iter(SimpleNamespace(timestamp_ns=stamp, host_receive_monotonic_ns=arrival,
+                                      metadata={}, bgr=None) for stamp, arrival in
+                      ((100, 1000), (None, 1500), (200, 2200)))
+        owner.stream = SimpleNamespace(stats={}, read_video=lambda **kw: next(frames))
+        owner.enabled = True
+        def video(frame, jpeg, stamp):
+            received.append(stamp)
+            if len(received) == 2:
+                owner.reader_stop.set()
+        owner.on_video = video
+        owner.on_unstamped_video = lambda frame, jpeg, stamp: unstamped.append(stamp)
+        cv2 = SimpleNamespace(IMWRITE_JPEG_QUALITY=1,
+                              imencode=lambda *args: (True, SimpleNamespace(tobytes=lambda: b'jpeg')))
+        try:
+            with patch.dict('sys.modules', {'cv2': cv2}):
+                owner.video_loop()
+            self.assertEqual(received, [6000, 6100])
+            self.assertEqual(unstamped, [6500])
+            self.assertEqual(owner.timestamp_missing_frames, 1)
+            self.assertEqual(owner.frames, 3)
+            self.assertEqual(owner.clock.last['video'], 200)
+            self.assertEqual(owner.capture_error, '')
+            self.assertTrue(owner.enabled)
+            self.assertEqual(owner.latest()[1][0], b'jpeg')
+        finally:
+            owner.stream = None
+            owner.close()

@@ -56,10 +56,12 @@ def validate_settings(value):
 
 
 class OsmoCamera:
-    def __init__(self, on_video=None, on_imu=None, on_error=None, *, camera_factory=Camera, host_offset_ns=None):
+    def __init__(self, on_video=None, on_imu=None, on_error=None, *, on_unstamped_video=None,
+                 camera_factory=Camera, host_offset_ns=None):
         self.on_video = on_video or (lambda *_: None)
         self.on_imu = on_imu or (lambda *_: None)
         self.on_error = on_error or (lambda *_: None)
+        self.on_unstamped_video = on_unstamped_video or (lambda *_: None)
         self.camera_factory = camera_factory
         self.camera = self.stream = None
         self.clock = CameraClock(host_offset_ns)
@@ -72,6 +74,7 @@ class OsmoCamera:
         self.readers = []
         self.frame = None
         self.sequence = self.frames = self.imu_samples = 0
+        self.timestamp_missing_frames = 0
         self.frame_times = []
         self.imu_at = None
         self.enabled = False
@@ -114,6 +117,7 @@ class OsmoCamera:
                         preparation=dict(self.preparation),
                         frame_age_s=age, capture_fps=round(fps, 1) if age is not None and age < 2 else 0,
                         frames=self.frames, imu_samples=self.imu_samples,
+                        timestamp_missing_frames=self.timestamp_missing_frames,
                         imu_age_s=now - self.imu_at if self.imu_at else None,
                         mode={'width': 2048, 'height': 1024, 'fps': 30},
                         projection='dual_fisheye', settings=dict(self.settings), settings_error=self.settings_error,
@@ -238,7 +242,10 @@ class OsmoCamera:
     def close_stream(self):
         self.stop_readers()
         if self.stream is not None:
-            self.stream.close()
+            report = self.stream.close()
+            # Preserve the last data counters alongside the verified cleanup
+            # result, including the collector's final DIAG/transport report.
+            self.capture_stats = dict(self.capture_stats, state=self.stream.state, report=json_value(report))
             # Camera.close clears SDK ownership only after verified cleanup.
             self.camera.close()
             self.stream = None
@@ -393,13 +400,25 @@ class OsmoCamera:
                     if time.monotonic() - last > 5:
                         raise RuntimeError('Osmo 360 не передаёт видео более 5 секунд')
                     continue
-                stamp = self.clock.stamp(frame.timestamp_ns, frame.host_receive_monotonic_ns, 'video')
+                native_timestamp = frame.timestamp_ns is not None
+                if native_timestamp:
+                    stamp = self.clock.stamp(frame.timestamp_ns, frame.host_receive_monotonic_ns, 'video')
+                else:
+                    # SDK explicitly permits pictures without a camera clock.
+                    # Keep the raw AU for decoder continuity and the picture for
+                    # live viewing. Arrival time is tagged by the separate sink;
+                    # it must never enter the synchronized image topic.
+                    stamp = frame.host_receive_monotonic_ns + self.host_offset_ns
+                    self.timestamp_missing_frames += 1
                 ok, encoded = cv2.imencode('.jpg', frame.bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 if not ok:
                     raise RuntimeError('Не удалось подготовить JPEG Osmo')
                 jpeg = encoded.tobytes()
                 # Before web consumers; raw_h264 is preserved by the recorder.
-                self.on_video(frame, jpeg, stamp)
+                if native_timestamp:
+                    self.on_video(frame, jpeg, stamp)
+                else:
+                    self.on_unstamped_video(frame, jpeg, stamp)
                 calibration = {k: v for k, v in frame.metadata.items() if k.startswith('calibration_')}
                 if calibration:
                     self.calibration = json_value(calibration)

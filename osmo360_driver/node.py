@@ -20,7 +20,8 @@ class OsmoNode(Node):
         self.declare_parameter('enabled', False)
         self.topics = OsmoTopics(self)
         self.camera = OsmoCamera(self.topics.video, self.topics.imu,
-                                 lambda error: self.get_logger().error(error))
+                                 lambda error: self.get_logger().error(error),
+                                 on_unstamped_video=self.topics.video_unstamped)
         self.status_publisher = self.create_publisher(String, '~/status', 1)
         self.create_timer(1, self.update_status)
         self.create_service(SetBool, '~/stream', self.stream)
