@@ -216,8 +216,17 @@ sudo bash -c 'source /opt/ros/jazzy/setup.bash && source install/local_setup.bas
 
 Node name: `/osmo360`. Default `enabled:=false` does not open USB.
 Do not run the standalone node alongside another owner (e.g. the rover camera node).
-Hardware initialization, helper installation and firmware constraints above still apply.
-The standalone driver does not install helpers automatically.
+Firmware, battery, activation and video-mode requirements above still apply.
+Before the first ordinary stream in a process, the ROS driver calls the SDK's
+idempotent `install_helpers()`: a new camera is prepared once, while a verified
+installation and boot cache are reused without reinstalling or rebooting.
+An existing sleeping session is discovered and resumed by the SDK without
+requiring ordinary camera services to answer first.
+
+Disabling a stream uses SDK `sleep()` and preserves the session; enabling it
+again uses `wake()`. Complete cleanup happens on driver shutdown, configuration
+or reboot. Status includes the actual startup phase, command elapsed time and
+the installation/autostart proof returned by the SDK.
 
 | Topic | Type / contents |
 | --- | --- |
@@ -240,7 +249,7 @@ Services (private namespace): `~/stream` (`std_srvs/SetBool`), `~/wake`, `~/slee
 `~/status.busy` to clear and check `error`/actual settings. Commands are serialized.
 Reboot leaves the stream disabled; wake/start enables joint video+IMU.
 
-Requested settings are standard ROS parameters: `exposure_mode` (0/4), `iso`
+Requested settings are standard ROS parameters: `exposure_mode` (0/1/4), `iso`
 (0=auto or supported ISO), `shutter_denominator` (1…8000), `white_balance`
 (0=auto or 2000…10000 K, step 100), `color` (0/60/61/63), `frame_rate`
 (protocol codes 2=25 FPS, 3=30000/1001 FPS, 14=30 FPS). A parameter change queues a camera command;

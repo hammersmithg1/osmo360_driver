@@ -14,6 +14,7 @@ from osmo360_camera import (
     Camera, CameraReplyError, ColorMode, ExposureMode, ExposureModeSetting, FrameRate, IsoSetting,
     ShutterSpeed, ShutterValue, WhiteBalance, WhiteBalanceMode,
 )
+from osmo360_camera.transport import CameraDisconnected, RequestTimeout
 from .clock import CameraClock
 
 
@@ -75,6 +76,9 @@ class OsmoCamera:
         self.imu_at = None
         self.enabled = False
         self.busy = self.error = self.capture_error = ''
+        self.command_started_at = None
+        self.preparation = {}
+        self.helpers_ready = False
         self.state = 'disconnected'
         self.settings = {}
         self.calibration = {}
@@ -93,6 +97,7 @@ class OsmoCamera:
             if self.busy:
                 raise ValueError('Дождись завершения команды Osmo 360: ' + self.busy)
             self.busy, self.error = action, ''
+            self.command_started_at = time.monotonic()
             self.commands.put_nowait((action, settings))
         return self.status()
 
@@ -103,6 +108,8 @@ class OsmoCamera:
             times = self.frame_times
             fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 and times[-1] > times[0] else 0
             return dict(enabled=self.enabled, state=self.state, busy=self.busy, error=self.error,
+                        command_elapsed_s=round(now - self.command_started_at, 1) if self.busy and self.command_started_at is not None else None,
+                        preparation=dict(self.preparation),
                         frame_age_s=age, capture_fps=round(fps, 1) if age is not None and age < 2 else 0,
                         frames=self.frames, imu_samples=self.imu_samples,
                         imu_age_s=now - self.imu_at if self.imu_at else None,
@@ -119,12 +126,37 @@ class OsmoCamera:
                 return None
             return self.sequence, self.frame
 
-    def connect(self):
+    def connect(self, *, wait_ready=True):
         if self.camera is None:
             self.camera = self.camera_factory()
         if not self.camera.connected:
             self.state = 'connecting'
-            self.camera.connect(timeout=30)
+            self.helpers_ready = False
+            self.camera.connect(timeout=30 if wait_ready else None)
+
+    def prepare_helpers(self):
+        if self.helpers_ready:
+            return
+        self.state = 'checking_helpers'
+        try:
+            # A retained sleeping owner can answer AMT while ordinary camera
+            # services are asleep. Let usb_stream discover/wake it; do not
+            # block that SDK path behind connect(timeout=30) or an installer.
+            self.camera.state(timeout=1)
+            self.camera.system_mode(timeout=1)
+        except (RequestTimeout, CameraDisconnected):
+            return
+        except CameraReplyError as exc:
+            if exc.status in (0xE0, 0xE3):
+                return
+            raise
+        self.state = 'preparing_helpers'
+        report = self.camera.install_helpers(timeout=180)
+        self.preparation = {key: report.get(key) for key in
+                            ('installed', 'already_installed', 'autostart_hydration_verified', 'reboot_attempted')}
+        if not self.preparation['installed'] or not self.preparation['autostart_hydration_verified']:
+            raise RuntimeError('SDK не подтвердил установку и автозапуск служебных скриптов Osmo')
+        self.helpers_ready = True
 
     def read_settings(self):
         cam = self.camera
@@ -180,19 +212,23 @@ class OsmoCamera:
             self.stream = None
 
     def activate(self):
-        self.connect()
+        # The resumable SDK owns readiness, standby discovery and wake.
+        self.connect(wait_ready=False)
         if self.enabled:
             return
         if self.stream is None:
+            self.prepare_helpers()
             self.state = 'starting'
             self.stream = self.camera.usb_stream(fast_sleep=True, retain_ecm=True, queue_size=8,
                                                  imu_options={'queue_size': 32768})
             self.stream.start()
         elif self.stream.state == 'SLEEP':
+            self.state = 'waking'
             self.stream.wake()
         elif self.stream.state != 'AWAKE':
             raise RuntimeError('Неопределённое состояние USB-сессии; перезапусти драйвер')
         # Settings queries belong to the owner thread, before data readers.
+        self.state = 'reading_settings'
         self.read_settings()
         self.start_readers()
 
@@ -226,17 +262,21 @@ class OsmoCamera:
     def execute(self, action, settings):
         if action in ('start', 'wake'):
             self.activate()
-        elif action == 'stop':
-            self.close_stream()
-            self.state = 'idle' if self.camera else 'disconnected'
-        elif action == 'sleep':
+        elif action in ('stop', 'sleep'):
             if self.stream is None:
+                if action == 'stop':
+                    self.state = 'idle' if self.camera and self.camera.connected else 'disconnected'
+                    return
                 self.activate()
+            self.state = 'sleeping_camera'
             self.stop_readers()
             if self.stream.state == 'AWAKE':
                 self.stream.sleep()
             self.state = 'sleeping'
         elif action == 'reboot':
+            if self.stream is not None and self.stream.state == 'SLEEP':
+                self.state = 'waking'
+                self.stream.wake()
             self.close_stream()
             self.connect()
             self.state = 'rebooting'
@@ -273,11 +313,15 @@ class OsmoCamera:
                     self.execute(action, settings)
                 except Exception as exc:
                     self.error = str(exc)
+                    cause = getattr(exc, 'last_error', None) or exc.__cause__
+                    if cause is not None and str(cause) not in self.error:
+                        self.error += ': ' + str(cause)
                     self.state = 'error'
                     self.on_error(self.error)
                 finally:
                     with self.condition:
                         self.busy = ''
+                        self.command_started_at = None
         finally:
             try:
                 self.close_stream()

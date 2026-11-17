@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock
 
 from osmo360_camera import controls
+from osmo360_camera.transport import RequestTimeout
 from osmo360_driver.clock import CameraClock
 from osmo360_driver.runtime import OsmoCamera, json_value, validate_settings
 
@@ -49,10 +50,59 @@ class RuntimeTests(unittest.TestCase):
         }
         methods = {('shutter_setting' if key == 'shutter' else key): Mock(side_effect=lambda key=key, decode=decode: decode(bytes.fromhex(native[key])))
                    for key, decode in getters.items()}
-        owner.camera = SimpleNamespace(connected=True, usb_stream=Mock(return_value=Mock()), **methods)
+        owner.camera = SimpleNamespace(connected=True, usb_stream=Mock(return_value=Mock(state='AWAKE')),
+            state=Mock(), system_mode=Mock(), install_helpers=Mock(return_value={
+                'installed': True, 'already_installed': True, 'autostart_hydration_verified': True,
+                'reboot_attempted': False}), **methods)
         owner.stream, owner.enabled, owner.settings = None, False, {}
+        owner.helpers_ready, owner.preparation = True, {}
         owner.start_readers = Mock()
         return owner
+
+    def test_start_lets_sdk_open_a_sleeping_camera_without_service_wait(self):
+        owner = self.settings_owner()
+        owner.camera.connected = False
+        owner.camera.connect = Mock(side_effect=lambda **kwargs: setattr(owner.camera, 'connected', True))
+        owner.camera.state.side_effect = RequestTimeout('ordinary services are asleep')
+        owner.activate()
+        owner.camera.connect.assert_called_once_with(timeout=None)
+        owner.camera.install_helpers.assert_not_called()
+        owner.stream.start.assert_called_once_with()
+        owner.start_readers.assert_called_once_with()
+
+    def test_preparation_uses_public_idempotent_installer_and_requires_autostart_proof(self):
+        owner = self.settings_owner()
+        owner.helpers_ready = False
+        owner.activate()
+        owner.camera.install_helpers.assert_called_once_with(timeout=180)
+        self.assertTrue(owner.preparation['already_installed'])
+        self.assertTrue(owner.helpers_ready)
+        owner = self.settings_owner()
+        owner.helpers_ready = False
+        owner.camera.install_helpers.return_value = {'installed': True, 'autostart_hydration_verified': False}
+        with self.assertRaisesRegex(RuntimeError, 'автозапуск'):
+            owner.activate()
+        owner.camera.usb_stream.assert_not_called()
+
+    def test_stream_toggle_sleeps_and_wakes_the_same_sdk_session(self):
+        owner = self.settings_owner()
+        owner.helpers_ready = False
+        owner.start_readers.side_effect = lambda: setattr(owner, 'enabled', True)
+        owner.stop_readers = Mock(side_effect=lambda: setattr(owner, 'enabled', False))
+        session = owner.camera.usb_stream.return_value
+        session.sleep.side_effect = lambda: setattr(session, 'state', 'SLEEP')
+        session.wake.side_effect = lambda: setattr(session, 'state', 'AWAKE')
+        owner.activate()
+        owner.execute('stop', None)
+        self.assertEqual(owner.state, 'sleeping')
+        self.assertFalse(owner.enabled)
+        owner.activate()
+        owner.camera.usb_stream.assert_called_once()
+        owner.camera.install_helpers.assert_called_once()
+        session.start.assert_called_once()
+        session.sleep.assert_called_once()
+        session.wake.assert_called_once()
+        session.close.assert_not_called()
 
     def test_real_program_snapshot_with_unset_shutter_starts_readers(self):
         owner = self.settings_owner()
