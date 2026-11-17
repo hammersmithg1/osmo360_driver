@@ -222,6 +222,10 @@ idempotent `install_helpers()`: a new camera is prepared once, while a verified
 installation and boot cache are reused without reinstalling or rebooting.
 An existing sleeping session is discovered and resumed by the SDK without
 requiring ordinary camera services to answer first.
+Once the control generation is verified, ordinary GET readiness waits within
+its existing deadline for transient timeouts/E3. A fresh Record0 is required
+before any diagnostic task START and rechecked last; input/SET transitions are
+never retried by this readiness wait.
 
 Disabling a stream uses SDK `sleep()` and preserves the session; enabling it
 again uses `wake()`. Complete cleanup happens on driver shutdown, configuration

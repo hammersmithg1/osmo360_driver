@@ -131,16 +131,37 @@ class _ControlGeneration:
                     # USBTransport.open releases only a failed/stale generation.
                     self.sleep(min(0.05, self._remaining(deadline)))
 
-    def _retry_e3(self, query, *, deadline):
+    def _retry_readonly(self, query, *, deadline):
+        """Wait for ordinary GET readiness on exactly this open generation.
+
+        A timed-out GET is safe to query again; it is not a possibly delivered
+        SET/QS/diagnostic START. Never open, rotate a task session or adopt a new
+        USB reader here. Pending diagnostic tasks remain separately guarded.
+        """
+        transport, expected = self.control.bootstrap.transport, self.generation
+        if expected is None:
+            raise USBError('Ordinary readiness requires a proven control generation')
+
+        def same_generation():
+            current = self._signature()
+            if (self.camera._transport is not transport
+                    or current[0] is not expected[0] or current[1:] != expected[1:]):
+                raise CameraDisconnected('Control generation changed during ordinary readiness')
+
         while True:
             self._remaining(deadline)
+            same_generation()
             try:
-                value = query(min(1, self._remaining(deadline)))
-            except controls.CameraReplyError as error:
-                if error.status != 0xE3 or self.clock() >= deadline:
+                value = query(min(2, self._remaining(deadline)))
+            except (RequestTimeout, controls.CameraReplyError) as error:
+                if isinstance(error, controls.CameraReplyError) and error.status != 0xE3:
+                    raise
+                same_generation()
+                if self.clock() >= deadline:
                     raise
                 self.sleep(min(0.05, self._remaining(deadline)))
                 continue
+            same_generation()
             self._remaining(deadline)
             return value
 
@@ -164,9 +185,22 @@ class _ControlGeneration:
         with camera._control_lock:
             deadline = self.clock() + self.timeout
             self.ensure(deadline=deadline, resolve=True)
-            activation = self._retry_e3(
+            activation = self._retry_readonly(
                 self._activation, deadline=min(deadline, self.clock() + 10)
             )
+
+            def record0():
+                state = self._retry_readonly(
+                    lambda remaining: camera.state(timeout=remaining),
+                    deadline=min(deadline, self.clock() + 10),
+                )
+                if state.recording_state != 0:
+                    raise ValueError("USB stream setup requires idle Record0")
+                return state
+
+            # A not-yet-ready service may answer Record1 after a GET timeout.
+            # Reject it before even the fixed read-only diagnostic task START.
+            record0()
             # This is a fixed read-only test, not a power/setting operation.
             # _run also rechecks any uncertainty before its one task START.
             self.control._run(
@@ -175,12 +209,7 @@ class _ControlGeneration:
             )
             self._remaining(deadline)
             # Record0 LAST: long uploads/readiness must not stale the entry proof.
-            state = self._retry_e3(
-                lambda remaining: camera.state(timeout=remaining),
-                deadline=min(deadline, self.clock() + 10),
-            )
-            if state.recording_state != 0:
-                raise ValueError("USB stream setup requires idle Record0")
+            state = record0()
             return _IdleEvidence(self.clock(), state.recording_state, activation, True)
 
 

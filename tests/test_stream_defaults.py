@@ -28,6 +28,7 @@ class Environment:
         self.events, self.adapters, self.clock = [], [], Clock()
         self.activation = [b"\0\1" + bytes(58)]
         self.states = [0]
+        self.state_timeouts = []
         self.old_task_running = False
         self.transport = types.SimpleNamespace(
             connected=False, _thread=None, _device_identity=None
@@ -60,6 +61,7 @@ class Environment:
 
         def state(**options):
             self.events.append("state.LAST")
+            self.state_timeouts.append(options.get('timeout'))
             value = self.states.pop(0) if len(self.states) > 1 else self.states[0]
             if isinstance(value, Exception):
                 raise value
@@ -254,6 +256,91 @@ class DefaultsTests(unittest.TestCase):
         self.env.transport._device_identity = dict(bus=1, address=3)
         session.idle_probe(self.env.camera)
         self.assertIsNot(session.control.bootstrap, old)
+
+    def test_readonly_state_timeout_waits_on_same_reader_then_requires_fresh_record0(self):
+        session, manager = self.opened()
+        self.env.states = [m.RequestTimeout('GET_SYSTEM_STATE not ready'), 0, 0]
+        reader = self.env.transport._thread
+        proof = session.idle_probe(self.env.camera)
+        self.assertEqual(proof.recording_state, 0)
+        self.assertIs(self.env.transport._thread, reader)
+        self.assertEqual(self.env.events.count('open'), 1)
+        self.assertEqual(self.env.events.count('state.LAST'), 3)
+        self.assertEqual(self.env.state_timeouts, [2, 2, 2])
+        self.assertEqual(self.env.events.count(('START', m.BATTERY_QUERY)), 1)
+        self.assertEqual(self.env.events[-1], 'state.LAST')
+
+    def test_record1_after_readonly_timeout_blocks_every_diagnostic_start(self):
+        session, _ = self.opened()
+        self.env.states = [m.RequestTimeout('not ready'), 1]
+        with self.assertRaisesRegex(ValueError, 'Record0'):
+            session.idle_probe(self.env.camera)
+        self.assertEqual(self.env.events.count('state.LAST'), 2)
+        self.assertFalse(any(isinstance(event, tuple) and event[0] == 'START'
+                             for event in self.env.events))
+
+    def test_readonly_retry_never_adopts_disconnected_or_changed_generation(self):
+        for change in ('disconnect', 'reader', 'address', 'late_reader'):
+            with self.subTest(change=change):
+                session, _ = self.opened()
+                self.env.events.clear()
+                def changing_state(**options):
+                    self.env.events.append('state.changed')
+                    if change == 'disconnect':
+                        self.env.transport.connected = False
+                    elif change in ('reader', 'late_reader'):
+                        self.env.transport._thread = object()
+                    else:
+                        self.env.transport._device_identity = dict(bus=1, address=3)
+                    if change == 'late_reader':
+                        return types.SimpleNamespace(recording_state=0)
+                    raise m.RequestTimeout('read timed out during USB change')
+                with patch.object(self.env.camera, 'state', side_effect=changing_state):
+                    with self.assertRaises(m.CameraDisconnected):
+                        session.idle_probe(self.env.camera)
+                self.assertEqual(self.env.events.count('state.changed'), 1)
+                self.assertNotIn('open', self.env.events)
+                self.assertFalse(any(isinstance(event, tuple) and event[0] == 'START'
+                                     for event in self.env.events))
+
+    def test_readonly_timeouts_share_overall_budget_and_do_not_accept_late_success(self):
+        session, manager = self.opened()
+        manager.timeout = 3
+        def timed_out(**options):
+            self.env.clock.now += options['timeout']
+            raise m.RequestTimeout('ordinary GET timeout')
+        with patch.object(self.env.camera, 'state', side_effect=timed_out):
+            with self.assertRaises(m.RequestTimeout):
+                session.idle_probe(self.env.camera)
+        self.assertAlmostEqual(self.env.clock.now, 3)
+        self.assertFalse(any(isinstance(event, tuple) and event[0] == 'START'
+                             for event in self.env.events))
+        self.env.events.clear()
+        def late(**options):
+            self.env.clock.now += manager.timeout + .01
+            return types.SimpleNamespace(recording_state=0)
+        with patch.object(self.env.camera, 'state', side_effect=late):
+            with self.assertRaises(m.RequestTimeout):
+                session.idle_probe(self.env.camera)
+        self.assertFalse(any(isinstance(event, tuple) and event[0] == 'START'
+                             for event in self.env.events))
+
+    def test_readonly_timeout_does_not_bypass_new_pending_task_quarantine(self):
+        session, _ = self.opened()
+        calls = []
+        def state(**options):
+            calls.append(options)
+            if len(calls) == 1:
+                session.control.bootstrap.session.quarantined = True
+                self.env.old_task_running = True
+                raise m.RequestTimeout('ordinary service not ready')
+            return types.SimpleNamespace(recording_state=0)
+        with patch.object(self.env.camera, 'state', side_effect=state):
+            with self.assertRaises(StandbyUncertain):
+                session.idle_probe(self.env.camera)
+        self.assertIn('old.RESULT', self.env.events)
+        self.assertFalse(any(isinstance(event, tuple) and event[0] == 'START'
+                             for event in self.env.events))
 
     def test_unknown_old_task_is_resolved_readonly_before_battery_start_on_new_generation(
         self,
