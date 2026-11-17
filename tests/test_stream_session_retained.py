@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock
 
 from osmo360_camera import _stream_session as m
+from osmo360_camera._prepared_stream import UnknownFutureApply
 from test_stream_session import Environment, Prepared
 from test_fast_sleep import Preview, IMU, SleepingPrepared
 
@@ -228,6 +229,46 @@ class RetainedSessionTests(unittest.TestCase):
         self.assertNotIn("owner.wake", env.events)
         self.assertNotIn("owner.detach", env.events)
         self.assertNotIn("owner.finalize", env.events)
+
+    def test_failed_wake_stats_keep_backend_diagnostics_and_original_cause_chain(self):
+        env, session, old, factory, _ = self.setup_session()
+        session.sleep()
+        backend = factory.created[0]
+
+        def fail_attach(**options):
+            self.assertTrue(env.wake_submitted.wait(0.5))
+            try:
+                try:
+                    raise OSError('Final USB generation lost carrier')
+                except OSError as error:
+                    raise TimeoutError('Retained completion/data deadline') from error
+            except TimeoutError as error:
+                backend.report.update(
+                    recovery_required=True, errors=[repr(error)],
+                    network_generations=[{'ncm_interface': 'enx-camera', 'ok': False}],
+                )
+                raise UnknownFutureApply('No final reset/lease proof') from error
+
+        backend.attach_data_first = fail_attach
+        with self.assertRaises(UnknownFutureApply):
+            session.wake(timeout=5)
+        stats = session.stats
+        self.assertEqual(stats['state'], 'RECOVERY_REQUIRED')
+        failure = stats['report']['wake_failure']
+        self.assertEqual(failure['prepared'], backend.report)
+        self.assertEqual(stats['report']['cycles'][-1]['prepared'], backend.report)
+        self.assertEqual(failure['errors'], [
+            "UnknownFutureApply('No final reset/lease proof')",
+            "TimeoutError('Retained completion/data deadline')",
+            "OSError('Final USB generation lost carrier')",
+        ])
+        self.assertEqual(env.events.count('owner.wake'), 1)
+        # Preserve postmortem evidence independently of live backend changes and
+        # independently of callers editing their returned stats JSON.
+        backend.report['errors'].append('later cleanup error')
+        failure['prepared']['errors'].append('caller edit')
+        frozen = session.stats['report']['wake_failure']['prepared']['errors']
+        self.assertEqual(frozen, ["TimeoutError('Retained completion/data deadline')"])
 
     def test_next_accepted_sleep_failure_retires_previous_warm_cleanup_proof(self):
         env, session, old, factory, prepared = self.setup_session()

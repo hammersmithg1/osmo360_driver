@@ -234,6 +234,14 @@ and appears in `settings_error` with the affected field; it does not stop
 video/IMU or fail a recording. Configuration SETs and their readback remain
 strict. A later successful refresh clears the warning.
 
+The ROS adapter caches graph subscriptions from a one-second executor timer.
+With no subscribers or recording, IMU messages and metadata JSON are not built.
+Recording demand is checked on each sample, so a newly accepted session receives
+the next sample immediately; native rates and timestamps are preserved. SDK
+diagnostic snapshots are copied once per second, outside the video frame lock.
+Failed wake reports include the actual prepared backend report and original
+exception chain in `stats.report.wake_failure`.
+
 If the SDK reports `RECOVERY_REQUIRED`, ordinary transitions are blocked:
 the driver must not label an uncertain session as sleeping or repeat wake.
 Stop the driver, power-cycle only the camera, and restart the driver to clear

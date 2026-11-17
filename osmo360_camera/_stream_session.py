@@ -30,6 +30,18 @@ class StreamSessionError(RuntimeError):
         self.report = report
 
 
+def _exception_chain(error):
+    """JSON-safe diagnostics preserving the original wrapper and root cause."""
+    result, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        result.append(repr(error))
+        error = error.__cause__ if error.__cause__ is not None else (
+            None if error.__suppress_context__ else error.__context__
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class _IdleEvidence:
     verified_at: float
@@ -977,6 +989,15 @@ class USBStreamSession:
                 return self
             except BaseException as error:
                 self.report["errors"].append("Wake: " + repr(error))
+                # The cycle's prepared snapshot predates arm/attach. Freeze the
+                # actual failed backend before cleanup/recovery can change it;
+                # UnknownFutureApply alone hides completion/network failures.
+                prepared = deepcopy(self._prepared.report)
+                self.report["wake_failure"] = dict(
+                    errors=_exception_chain(error), prepared=prepared
+                )
+                if self.report["cycles"]:
+                    self.report["cycles"][-1]["prepared"] = deepcopy(prepared)
                 self._set_state("RECOVERY_REQUIRED")
                 raise
 

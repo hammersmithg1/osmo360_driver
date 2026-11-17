@@ -28,38 +28,64 @@ def compressed_image(data, stamp_ns, frame_id, format='jpeg'):
 
 
 class OsmoTopics:
-    def __init__(self, node, sink=None):
-        self.sink = sink or (lambda *_: None)
+    def __init__(self, node, sink=None, *, has_sink_consumers=None):
+        self.sink = sink
+        # Recording demand is checked for each sample, independently of ROS
+        # discovery. A newly started recording must not wait for the timer.
+        self.has_sink_consumers = has_sink_consumers or (lambda: sink is not None)
         types = {'sensor_msgs/msg/CompressedImage': CompressedImage, 'sensor_msgs/msg/Imu': Imu,
                  'std_msgs/msg/String': String, 'std_msgs/msg/UInt64MultiArray': UInt64MultiArray}
         qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.publishers = {topic: node.create_publisher(types[kind], topic, qos) for topic, kind in TOPICS.items()}
+        self._subscribed_topics = frozenset()
+        self.refresh_subscribers()
         self.sequence = 0
 
-    def emit(self, topic, message, stamp_ns):
-        self.sink('osmo360', topic, message, stamp_ns)
-        publisher = self.publishers[topic]
-        if publisher.get_subscription_count():
-            publisher.publish(message)
+    def refresh_subscribers(self):
+        """Call from the ROS executor timer, not the 8 kHz capture thread."""
+        self._subscribed_topics = frozenset(
+            topic for topic, publisher in self.publishers.items()
+            if publisher.get_subscription_count())
+
+    def emit(self, topic, message, stamp_ns, sink_active, subscribers):
+        if sink_active:
+            self.sink('osmo360', topic, message, stamp_ns)
+        if topic in subscribers:
+            self.publishers[topic].publish(message)
 
     def video(self, frame, jpeg, stamp_ns):
-        self.emit('/osmo360/image/compressed', compressed_image(
-            jpeg, stamp_ns, 'osmo360_dual_fisheye', 'bgr8; jpeg compressed bgr8'), stamp_ns)
-        self.emit('/osmo360/video/h264', compressed_image(
-            frame.raw_h264, stamp_ns, 'osmo360_dual_fisheye', 'h264'), stamp_ns)
-        self.emit('/osmo360/video/timing', UInt64MultiArray(data=[
-            stamp_ns, frame.timestamp_ns, frame.host_receive_monotonic_ns, self.sequence]), stamp_ns)
-        self.emit('/osmo360/video/metadata', String(data=json.dumps(
-            json_value(frame.metadata), allow_nan=False, separators=(',', ':'))), stamp_ns)
+        subscribers = self._subscribed_topics
+        sink_active = self.sink is not None and self.has_sink_consumers()
+        if sink_active or '/osmo360/image/compressed' in subscribers:
+            self.emit('/osmo360/image/compressed', compressed_image(
+                jpeg, stamp_ns, 'osmo360_dual_fisheye', 'bgr8; jpeg compressed bgr8'),
+                stamp_ns, sink_active, subscribers)
+        if sink_active or '/osmo360/video/h264' in subscribers:
+            self.emit('/osmo360/video/h264', compressed_image(
+                frame.raw_h264, stamp_ns, 'osmo360_dual_fisheye', 'h264'),
+                stamp_ns, sink_active, subscribers)
+        if sink_active or '/osmo360/video/timing' in subscribers:
+            self.emit('/osmo360/video/timing', UInt64MultiArray(data=[
+                stamp_ns, frame.timestamp_ns, frame.host_receive_monotonic_ns, self.sequence]),
+                stamp_ns, sink_active, subscribers)
+        if sink_active or '/osmo360/video/metadata' in subscribers:
+            self.emit('/osmo360/video/metadata', String(data=json.dumps(
+                json_value(frame.metadata), allow_nan=False, separators=(',', ':'))),
+                stamp_ns, sink_active, subscribers)
         self.sequence += 1
 
     def imu(self, sample, stamp_ns):
-        message = set_header(Imu(), stamp_ns, 'osmo360_imu_native')
-        message.angular_velocity.x, message.angular_velocity.y, message.angular_velocity.z = sample.gyro
-        message.linear_acceleration.x, message.linear_acceleration.y, message.linear_acceleration.z = sample.accel
-        # No fused orientation. Zero covariance means unknown (not calibrated).
-        message.orientation_covariance[0] = -1.0
-        self.emit('/osmo360/imu', message, stamp_ns)
-        self.emit('/osmo360/imu/timing', UInt64MultiArray(data=[
-            stamp_ns, sample.timestamp_ns, sample.host_receive_monotonic_ns,
-            sample.timestamp_ticks, sample.accel_status, sample.gyro_status]), stamp_ns)
+        subscribers = self._subscribed_topics
+        sink_active = self.sink is not None and self.has_sink_consumers()
+        if sink_active or '/osmo360/imu' in subscribers:
+            message = set_header(Imu(), stamp_ns, 'osmo360_imu_native')
+            message.angular_velocity.x, message.angular_velocity.y, message.angular_velocity.z = sample.gyro
+            message.linear_acceleration.x, message.linear_acceleration.y, message.linear_acceleration.z = sample.accel
+            # No fused orientation. Zero covariance means unknown (not calibrated).
+            message.orientation_covariance[0] = -1.0
+            self.emit('/osmo360/imu', message, stamp_ns, sink_active, subscribers)
+        if sink_active or '/osmo360/imu/timing' in subscribers:
+            self.emit('/osmo360/imu/timing', UInt64MultiArray(data=[
+                stamp_ns, sample.timestamp_ns, sample.host_receive_monotonic_ns,
+                sample.timestamp_ticks, sample.accel_status, sample.gyro_status]),
+                stamp_ns, sink_active, subscribers)

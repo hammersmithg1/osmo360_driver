@@ -84,6 +84,7 @@ class OsmoCamera:
         self.settings_error = ''
         self.calibration = {}
         self.capture_stats = {}
+        self.stats_at = 0
         self.worker = threading.Thread(target=self.run, name='Osmo control', daemon=True)
         self.worker.start()
 
@@ -152,7 +153,11 @@ class OsmoCamera:
                 return
             raise
         self.state = 'preparing_helpers'
-        report = self.camera.install_helpers(timeout=180)
+        try:
+            report = self.camera.install_helpers(timeout=180)
+        except Exception as exc:
+            self.preparation = json_value(getattr(exc, 'report', {}))
+            raise
         self.preparation = {key: report.get(key) for key in
                             ('installed', 'already_installed', 'autostart_hydration_verified', 'reboot_attempted')}
         if not self.preparation['installed'] or not self.preparation['autostart_hydration_verified']:
@@ -222,6 +227,7 @@ class OsmoCamera:
         self.clock = CameraClock(self.host_offset_ns)
         self.frame_times = []
         self.imu_at = None
+        self.stats_at = 0
         self.enabled = True
         self.state = 'streaming'
         self.readers = [threading.Thread(target=self.video_loop, name='Osmo video', daemon=True),
@@ -279,10 +285,12 @@ class OsmoCamera:
                     self.camera.set_color(ColorMode(value))
                 elif key == 'frame_rate':
                     self.camera.set_frame_rate(FrameRate(value))
-        finally:
-            # Read actual values even if a later SET failed; never report the
-            # requested group as an atomic transaction when firmware is not one.
-            self.read_settings()
+        except Exception:
+            # SDK setters verify their own readback/rollback. An unrelated
+            # optional GET must not replace the original SET failure.
+            self.read_settings(strict=False)
+            raise
+        self.read_settings(strict=False)
         if restart:
             self.activate()
         else:
@@ -396,12 +404,16 @@ class OsmoCamera:
                 if calibration:
                     self.calibration = json_value(calibration)
                 last = time.monotonic()
+                # SDK stats include deep lifecycle reports. Snapshot once per
+                # second outside the frame condition, not on every video frame.
+                if last - self.stats_at >= 1:
+                    self.capture_stats = json_value(self.stream.stats)
+                    self.stats_at = last
                 with self.condition:
                     self.frame = (jpeg, stamp, last)
                     self.sequence += 1
                     self.frames += 1
                     self.frame_times = [at for at in self.frame_times if last - at < 2] + [last]
-                    self.capture_stats = json_value(self.stream.stats)
                     self.condition.notify_all()
         except Exception as exc:
             if not self.reader_stop.is_set():

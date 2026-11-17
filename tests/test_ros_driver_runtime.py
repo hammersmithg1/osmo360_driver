@@ -182,6 +182,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(owner.settings['shutter_denominator'], 250)
         self.assertEqual(owner.settings['exposure_mode'], int(controls.ExposureMode.MANUAL))
 
+    def test_optional_get_does_not_hide_original_set_failure(self):
+        owner = self.settings_owner()
+        owner.close_stream = Mock()
+        owner.camera.set_color = Mock(side_effect=RuntimeError('SET color rejected'))
+        owner.camera.video_format.side_effect = controls.CameraReplyError(0xDF, b'\xdf')
+        with self.assertRaisesRegex(RuntimeError, 'SET color rejected'):
+            owner.apply_settings({'color': 0})
+        self.assertIn('частоту съёмки', owner.settings_error)
+
+    def test_verified_set_resumes_stream_despite_unrelated_metadata_failure(self):
+        owner = self.settings_owner()
+        owner.enabled = True
+        owner.close_stream = Mock(side_effect=lambda: setattr(owner, 'enabled', False))
+        owner.camera.set_color = Mock()
+        owner.camera.video_format.side_effect = controls.CameraReplyError(0xDF, b'\xdf')
+        owner.activate = Mock()
+        owner.apply_settings({'color': 0})
+        owner.camera.set_color.assert_called_once()
+        owner.activate.assert_called_once()
+        self.assertIn('частоту съёмки', owner.settings_error)
+
     def test_initializing_driver_does_not_touch_usb_and_commands_are_asynchronous(self):
         called, release = threading.Event(), threading.Event()
 

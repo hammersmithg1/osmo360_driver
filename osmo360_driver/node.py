@@ -22,7 +22,7 @@ class OsmoNode(Node):
         self.camera = OsmoCamera(self.topics.video, self.topics.imu,
                                  lambda error: self.get_logger().error(error))
         self.status_publisher = self.create_publisher(String, '~/status', 1)
-        self.create_timer(1, lambda: self.status_publisher.publish(String(data=json.dumps(self.camera.status()))))
+        self.create_timer(1, self.update_status)
         self.create_service(SetBool, '~/stream', self.stream)
         for action in ('wake', 'sleep', 'reboot', 'refresh'):
             self.create_service(Trigger, '~/' + action, self.trigger(action))
@@ -33,6 +33,10 @@ class OsmoNode(Node):
         self.add_on_set_parameters_callback(self.configure)
         if self.get_parameter('enabled').value:
             self.camera.command('start')
+
+    def update_status(self):
+        self.topics.refresh_subscribers()
+        self.status_publisher.publish(String(data=json.dumps(self.camera.status())))
 
     def stream(self, request, response):
         return self.enqueue('start' if request.data else 'stop', response)
