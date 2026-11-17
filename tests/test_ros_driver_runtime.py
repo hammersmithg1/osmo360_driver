@@ -120,13 +120,59 @@ class RuntimeTests(unittest.TestCase):
                 owner = self.settings_owner()
                 owner.camera.exposure_mode = Mock(return_value=controls.ExposureModeSetting(mode))
                 owner.camera.shutter_setting = Mock(side_effect=controls.CameraReplyError(status, bytes([status])))
-                with self.assertRaises(controls.CameraReplyError):
-                    owner.activate()
-                owner.start_readers.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, 'выдержку') as caught:
+                    owner.read_settings()
+                self.assertIsInstance(caught.exception.__cause__, controls.CameraReplyError)
+                owner.activate()
+                owner.start_readers.assert_called_once_with()
+                self.assertIn('выдержку', owner.settings_error)
+                self.assertEqual(owner.settings, {})
         owner = self.settings_owner()
         owner.camera.exposure_mode = Mock(return_value=controls.ExposureModeSetting(controls.ExposureMode.AUTO))
         owner.activate()
         owner.start_readers.assert_called_once_with()
+
+    def test_failed_settings_get_does_not_prevent_data_and_refresh_clears_warning(self):
+        owner = self.settings_owner()
+        def start_readers():
+            owner.enabled, owner.state = True, 'streaming'
+        owner.start_readers.side_effect = start_readers
+        owner.read_settings()
+        self.assertTrue(owner.settings)
+        native_format = owner.camera.video_format.side_effect
+
+        def rejected_format():
+            owner.start_readers.assert_called_once_with()
+            raise controls.CameraReplyError(0xDF, b'\xdf')
+
+        owner.camera.video_format.side_effect = rejected_format
+        owner.activate()
+        self.assertIn('частоту съёмки', owner.settings_error)
+        self.assertIn('0xdf', owner.settings_error)
+        self.assertEqual(owner.settings, {})
+        self.assertTrue(owner.enabled)
+        self.assertEqual(owner.state, 'streaming')
+        owner.camera.video_format.side_effect = native_format
+        owner.execute('refresh', None)
+        self.assertEqual(owner.settings_error, '')
+        self.assertTrue(owner.enabled)
+        self.assertEqual(owner.state, 'streaming')
+        self.assertEqual(owner.settings['frame_rate'], int(controls.FrameRate.FPS30))
+
+    def test_unknown_session_is_not_reported_as_asleep_or_retried(self):
+        owner = self.settings_owner()
+        owner.state = 'error'
+        owner.stream = Mock(state='RECOVERY_REQUIRED')
+        owner.stop_readers = Mock()
+        for action in ('start', 'stop', 'sleep', 'wake', 'reboot', 'refresh', 'configure'):
+            with self.subTest(action=action), self.assertRaisesRegex(RuntimeError, 'RECOVERY_REQUIRED'):
+                owner.execute(action, {})
+        self.assertEqual(owner.state, 'error')
+        owner.stream.sleep.assert_not_called()
+        owner.stream.wake.assert_not_called()
+        owner.stream.close.assert_not_called()
+        owner.stop_readers.assert_not_called()
+        owner.camera.usb_stream.assert_not_called()
 
     def test_manual_shutter_value_is_preserved(self):
         owner = self.settings_owner()

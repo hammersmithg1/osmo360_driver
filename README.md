@@ -228,6 +228,17 @@ again uses `wake()`. Complete cleanup happens on driver shutdown, configuration
 or reboot. Status includes the actual startup phase, command elapsed time and
 the installation/autostart proof returned by the SDK.
 
+Video and IMU readers start as soon as the SDK supplies a healthy stream,
+before optional settings queries. A failed GET clears the settings snapshot
+and appears in `settings_error` with the affected field; it does not stop
+video/IMU or fail a recording. Configuration SETs and their readback remain
+strict. A later successful refresh clears the warning.
+
+If the SDK reports `RECOVERY_REQUIRED`, ordinary transitions are blocked:
+the driver must not label an uncertain session as sleeping or repeat wake.
+Stop the driver, power-cycle only the camera, and restart the driver to clear
+an unknown pending camera operation. Restarting the Pi is not required.
+
 | Topic | Type / contents |
 | --- | --- |
 | `/osmo360/image/compressed` | `sensor_msgs/CompressedImage`, dual-fisheye JPEG, quality 92 |

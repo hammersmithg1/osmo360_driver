@@ -81,6 +81,7 @@ class OsmoCamera:
         self.helpers_ready = False
         self.state = 'disconnected'
         self.settings = {}
+        self.settings_error = ''
         self.calibration = {}
         self.capture_stats = {}
         self.worker = threading.Thread(target=self.run, name='Osmo control', daemon=True)
@@ -114,7 +115,7 @@ class OsmoCamera:
                         frames=self.frames, imu_samples=self.imu_samples,
                         imu_age_s=now - self.imu_at if self.imu_at else None,
                         mode={'width': 2048, 'height': 1024, 'fps': 30},
-                        projection='dual_fisheye', settings=dict(self.settings),
+                        projection='dual_fisheye', settings=dict(self.settings), settings_error=self.settings_error,
                         clock=self.clock.status(), calibration=self.calibration,
                         stats=self.capture_stats)
 
@@ -158,23 +159,48 @@ class OsmoCamera:
             raise RuntimeError('SDK не подтвердил установку и автозапуск служебных скриптов Osmo')
         self.helpers_ready = True
 
-    def read_settings(self):
+    def read_settings(self, *, strict=True):
         cam = self.camera
-        exposure = int(cam.exposure_mode().mode)
-        iso, wb = cam.iso(), cam.white_balance()
         try:
-            shutter = cam.shutter_setting()
-        except CameraReplyError as exc:
-            # GET_SHUTTER returns DF when no manual shutter was set in Auto/P.
-            # This observed reply is not a failed stream or a requested SET.
-            if exc.status != 0xDF or exposure not in (ExposureMode.AUTO, ExposureMode.PROGRAM):
-                raise
-            shutter = None
+            field = 'экспозицию'
+            exposure = int(cam.exposure_mode().mode)
+            field = 'ISO'
+            iso = cam.iso()
+            field = 'баланс белого'
+            wb = cam.white_balance()
+            field = 'выдержку'
+            try:
+                shutter = cam.shutter_setting()
+            except CameraReplyError as exc:
+                # GET_SHUTTER returns DF when no manual shutter was set in Auto/P.
+                # This observed reply is not a failed stream or a requested SET.
+                if exc.status != 0xDF or exposure not in (ExposureMode.AUTO, ExposureMode.PROGRAM):
+                    raise
+                shutter = None
+            field = 'цветовой профиль'
+            color = int(cam.color().mode)
+            field = 'частоту съёмки'
+            frame_rate = int(cam.video_format().frame_rate)
+        except Exception as exc:
+            # Never expose a stale or guessed snapshot as verified settings.
+            # Metadata GET failures do not invalidate already healthy data.
+            self.settings = {}
+            self.settings_error = f'Не удалось прочитать {field}: {exc}'
+            if strict:
+                raise RuntimeError(self.settings_error) from exc
+            return False
         self.settings = dict(exposure_mode=exposure,
                              iso=0 if iso.automatic else iso.iso,
                              white_balance=0 if wb.mode == WhiteBalanceMode.AUTO else wb.kelvin,
-                             color=int(cam.color().mode), frame_rate=int(cam.video_format().frame_rate),
+                             color=color, frame_rate=frame_rate,
                              shutter_denominator=shutter.shutter.value if shutter and shutter.shutter.reciprocal else 0)
+        self.settings_error = ''
+        return True
+
+    def require_session_state(self):
+        if self.stream is not None and self.stream.state not in ('AWAKE', 'SLEEP'):
+            raise RuntimeError('SDK не подтвердил состояние USB-сессии (' + self.stream.state +
+                               '). Выключи и включи только Osmo 360, затем перезапусти драйвер')
 
     def stop_readers(self):
         self.reader_stop.set()
@@ -212,6 +238,7 @@ class OsmoCamera:
             self.stream = None
 
     def activate(self):
+        self.require_session_state()
         # The resumable SDK owns readiness, standby discovery and wake.
         self.connect(wait_ready=False)
         if self.enabled:
@@ -225,14 +252,16 @@ class OsmoCamera:
         elif self.stream.state == 'SLEEP':
             self.state = 'waking'
             self.stream.wake()
-        elif self.stream.state != 'AWAKE':
-            raise RuntimeError('Неопределённое состояние USB-сессии; перезапусти драйвер')
-        # Settings queries belong to the owner thread, before data readers.
-        self.state = 'reading_settings'
-        self.read_settings()
+        # Drain video and 8 kHz IMU immediately. Optional camera GETs stay on
+        # the owner thread, but must neither block readers nor fail capture.
         self.start_readers()
+        self.state = 'reading_settings'
+        self.read_settings(strict=False)
+        if self.enabled:
+            self.state = 'streaming'
 
     def apply_settings(self, values):
+        self.require_session_state()
         restart = self.enabled
         self.close_stream()
         self.connect()
@@ -263,6 +292,7 @@ class OsmoCamera:
         if action in ('start', 'wake'):
             self.activate()
         elif action in ('stop', 'sleep'):
+            self.require_session_state()
             if self.stream is None:
                 if action == 'stop':
                     self.state = 'idle' if self.camera and self.camera.connected else 'disconnected'
@@ -274,6 +304,7 @@ class OsmoCamera:
                 self.stream.sleep()
             self.state = 'sleeping'
         elif action == 'reboot':
+            self.require_session_state()
             if self.stream is not None and self.stream.state == 'SLEEP':
                 self.state = 'waking'
                 self.stream.wake()
@@ -282,15 +313,16 @@ class OsmoCamera:
             self.state = 'rebooting'
             self.camera.reboot(timeout=90)
             self.clock = CameraClock(self.host_offset_ns)
-            self.read_settings()
+            self.read_settings(strict=False)
             self.state = 'idle'
         elif action == 'configure':
             self.apply_settings(settings)
         elif action == 'refresh':
+            self.require_session_state()
             if self.state == 'sleeping':
                 raise ValueError('Сначала разбуди камеру')
             self.connect()
-            self.read_settings()
+            self.read_settings(strict=False)
             if not self.enabled:
                 self.state = 'idle'
 
