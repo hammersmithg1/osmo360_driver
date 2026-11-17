@@ -178,6 +178,21 @@ class IMUNativeIntervalTests(unittest.TestCase):
                     stream.stats["nonincreasing_ticks"], max(0, len(ticks) - 1)
                 )
 
+    def test_receive_times_remain_available_without_consumer_reads(self):
+        stream = self.replay([])
+        self.assertIsNone(stream.stats["first_host_receive_monotonic_ns"])
+        self.assertIsNone(stream.stats["last_host_receive_monotonic_ns"])
+
+        stream = self.replay([
+            datagram(1000, host_receive_monotonic_ns=7_000_000_000),
+            datagram(3400, host_receive_monotonic_ns=7_125_000_000),
+        ])
+        # Diagnostics describe arrival at the collector, even when no client
+        # consumes the samples queued by the receiver.
+        self.assertEqual(stream.stats["first_host_receive_monotonic_ns"], 7_000_000_000)
+        self.assertEqual(stream.stats["last_host_receive_monotonic_ns"], 7_125_000_000)
+        self.assertEqual(stream.stats["received"], 2)
+
     def test_nonincreasing_ticks_are_counted_and_do_not_replace_positive_maximum(self):
         stream = self.replay(
             [datagram(tick) for tick in (10_000, 10_000, 9000, 9005, 9005, 8995, 8997)]

@@ -124,6 +124,29 @@ class VideoTests(TestCase):
             with self.assertRaises(VideoStreamError):
                 stream.start()
 
+    def test_latest_video_motion_evidence_tracks_real_post_resume_fixture_without_consuming(self):
+        resumed = json.loads((ROOT / "tests/fixtures/preview_sei_resume_empty.json").read_text())
+        stream = VideoStream(decode=False, queue_size=1)
+        self.assertIsNone(stream.stats["latest_video"])
+        stream._on_video(RAW, 0)
+        first = stream.stats["latest_video"]
+        self.assertEqual(first["motion"]["sample_count"], 33)
+        stream._on_video(b"\0\0\0\1" + bytes.fromhex(resumed["nal_hex"]), 0)
+        latest = stream.stats["latest_video"]
+        self.assertEqual(latest["timestamp_ns"], resumed["expected"]["frame_clock_ns_raw"])
+        self.assertEqual(latest["motion"]["sample_count"], 0)
+        self.assertEqual(latest["motion"]["imu_clock_us_raw"], 0)
+        self.assertTrue(latest["motion"]["motion_header_only"])
+        self.assertFalse(latest["motion"]["motion_samples_available"])
+        self.assertEqual(stream.stats["queued_frames"], 1)
+        self.assertEqual(stream.stats["dropped_frames"], 1)
+        self.assertLess(len(json.dumps(latest)), 1024)
+        self.assertNotIn("motion_body_hex", latest["motion"])
+        self.assertNotIn("quaternions", first["motion"])
+        latest["motion"]["sample_count"] = 999
+        stream._queue[-1].metadata["sample_count"] = 888
+        self.assertEqual(stream.stats["latest_video"]["motion"]["sample_count"], 0)
+
     def test_decoder_receives_every_access_unit_before_decoded_queue_drops(self):
         codec = FakeCodec()
         fake_av = SimpleNamespace(

@@ -25,6 +25,60 @@ from ._ssc import decode_diag_packet
 BIT_REVERSE_TABLE = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
 HDLC_ESCAPE = re.compile(rb"\x7d(.)", re.DOTALL)
 UNESCAPED_BYTES = tuple(bytes([i ^ 0x20]) for i in range(256))
+LIVE_PREFIX = 'OSMO_IMU_STATUS '
+
+
+class _LiveStatus:
+    """Bounded host-only evidence; never performs USB or changes recovery."""
+
+    def __init__(self, snapshot, *, clock=None, output=None):
+        self.snapshot = snapshot
+        self.clock = clock or time.monotonic_ns
+        self.output = output or (lambda line: print(line, flush=True))
+        self.phase = 'starting'
+        self.times = dict(mask_verified_ns=None, first_ssc_ns=None, first_pair_ns=None,
+                          fatal_read_ns=None, fatal_read_status=None, fatal_read_phase=None)
+        self.events = []
+        self.latest = None
+        self.last_output_ns = None
+        self.output_failed = False
+        self._fatal_phases = set()
+
+    def mark(self, event, *, at_ns=None, status=None, **fields):
+        now = self.clock() if at_ns is None else at_ns
+        if event in ('mask_verified', 'first_ssc', 'first_pair'):
+            key = event + '_ns'
+            if self.times[key] is not None:
+                return
+            self.times[key] = now
+        elif event == 'fatal_read':
+            if self.phase in self._fatal_phases:
+                return
+            self._fatal_phases.add(self.phase)
+            if self.times['fatal_read_ns'] is None:
+                self.times.update(fatal_read_ns=now, fatal_read_status=status,
+                                  fatal_read_phase=self.phase)
+        self._emit(event, now, **fields)
+
+    def progress(self):
+        now = self.clock()
+        if self.last_output_ns is None or now - self.last_output_ns >= 1_000_000_000:
+            self._emit('progress', now)
+
+    def _emit(self, event, now, **fields):
+        value = dict(schema=1, event=event, monotonic_ns=now, phase=self.phase,
+                     **self.snapshot(), **self.times, **fields)
+        self.latest = value
+        self.last_output_ns = now
+        if event != 'progress':
+            self.events.append(value)
+            del self.events[:-12]
+        if not self.output_failed:
+            try:
+                self.output(LIVE_PREFIX + json.dumps(value, separators=(',', ':'), allow_nan=False))
+            except (OSError, ValueError):
+                # Losing the diagnostic pipe cannot bypass mask restoration.
+                self.output_failed = True
 
 
 def checksum(data):
@@ -515,7 +569,7 @@ def main():
         "errors": [],
     }
     raw, packets, sample_file, udp = None, None, None, None
-    sample_counts, sample_decode_errors, udp_drops = Counter(), 0, 0
+    sample_counts, sample_decode_errors, udp_drops, udp_sent = Counter(), 0, 0, 0
     pending_pairs, paired_samples, evicted_unpaired = {}, 0, 0
     streaming_enabled = False
     decode_samples = None
@@ -523,6 +577,16 @@ def main():
         decode_samples = decode_diag_packet
     # Reuse the host buffer; Decoder retains packets split across USB reads.
     read_buffer = C.create_string_buffer(args.read_buffer_bytes)
+    io_counts = dict(usb_reads=0, usb_bytes=0, usb_timeouts=0, last_read_status=None)
+
+    def live_snapshot():
+        return dict(io_counts, ssc_packets=log_codes['19cb'],
+                    accel_samples=sample_counts['accel'], gyro_samples=sample_counts['gyro'],
+                    paired_samples=paired_samples, sample_decode_errors=sample_decode_errors,
+                    udp_sent=udp_sent, udp_drops=udp_drops, bad_crc=decoder.bad_crc,
+                    unpaired_pending=len(pending_pairs))
+
+    live = _LiveStatus(live_snapshot)
 
     def close_original():
         nonlocal claimed, handle
@@ -552,6 +616,7 @@ def main():
         nonlocal \
             sample_decode_errors, \
             udp_drops, \
+            udp_sent, \
             paired_samples, \
             evicted_unpaired, \
             fatal_read_status
@@ -560,8 +625,13 @@ def main():
             handle, 0x81, read_buffer, len(read_buffer), C.byref(received), 150
         )
         received_at_ns = time.monotonic_ns()
+        io_counts['usb_reads'] += 1
+        io_counts['usb_bytes'] += received.value
+        io_counts['usb_timeouts'] += code == -7
+        io_counts['last_read_status'] = code
         if code not in (0, -7):
             fatal_read_status = code
+            live.mark('fatal_read', at_ns=received_at_ns, status=code)
             osmo_usb.check(usb, code, "DIAG read")
         data = read_buffer.raw[: received.value]
         if raw:
@@ -573,6 +643,9 @@ def main():
             if body[0] == 0x10 and len(body) >= 16:
                 log_code = struct.unpack_from("<H", body, 6)[0]
                 log_codes[f"{log_code:04x}"] += 1
+                if (log_code == 0x19CB and streaming_enabled
+                        and live.times['first_ssc_ns'] is None):
+                    live.mark('first_ssc', at_ns=received_at_ns)
             if packets:
                 entry = {
                     "host_monotonic_s": time.monotonic(),
@@ -627,6 +700,8 @@ def main():
                         }
                         del pending_pairs[tick]
                         paired_samples += 1
+                        if paired_samples == 1:
+                            live.mark('first_pair', at_ns=received_at_ns)
                     line, datagram = _sample_outputs(
                         output,
                         write_json=sample_file is not None,
@@ -637,8 +712,10 @@ def main():
                     if udp:
                         try:
                             udp.sendto(datagram, ("127.0.0.1", args.udp_port))
+                            udp_sent += 1
                         except (BlockingIOError, OSError):
                             udp_drops += 1
+        live.progress()
         return decoded
 
     def request(body, operation, timeout=3):
@@ -717,6 +794,8 @@ def main():
             raise RuntimeError("Камера не подтвердила запрошенную маску логирования")
         # Не выдаём старые логи, прочитанные вместе с исходной маской до запуска.
         streaming_enabled = True
+        live.phase = 'capture'
+        live.mark('mask_verified')
         print("Sensor log mask enabled; capture started", flush=True)
         deadline = time.monotonic() + args.seconds if args.seconds else float("inf")
         while time.monotonic() < deadline:
@@ -726,6 +805,8 @@ def main():
     except (OSError, RuntimeError) as error:
         report["errors"].append(str(error) or "interrupted")
     finally:
+        live.phase = 'cleanup'
+        live.mark('cleanup_started')
         streaming_enabled = False
         if attempted:
 
@@ -774,6 +855,10 @@ def main():
             evicted_unpaired=evicted_unpaired,
             samples_jsonl=str(args.samples_jsonl) if args.samples_jsonl else None,
         )
+        live.phase = 'finished'
+        live.mark('collector_finished', restored=bool(report['restored']), error_count=len(report['errors']))
+        report.update(collector_live=live.latest, collector_events=live.events,
+                      live_output_failed=live.output_failed)
         paths["json"].write_text(json.dumps(report, indent=2) + "\n")
     print(
         json.dumps(

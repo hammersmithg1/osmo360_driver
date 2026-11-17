@@ -23,9 +23,9 @@ from ._preview_lease import PreviewLease
 from ._standby_control import _token
 from ._usb_bundle import build_bundle, NAMES
 from ._usb_plan import _validate_runtime
-from .imu import IMUStream
+from .imu import IMUStream, TICK_HZ
 from .usb_preview import USBPreview
-from .video import VideoStream
+from .video import VideoStream, _video_evidence, _motion_evidence
 
 WATCHER = "prepared_preview_wake_047.py"
 SOURCES = {
@@ -288,10 +288,16 @@ class FreshnessWitness:
             )
         self.floor, self.host_epoch = native_floor_ns, wake_host_ns
         self.first_video = self.first_imu = None
+        self.latest_video = self.latest_imu = self.first_video_motion = None
         self.rejected_video = self.rejected_imu = 0
 
     def _observe(self, sample, kind):
         native, host = sample.timestamp_ns, sample.host_receive_monotonic_ns
+        evidence = (
+            _video_evidence(sample) if kind == "video"
+            else dict(timestamp_ns=native, host_receive_monotonic_ns=host)
+        )
+        setattr(self, "latest_" + kind, evidence)
         valid = (
             type(native) is int
             and native > self.floor
@@ -306,7 +312,25 @@ class FreshnessWitness:
             setattr(
                 self, name, dict(timestamp_ns=native, host_receive_monotonic_ns=host)
             )
+            if kind == "video":
+                self.first_video_motion = deepcopy(evidence["motion"])
         return True
+
+    def snapshot_latest(self, *, video=None, imu=None):
+        """Refresh diagnostics from producer snapshots, never freshness gates."""
+        if isinstance(video, dict):
+            self.latest_video = dict(
+                timestamp_ns=video.get("timestamp_ns"),
+                host_receive_monotonic_ns=video.get("host_receive_monotonic_ns"),
+                motion=_motion_evidence(video.get("motion")),
+            )
+        if isinstance(imu, dict):
+            ticks = imu.get("last_timestamp_ticks")
+            if type(ticks) is int and ticks >= 0:
+                self.latest_imu = dict(
+                    timestamp_ns=ticks * 1_000_000_000 // TICK_HZ,
+                    host_receive_monotonic_ns=imu.get("last_host_receive_monotonic_ns"),
+                )
 
     def observe_video(self, frame):
         return self._observe(frame, "video")
@@ -326,6 +350,9 @@ class FreshnessWitness:
             joint_ready=self.joint_ready,
             first_video=deepcopy(self.first_video),
             first_imu=deepcopy(self.first_imu),
+            first_video_motion=deepcopy(self.first_video_motion),
+            latest_video=deepcopy(self.latest_video),
+            latest_imu=deepcopy(self.latest_imu),
             rejected_video=self.rejected_video,
             rejected_imu=self.rejected_imu,
         )

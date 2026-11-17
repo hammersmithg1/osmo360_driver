@@ -889,6 +889,28 @@ class USBStreamSession:
                 error  # No second input, even on a lost USB reply.
             )
 
+    def _wake_freshness_diagnostics(self):
+        """Copy existing producer evidence without reading queues or USB."""
+        prepared = self._prepared
+        witness = getattr(prepared, "witness", None)
+        if witness is None:
+            return
+        try:
+            snapshot = getattr(witness, "snapshot_latest", None)
+            if callable(snapshot):
+                preview = getattr(prepared, "preview", None)
+                imu = getattr(prepared, "imu", None)
+                video_stats = preview.stats.get("video") if preview is not None else None
+                snapshot(
+                    video=video_stats.get("latest_video") if isinstance(video_stats, dict) else None,
+                    imu=imu.stats if imu is not None else None,
+                )
+            prepared.report["freshness"] = deepcopy(witness.report)
+        except Exception as error:
+            # Evidence collection must not change a successful gate or replace
+            # the transition's primary failure during postmortem capture.
+            prepared.report["freshness_snapshot_error"] = repr(error)[:240]
+
     def wake(self, *, timeout=45):
         if (
             type(timeout) not in (int, float)
@@ -914,8 +936,20 @@ class USBStreamSession:
                 )
             self._set_state("WAKING")
             began = self.clock()
+            startup = dict(timeout_s=timeout, stages=[])
+            self._prepared.report["wake_startup"] = startup
+
+            def stage(name):
+                startup["stages"].append(dict(
+                    stage=name,
+                    host_monotonic_ns=time.monotonic_ns(),
+                    elapsed_s=self.clock() - began,
+                ))
+
             try:
+                stage("watcher_arm_started")
                 self._prepared.arm_watcher()
+                stage("watcher_armed")
                 self._wake_outcome = {}
                 self._late_verified = False
                 self._wake_thread = threading.Thread(
@@ -923,11 +957,13 @@ class USBStreamSession:
                 )
                 wake_host_ns = time.monotonic_ns()
                 self._wake_thread.start()
+                stage("wake_thread_started")
                 elapsed = max(0, began - self._stable_sleep_at)
                 floor = self._native_floor_ns + int(elapsed * 1_000_000_000)
                 self._preview, attached_imu = self._prepared.attach_data_first(
                     timeout=timeout, native_floor_ns=floor, wake_host_ns=wake_host_ns
                 )
+                stage("data_attached")
                 imu_starter = getattr(self._prepared, "start_imu_after_video", None)
                 imu_waiting = callable(imu_starter)
                 self._imu = None if imu_waiting else attached_imu
@@ -952,6 +988,7 @@ class USBStreamSession:
                             if witness.observe_imu(sample):
                                 self._primed_imu.append(sample)
                                 imu_ready = True
+                                stage("first_imu_accepted")
                     remaining = deadline - self.clock()
                     if remaining <= 0:
                         raise TimeoutError("Fresh joint data arrived after deadline")
@@ -964,18 +1001,23 @@ class USBStreamSession:
                             if witness.observe_video(frame):
                                 self._primed_video.append(frame)
                                 video_ready = True
+                                stage("first_video_accepted")
                                 if imu_waiting:
                                     if self.clock() >= deadline:
                                         raise TimeoutError(
                                             "Fresh video arrived after DIAG start deadline"
                                         )
                                     self._imu = attached_imu
+                                    stage("imu_start_started")
                                     imu_starter(frame)
                                     imu_waiting = False
+                                    stage("imu_mask_ready")
                 if self.clock() >= deadline or not witness.joint_ready:
                     raise TimeoutError(
                         "Joint freshness proof not complete within deadline"
                     )
+                stage("joint_ready")
+                self._wake_freshness_diagnostics()
                 self._prepared.report.update(
                     media_ready_proven=True, freshness=deepcopy(witness.report)
                 )
@@ -988,6 +1030,9 @@ class USBStreamSession:
                 self._set_state("AWAKE")
                 return self
             except BaseException as error:
+                startup["failed_after"] = startup["stages"][-1]["stage"] if startup["stages"] else None
+                stage("failed")
+                self._wake_freshness_diagnostics()
                 self.report["errors"].append("Wake: " + repr(error))
                 # The cycle's prepared snapshot predates arm/attach. Freeze the
                 # actual failed backend before cleanup/recovery can change it;

@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -15,6 +16,8 @@ from unittest.mock import Mock, patch
 from osmo360_camera import _prepared_stream as m
 from osmo360_camera._usb_bootstrap import USBRuntime, FUNCTIONS
 from osmo360_camera._usb_plan import build_usb_plan
+from osmo360_camera.video import VideoFrame, VideoStream
+from osmo360_camera.vendor.preview_metadata import records_from_video
 
 OWNER, SERVICE = dict(pid=4001, start="100"), dict(pid=801, start="10")
 RECEIPT = dict(
@@ -408,6 +411,39 @@ class PreparedTests(unittest.TestCase):
         copied = value.report
         copied["first_imu"]["timestamp_ns"] = 999
         self.assertEqual(value.report["first_imu"]["timestamp_ns"], 102)
+
+    def test_real_post_resume_motion_diagnostics_do_not_become_an_imu_readiness_gate(self):
+        fixtures = Path(__file__).parent / "fixtures"
+        empty = json.loads((fixtures / "preview_sei_resume_empty.json").read_text())
+        raw = b"\0\0\0\1" + bytes.fromhex(empty["nal_hex"])
+        metadata = {}
+        for record in records_from_video(raw):
+            metadata.update(record)
+        witness = m.FreshnessWitness(0, 1000)
+        frame = VideoFrame(empty["expected"]["frame_clock_ns_raw"], 1001, None, raw, metadata)
+        self.assertTrue(witness.observe_video(frame))
+        self.assertFalse(witness.joint_ready)
+        self.assertEqual(witness.report["first_video_motion"]["sample_count"], 0)
+        # A producer snapshot can reveal later native motion even while the
+        # joint gate still lacks any actually read/accepted DIAG sample.
+        current = json.loads((fixtures / "preview_sei_native.json").read_text())["current"][0]
+        stream = VideoStream(decode=False)
+        stream._on_video(b"\0\0\0\1" + bytes.fromhex(current["nal_hex"]), 0)
+        witness.snapshot_latest(video=stream.stats["latest_video"], imu={
+            "last_timestamp_ticks": 19_200_001,
+            "last_host_receive_monotonic_ns": 1002,
+        })
+        result = witness.report
+        self.assertEqual(result["latest_video"]["motion"]["sample_count"], 33)
+        self.assertEqual(result["latest_imu"]["timestamp_ns"], 1_000_000_052)
+        self.assertEqual(result["latest_imu"]["host_receive_monotonic_ns"], 1002)
+        self.assertEqual(result["first_video"]["timestamp_ns"], frame.timestamp_ns)
+        self.assertEqual(result["first_video_motion"]["sample_count"], 0)
+        self.assertIsNone(result["first_imu"])
+        self.assertFalse(result["joint_ready"])
+        self.assertEqual((result["rejected_video"], result["rejected_imu"]), (0, 0))
+        result["latest_video"]["motion"]["sample_count"] = 999
+        self.assertEqual(witness.report["latest_video"]["motion"]["sample_count"], 33)
 
     def test_failed_lease_does_not_expose_normal_preview_cleanup(self):
         lease = Lease(self.events, {})

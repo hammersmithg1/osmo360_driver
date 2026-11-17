@@ -36,6 +36,52 @@ from typing import Callable
 from ._imu_wire import BINARY_PREFIX, TICK_HZ, unpack_sample
 
 READY_LINE = "Sensor log mask enabled; capture started"
+LIVE_PREFIX = 'OSMO_IMU_STATUS '
+_LIVE_EVENTS = {'progress', 'mask_verified', 'first_ssc', 'first_pair',
+                'fatal_read', 'cleanup_started', 'collector_finished'}
+_LIVE_PHASES = {'starting', 'capture', 'cleanup', 'finished'}
+_LIVE_COUNTS = {'usb_reads', 'usb_bytes', 'usb_timeouts', 'ssc_packets',
+                'accel_samples', 'gyro_samples', 'paired_samples',
+                'sample_decode_errors', 'udp_sent', 'udp_drops', 'bad_crc', 'unpaired_pending'}
+_LIVE_TIMES = {'mask_verified_ns', 'first_ssc_ns', 'first_pair_ns', 'fatal_read_ns'}
+
+
+def _collector_status(line):
+    """Accept only the bounded numeric schema, never collector raw output."""
+    if not line.startswith(LIVE_PREFIX) or len(line) > 4096:
+        return None
+    try:
+        value = json.loads(line[len(LIVE_PREFIX):])
+    except (ValueError, TypeError, RecursionError):
+        return None
+    required = _LIVE_COUNTS | _LIVE_TIMES | {
+        'schema', 'event', 'phase', 'monotonic_ns', 'last_read_status',
+        'fatal_read_status', 'fatal_read_phase'}
+    if (type(value) is not dict or not required <= value.keys()
+            or value.keys() - required - {'restored', 'error_count'}
+            or type(value['schema']) is not int or value['schema'] != 1
+            or type(value['event']) is not str or type(value['phase']) is not str
+            or value['event'] not in _LIVE_EVENTS or value['phase'] not in _LIVE_PHASES):
+        return None
+
+    def uint(number):
+        return type(number) is int and 0 <= number <= 0xffffffffffffffff
+
+    if not uint(value['monotonic_ns']) or any(not uint(value[key]) for key in _LIVE_COUNTS):
+        return None
+    if any(value[key] is not None and not uint(value[key]) for key in _LIVE_TIMES):
+        return None
+    for key in ('last_read_status', 'fatal_read_status'):
+        number = value[key]
+        if number is not None and (type(number) is not int or not -0x80000000 <= number < 0x80000000):
+            return None
+    if value['fatal_read_phase'] is not None and (
+            type(value['fatal_read_phase']) is not str or value['fatal_read_phase'] not in _LIVE_PHASES):
+        return None
+    if ('restored' in value and type(value['restored']) is not bool
+            or 'error_count' in value and not uint(value['error_count'])):
+        return None
+    return value
 
 
 class IMUStreamError(RuntimeError):
@@ -203,6 +249,9 @@ class IMUStream:
         self._stop_error = None
         self._threads = []
         self._tail = deque(maxlen=20)
+        self._collector_live = None
+        self._collector_live_at = None
+        self._collector_events = deque(maxlen=12)
         self._lock = threading.Lock()
         self._stats = dict(
             received=0,
@@ -215,6 +264,8 @@ class IMUStream:
             nonincreasing_ticks=0,
             gaps_over_5ms=0,
             max_native_interval_ticks=None,
+            first_host_receive_monotonic_ns=None,
+            last_host_receive_monotonic_ns=None,
         )
 
     @property
@@ -243,6 +294,10 @@ class IMUStream:
     def stats(self) -> dict:
         with self._lock:
             result = dict(self._stats)
+            result['collector_live'] = dict(self._collector_live) if self._collector_live else None
+            result['collector_live_age_s'] = (max(0, time.monotonic() - self._collector_live_at)
+                                               if self._collector_live_at is not None else None)
+            result['collector_events'] = [dict(event) for event in self._collector_events]
         first, last = result["first_timestamp_ticks"], result["last_timestamp_ticks"]
         result["observed_rate_hz"] = (
             (result["received"] - 1) * TICK_HZ / (last - first)
@@ -352,8 +407,15 @@ class IMUStream:
         try:
             for line in self._process.stdout:
                 line = line.rstrip()
+                live = _collector_status(line)
                 with self._lock:
                     self._tail.append(line[:1000])
+                    if live is not None and (self._collector_live is None
+                            or live['monotonic_ns'] >= self._collector_live['monotonic_ns']):
+                        self._collector_live = live
+                        self._collector_live_at = time.monotonic()
+                        if live['event'] != 'progress':
+                            self._collector_events.append(live)
                 if line == READY_LINE:
                     self._ready.set()
         finally:
@@ -399,7 +461,9 @@ class IMUStream:
                             self._stats["max_native_interval_ticks"] = delta
                     else:
                         self._stats["first_timestamp_ticks"] = sample.timestamp_ticks
+                        self._stats['first_host_receive_monotonic_ns'] = sample.host_receive_monotonic_ns
                     self._stats["last_timestamp_ticks"] = sample.timestamp_ticks
+                    self._stats['last_host_receive_monotonic_ns'] = sample.host_receive_monotonic_ns
                     self._stats["received"] += 1
                 self._put_recent(self._queue, sample, "queue_drops")
                 if self._callbacks is not None:

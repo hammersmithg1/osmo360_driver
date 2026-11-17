@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock
 
 from osmo360_camera import _stream_session as m
-from osmo360_camera._prepared_stream import UnknownFutureApply
+from osmo360_camera._prepared_stream import FreshnessWitness, UnknownFutureApply
 from test_stream_session import Environment, Prepared
 from test_fast_sleep import Preview, IMU, SleepingPrepared
 
@@ -269,6 +269,49 @@ class RetainedSessionTests(unittest.TestCase):
         failure['prepared']['errors'].append('caller edit')
         frozen = session.stats['report']['wake_failure']['prepared']['errors']
         self.assertEqual(frozen, ["TimeoutError('Retained completion/data deadline')"])
+
+    def test_failed_joint_wake_keeps_latest_producer_evidence_and_startup_stages(self):
+        env, session, old, factory, _ = self.setup_session()
+        session.sleep()
+        backend = factory.created[0]
+        attach = backend.attach_data_first
+
+        def attach_without_imu(**options):
+            preview, imu = attach(**options)
+            backend.witness = FreshnessWitness(options['native_floor_ns'], options['wake_host_ns'])
+            preview.stats = {'video': {'latest_video': {
+                'timestamp_ns': options['native_floor_ns'] + 500,
+                'host_receive_monotonic_ns': options['wake_host_ns'] + 500,
+                'motion': {'sample_count': 33, 'imu_clock_us_raw': 123},
+            }}}
+            imu.items.clear()
+            imu.stats = {'received': 0, 'last_timestamp_ticks': None,
+                         'last_host_receive_monotonic_ns': None, 'collector_returncode': None}
+            backend.start_imu_after_video = lambda frame: env.events.append('fresh.imu.start')
+            return preview, imu
+
+        backend.attach_data_first = attach_without_imu
+        with self.assertRaises(TimeoutError):
+            session.wake(timeout=1)
+        failure = session.stats['report']['wake_failure']['prepared']
+        witness = failure['freshness']
+        self.assertIsNotNone(witness['first_video'])
+        self.assertIsNone(witness['first_imu'])
+        self.assertEqual(witness['latest_video']['motion']['sample_count'], 33)
+        self.assertGreater(witness['latest_video']['timestamp_ns'], witness['first_video']['timestamp_ns'])
+        self.assertIsNone(witness['latest_imu'])
+        self.assertFalse(witness['joint_ready'])
+        stages = failure['wake_startup']['stages']
+        self.assertEqual([row['stage'] for row in stages], [
+            'watcher_arm_started', 'watcher_armed', 'wake_thread_started',
+            'data_attached', 'first_video_accepted', 'imu_start_started',
+            'imu_mask_ready', 'failed',
+        ])
+        self.assertEqual(failure['wake_startup']['failed_after'], 'imu_mask_ready')
+        self.assertTrue(all(type(row['host_monotonic_ns']) is int for row in stages))
+        self.assertEqual(env.events.count('owner.wake'), 1)
+        self.assertEqual(env.events.count('fresh.imu.start'), 1)
+        self.assertNotIn('owner.wait.AWAKE', env.events)
 
     def test_next_accepted_sleep_failure_retires_previous_warm_cleanup_proof(self):
         env, session, old, factory, prepared = self.setup_session()

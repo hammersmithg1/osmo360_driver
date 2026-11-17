@@ -44,6 +44,33 @@ class VideoFrame:
         return self._bgr
 
 
+def _motion_evidence(metadata):
+    """Only scalar motion headers; never pixels, poses or raw payloads."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    motion = {}
+    for key in (
+        "motion_version", "motion_declared_body_length", "motion_body_length",
+        "imu_clock_us_raw", "imu_clock_available", "sample_count",
+        "motion_header_only", "motion_samples_available",
+    ):
+        value = metadata.get(key)
+        if type(value) is bool or type(value) is int and 0 <= value < 2**64:
+            motion[key] = value
+    error = metadata.get("motion_decode_error")
+    if isinstance(error, str):
+        motion["motion_decode_error"] = error[:64]
+    return motion
+
+
+def _video_evidence(frame):
+    """Bounded timing/motion evidence for one actually published frame."""
+    return dict(
+        timestamp_ns=frame.timestamp_ns,
+        host_receive_monotonic_ns=frame.host_receive_monotonic_ns,
+        motion=_motion_evidence(getattr(frame, "metadata", None)),
+    )
+
+
 _START = re.compile(rb"\x00\x00\x00?\x01")
 _TIME_BASE = Fraction(1, 1_000_000_000)
 
@@ -200,6 +227,7 @@ class VideoStream:
         self._thread = self._link = self._decoder = self._av = self._error = None
         self._metadata_error = None
         self._missing_timestamp = self._first_missing_timestamp = None
+        self._latest_video = None
         self._counts = dict(
             encoded_units=0,
             encoded_bytes=0,
@@ -243,6 +271,7 @@ class VideoStream:
                 error_cause=error_cause,
                 metadata_error=deepcopy(self._metadata_error),
                 missing_timestamp=deepcopy(self._missing_timestamp),
+                latest_video=deepcopy(self._latest_video),
                 first_missing_timestamp=deepcopy(self._first_missing_timestamp),
                 network=dict(self._link.stats) if self._link else {},
             )
@@ -317,6 +346,7 @@ class VideoStream:
                 self._counts["dropped_frames"] += 1
             self._queue.append(frame)
             self._counts["published_frames"] += 1
+            self._latest_video = _video_evidence(frame)
             self._condition.notify_all()
 
     def _on_video(self, data, first_packet):
