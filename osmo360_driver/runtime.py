@@ -316,6 +316,11 @@ class OsmoCamera:
                     cause = getattr(exc, 'last_error', None) or exc.__cause__
                     if cause is not None and str(cause) not in self.error:
                         self.error += ': ' + str(cause)
+                    if self.stream is not None:
+                        try:
+                            self.capture_stats = json_value(self.stream.stats)
+                        except Exception:
+                            pass  # Preserve the command's original failure.
                     self.state = 'error'
                     self.on_error(self.error)
                 finally:

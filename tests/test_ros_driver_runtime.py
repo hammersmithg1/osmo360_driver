@@ -182,6 +182,23 @@ class RuntimeTests(unittest.TestCase):
             owner.stream = None
             owner.close()
 
+    def test_failed_start_retains_sdk_report_for_diagnosis(self):
+        report = {'report': {'state': 'RECOVERY_REQUIRED', 'errors': ['initial preview failed']}}
+        session = SimpleNamespace(start=Mock(side_effect=RuntimeError('preview failed')), stats=report, close=Mock())
+        camera = SimpleNamespace(connected=True, state=Mock(side_effect=RequestTimeout('sleeping')),
+                                 usb_stream=Mock(return_value=session), close=Mock())
+        owner = OsmoCamera(camera_factory=lambda: camera)
+        try:
+            owner.command('start')
+            deadline = time.monotonic() + 2
+            while owner.status()['busy'] and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(owner.status()['state'], 'error')
+            self.assertEqual(owner.status()['stats'], report)
+            self.assertIn('preview failed', owner.status()['error'])
+        finally:
+            owner.close()
+
     def test_settings_are_validated_before_camera_is_touched(self):
         for values in ({'unknown': 1}, {'iso': True}, {'iso': 123}, {'white_balance': 2030}, {'frame_rate': 999}):
             with self.subTest(values=values), self.assertRaises(ValueError):
