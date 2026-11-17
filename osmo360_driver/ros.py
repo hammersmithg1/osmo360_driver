@@ -1,4 +1,8 @@
-"""Standard ROS messages. The optional sink receives EVERY sample before DDS.
+"""Standard ROS messages. Optional sinks receive EVERY sample before DDS.
+
+batch_sink(source, entries) receives one acquisition as (topic, message, stamp)
+entries, so recording start/stop and overflow cannot separate its companion
+timing/metadata messages. The original per-message sink remains supported.
 
 Browser JPEG is a viewing copy. /video/h264 retains the original Annex-B
 access units, including DJI metadata. SLAM can consume /image/compressed;
@@ -30,11 +34,11 @@ def compressed_image(data, stamp_ns, frame_id, format='jpeg'):
 
 
 class OsmoTopics:
-    def __init__(self, node, sink=None, *, has_sink_consumers=None):
-        self.sink = sink
+    def __init__(self, node, sink=None, *, has_sink_consumers=None, batch_sink=None):
+        self.sink, self.batch_sink = sink, batch_sink
         # Recording demand is checked for each sample, independently of ROS
         # discovery. A newly started recording must not wait for the timer.
-        self.has_sink_consumers = has_sink_consumers or (lambda: sink is not None)
+        self.has_sink_consumers = has_sink_consumers or (lambda: sink is not None or batch_sink is not None)
         types = {'sensor_msgs/msg/CompressedImage': CompressedImage, 'sensor_msgs/msg/Imu': Imu,
                  'std_msgs/msg/String': String, 'std_msgs/msg/UInt64MultiArray': UInt64MultiArray}
         qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -55,6 +59,15 @@ class OsmoTopics:
         if topic in subscribers:
             self.publishers[topic].publish(message)
 
+    def emit_group(self, entries, sink_active, subscribers):
+        # One acquisition and all its timing/metadata enter a recording together.
+        # The legacy per-message sink keeps its original callback ordering.
+        if sink_active and self.batch_sink is not None:
+            self.batch_sink('osmo360', entries)
+            sink_active = False
+        for topic, message, stamp_ns in entries:
+            self.emit(topic, message, stamp_ns, sink_active, subscribers)
+
     def video(self, frame, jpeg, stamp_ns):
         if frame.timestamp_ns is None:
             raise ValueError('Use video_unstamped for an access unit without native time')
@@ -68,42 +81,48 @@ class OsmoTopics:
 
     def _video(self, frame, jpeg, stamp_ns, *, valid_native):
         subscribers = self._subscribed_topics
-        sink_active = self.sink is not None and self.has_sink_consumers()
+        sink_active = (self.sink is not None or self.batch_sink is not None) and self.has_sink_consumers()
+        entries = []
         if valid_native and (sink_active or '/osmo360/image/compressed' in subscribers):
-            self.emit('/osmo360/image/compressed', compressed_image(
+            entries.append(('/osmo360/image/compressed', compressed_image(
                 jpeg, stamp_ns, 'osmo360_dual_fisheye', 'bgr8; jpeg compressed bgr8'),
-                stamp_ns, sink_active, subscribers)
+                stamp_ns))
         if sink_active or '/osmo360/video/h264' in subscribers:
-            self.emit('/osmo360/video/h264', compressed_image(
+            entries.append(('/osmo360/video/h264', compressed_image(
                 frame.raw_h264, stamp_ns, 'osmo360_dual_fisheye', 'h264'),
-                stamp_ns, sink_active, subscribers)
+                stamp_ns))
         if sink_active or '/osmo360/video/timing' in subscribers:
-            self.emit('/osmo360/video/timing', UInt64MultiArray(data=[
+            entries.append(('/osmo360/video/timing', UInt64MultiArray(data=[
                 stamp_ns, frame.timestamp_ns if valid_native else 0,
                 frame.host_receive_monotonic_ns, self.sequence, int(valid_native)]),
-                stamp_ns, sink_active, subscribers)
+                stamp_ns))
         if sink_active or '/osmo360/video/metadata' in subscribers:
             metadata = dict(frame.metadata, _rover_timing={
                 'valid_native': valid_native,
                 'stamp_source': 'camera_native' if valid_native else 'host_receive',
             })
-            self.emit('/osmo360/video/metadata', String(data=json.dumps(
+            entries.append(('/osmo360/video/metadata', String(data=json.dumps(
                 json_value(metadata), allow_nan=False, separators=(',', ':'))),
-                stamp_ns, sink_active, subscribers)
+                stamp_ns))
+        self.emit_group(entries, sink_active, subscribers)
         self.sequence += 1
 
     def imu(self, sample, stamp_ns):
         subscribers = self._subscribed_topics
-        sink_active = self.sink is not None and self.has_sink_consumers()
+        sink_active = (self.sink is not None or self.batch_sink is not None) and self.has_sink_consumers()
+        if not sink_active and '/osmo360/imu' not in subscribers and '/osmo360/imu/timing' not in subscribers:
+            return
+        entries = []
         if sink_active or '/osmo360/imu' in subscribers:
             message = set_header(Imu(), stamp_ns, 'osmo360_imu_native')
             message.angular_velocity.x, message.angular_velocity.y, message.angular_velocity.z = sample.gyro
             message.linear_acceleration.x, message.linear_acceleration.y, message.linear_acceleration.z = sample.accel
             # No fused orientation. Zero covariance means unknown (not calibrated).
             message.orientation_covariance[0] = -1.0
-            self.emit('/osmo360/imu', message, stamp_ns, sink_active, subscribers)
+            entries.append(('/osmo360/imu', message, stamp_ns))
         if sink_active or '/osmo360/imu/timing' in subscribers:
-            self.emit('/osmo360/imu/timing', UInt64MultiArray(data=[
+            entries.append(('/osmo360/imu/timing', UInt64MultiArray(data=[
                 stamp_ns, sample.timestamp_ns, sample.host_receive_monotonic_ns,
                 sample.timestamp_ticks, sample.accel_status, sample.gyro_status]),
-                stamp_ns, sink_active, subscribers)
+                stamp_ns))
+        self.emit_group(entries, sink_active, subscribers)

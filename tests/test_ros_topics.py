@@ -132,6 +132,50 @@ class RosTopicsTests(unittest.TestCase):
         topics.imu(self.sample, 1002)
         self.assertEqual(len(publisher.messages), 1)
 
+    def test_batch_sink_keeps_whole_native_unstamped_and_imu_groups_before_dds(self):
+        saved, order, legacy = [], [], Mock()
+
+        def batch(source, entries):
+            saved.append((source, tuple(entries)))
+            order.append('batch')
+
+        topics = self.OsmoTopics(self.node, sink=legacy, batch_sink=batch)
+        for publisher in self.node.publishers.values():
+            publisher.count = 1
+            publisher.publish = lambda message: order.append('dds')
+        topics.refresh_subscribers()
+        topics.video(self.frame, b'jpeg', 1000)
+        topics.video_unstamped(SimpleNamespace(raw_h264=b'original P', timestamp_ns=None,
+            host_receive_monotonic_ns=240, metadata={}), b'unknown jpeg', 1040)
+        topics.imu(self.sample, 1080)
+        self.assertEqual(order, ['batch', *['dds'] * 4, 'batch', *['dds'] * 3, 'batch', 'dds', 'dds'])
+        legacy.assert_not_called()  # A supplied batch sink owns archival delivery.
+        self.assertEqual([source for source, _ in saved], ['osmo360'] * 3)
+        self.assertEqual([len(entries) for _, entries in saved], [4, 3, 2])
+        self.assertEqual([{stamp for _, _, stamp in entries} for _, entries in saved], [{1000}, {1040}, {1080}])
+        unknown = {topic: message for topic, message, _ in saved[1][1]}
+        self.assertNotIn('/osmo360/image/compressed', unknown)
+        self.assertEqual(unknown['/osmo360/video/h264'].data, b'original P')
+        self.assertEqual(unknown['/osmo360/video/timing'].data, [1040, 0, 240, 1, 0])
+        self.assertEqual(topics.sequence, 2)
+
+    def test_batch_demand_starts_on_next_sample_and_preserves_every_imu_pair(self):
+        active, groups = [False], []
+        topics = self.OsmoTopics(self.node, batch_sink=lambda source, entries: groups.append(tuple(entries)),
+                                 has_sink_consumers=lambda: active[0])
+        topics.imu(object(), 0)
+        self.assertEqual(self.created, {})
+        active[0] = True
+        for stamp in range(1, 8001):
+            topics.imu(self.sample, stamp)
+        active[0] = False
+        topics.imu(object(), 8001)
+        self.assertEqual(len(groups), 8000)
+        self.assertTrue(all([topic for topic, _, _ in entries] == ['/osmo360/imu', '/osmo360/imu/timing'] for entries in groups))
+        self.assertEqual([entries[0][2] for entries in groups], list(range(1, 8001)))
+        self.assertTrue(all(entries[0][2] == entries[1][2] == entries[1][1].data[0] for entries in groups))
+        self.assertTrue(all(p.queries == 1 for p in self.node.publishers.values()))
+
     def test_default_sink_keeps_every_topic_and_native_data_without_dds_subscribers(self):
         saved = []
         topics = self.OsmoTopics(self.node, sink=lambda *args: saved.append(args))
