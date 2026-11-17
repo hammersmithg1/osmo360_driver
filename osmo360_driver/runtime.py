@@ -11,7 +11,7 @@ import threading
 import time
 
 from osmo360_camera import (
-    Camera, ColorMode, ExposureMode, ExposureModeSetting, FrameRate, IsoSetting,
+    Camera, CameraReplyError, ColorMode, ExposureMode, ExposureModeSetting, FrameRate, IsoSetting,
     ShutterSpeed, ShutterValue, WhiteBalance, WhiteBalanceMode,
 )
 from .clock import CameraClock
@@ -39,8 +39,8 @@ def validate_settings(value):
     for key, number in value.items():
         if type(number) is not int:
             raise ValueError(f'{key}: нужно целое число')
-        if key == 'exposure_mode' and number not in (0, 4):
-            raise ValueError('Экспозиция: 0 — авто, 4 — вручную')
+        if key == 'exposure_mode' and number not in (0, 1, 4):
+            raise ValueError('Экспозиция: 0 — авто, 1 — Program, 4 — вручную')
         if key == 'iso' and number not in (0, 50, 100, 200, 400, 800, 1600, 3200, 6400, 12800):
             raise ValueError('ISO: авто (0), 50…12800 из списка')
         if key == 'shutter_denominator' and not 1 <= number <= 8000:
@@ -128,12 +128,21 @@ class OsmoCamera:
 
     def read_settings(self):
         cam = self.camera
-        iso, wb, shutter = cam.iso(), cam.white_balance(), cam.shutter_setting()
-        self.settings = dict(exposure_mode=int(cam.exposure_mode().mode),
+        exposure = int(cam.exposure_mode().mode)
+        iso, wb = cam.iso(), cam.white_balance()
+        try:
+            shutter = cam.shutter_setting()
+        except CameraReplyError as exc:
+            # GET_SHUTTER returns DF when no manual shutter was set in Auto/P.
+            # This observed reply is not a failed stream or a requested SET.
+            if exc.status != 0xDF or exposure not in (ExposureMode.AUTO, ExposureMode.PROGRAM):
+                raise
+            shutter = None
+        self.settings = dict(exposure_mode=exposure,
                              iso=0 if iso.automatic else iso.iso,
                              white_balance=0 if wb.mode == WhiteBalanceMode.AUTO else wb.kelvin,
                              color=int(cam.color().mode), frame_rate=int(cam.video_format().frame_rate),
-                             shutter_denominator=shutter.shutter.value if shutter.shutter.reciprocal else 0)
+                             shutter_denominator=shutter.shutter.value if shutter and shutter.shutter.reciprocal else 0)
 
     def stop_readers(self):
         self.reader_stop.set()

@@ -1,10 +1,14 @@
 """Driver tests do not open USB or require a camera."""
 
+import json
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
+from osmo360_camera import controls
 from osmo360_driver.clock import CameraClock
 from osmo360_driver.runtime import OsmoCamera, json_value, validate_settings
 
@@ -34,6 +38,54 @@ class ClockTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def settings_owner(self):
+        # Replay the hardware GET snapshot, including Program + shutter DF.
+        native = json.loads((Path(__file__).parent / 'fixtures/camera_controls_native.json').read_text())['current_gets']
+        owner = OsmoCamera.__new__(OsmoCamera)
+        getters = {
+            'exposure_mode': controls.decode_exposure_mode, 'iso': controls.decode_iso,
+            'white_balance': controls.decode_white_balance, 'shutter': controls.decode_shutter,
+            'color': controls.decode_color, 'video_format': controls.decode_video_format,
+        }
+        methods = {('shutter_setting' if key == 'shutter' else key): Mock(side_effect=lambda key=key, decode=decode: decode(bytes.fromhex(native[key])))
+                   for key, decode in getters.items()}
+        owner.camera = SimpleNamespace(connected=True, usb_stream=Mock(return_value=Mock()), **methods)
+        owner.stream, owner.enabled, owner.settings = None, False, {}
+        owner.start_readers = Mock()
+        return owner
+
+    def test_real_program_snapshot_with_unset_shutter_starts_readers(self):
+        owner = self.settings_owner()
+        owner.activate()
+        owner.stream.start.assert_called_once_with()
+        owner.start_readers.assert_called_once_with()
+        self.assertEqual(owner.settings['exposure_mode'], int(controls.ExposureMode.PROGRAM))
+        self.assertEqual(owner.settings['shutter_denominator'], 0)
+        self.assertEqual(owner.settings['iso'], 0)
+        self.assertEqual(validate_settings({'exposure_mode': 1}), {'exposure_mode': 1})
+
+    def test_missing_shutter_is_only_tolerated_in_auto_or_program(self):
+        for mode, status in ((controls.ExposureMode.MANUAL, 0xDF), (controls.ExposureMode.PROGRAM, 0xE0)):
+            with self.subTest(mode=mode, status=status):
+                owner = self.settings_owner()
+                owner.camera.exposure_mode = Mock(return_value=controls.ExposureModeSetting(mode))
+                owner.camera.shutter_setting = Mock(side_effect=controls.CameraReplyError(status, bytes([status])))
+                with self.assertRaises(controls.CameraReplyError):
+                    owner.activate()
+                owner.start_readers.assert_not_called()
+        owner = self.settings_owner()
+        owner.camera.exposure_mode = Mock(return_value=controls.ExposureModeSetting(controls.ExposureMode.AUTO))
+        owner.activate()
+        owner.start_readers.assert_called_once_with()
+
+    def test_manual_shutter_value_is_preserved(self):
+        owner = self.settings_owner()
+        owner.camera.exposure_mode = Mock(return_value=controls.ExposureModeSetting(controls.ExposureMode.MANUAL))
+        owner.camera.shutter_setting = Mock(return_value=controls.ShutterSpeed(1, controls.ShutterValue(250, True)))
+        owner.activate()
+        self.assertEqual(owner.settings['shutter_denominator'], 250)
+        self.assertEqual(owner.settings['exposure_mode'], int(controls.ExposureMode.MANUAL))
+
     def test_initializing_driver_does_not_touch_usb_and_commands_are_asynchronous(self):
         called, release = threading.Event(), threading.Event()
 
