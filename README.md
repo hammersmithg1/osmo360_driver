@@ -312,8 +312,15 @@ available for offline temporal calibration. The exact relation between the
 video exposure clock and SSC timestamps must be verified for SLAM.
 
 For embedded use, compose `OsmoCamera(on_video, on_imu, on_error)` and
-`OsmoTopics(node, sink=...)`. The sink receives every ROS message before DDS;
-a recorder can store full IMU without depending on subscription QoS. Video and
+`OsmoTopics(node, acquisition_sink=...)` for an IPC recording worker. This callback
+receives immutable `imu`/`video` tuples before any ROS message is constructed;
+`osmo360_driver.acquisition.materialize_acquisition()` builds the same standard
+messages in the worker. Tuples carry the already mapped/native/receive clocks,
+raw video bytes, JPEG and immutable metadata JSON; no AV image enters IPC.
+Only cached DDS subscribers cause message construction in the capture process.
+The earlier `batch_sink` and per-message `sink` remain supported, with archival
+priority `acquisition_sink` → `batch_sink` → `sink` to prevent duplicate delivery.
+A recorder can store full IMU without depending on subscription QoS. Video and
 IMU readers stop and join before any sleep/wake/close transition. Errors retain
 the SDK's verified cleanup behavior; there is no forced collector kill or
 automatic reboot/retry of an uncertain USB owner.

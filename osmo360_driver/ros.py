@@ -3,6 +3,9 @@
 batch_sink(source, entries) receives one acquisition as (topic, message, stamp)
 entries, so recording start/stop and overflow cannot separate its companion
 timing/metadata messages. The original per-message sink remains supported.
+acquisition_sink(source, immutable_tuple) runs before ROS construction, allowing
+a separate recording process to use acquisition.materialize_acquisition().
+Archival priority is acquisition_sink, then batch_sink, then the legacy sink.
 
 Browser JPEG is a viewing copy. /video/h264 retains the original Annex-B
 access units, including DJI metadata. SLAM can consume /image/compressed;
@@ -11,34 +14,32 @@ Access units without a native timestamp stay in the same H.264 sequence, but
 their host-arrival-stamped JPEG is excluded from the SLAM image topic.
 """
 
-import json
-
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Imu
 from std_msgs.msg import String, UInt64MultiArray
 
-from .runtime import json_value
+from .acquisition import (
+    IMU_TOPICS, VIDEO_TOPICS, imu_acquisition, video_acquisition,
+    materialize_acquisition, set_header, compressed_image as _compressed_image,
+)
 from .topics import TOPICS
 
 
-def set_header(message, stamp_ns, frame_id):
-    message.header.stamp.sec, message.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
-    message.header.frame_id = frame_id
-    return message
-
-
 def compressed_image(data, stamp_ns, frame_id, format='jpeg'):
-    message = set_header(CompressedImage(), stamp_ns, frame_id)
-    message.format, message.data = format, data
-    return message
+    return _compressed_image(data, stamp_ns, frame_id, format, message_type=CompressedImage)
 
 
 class OsmoTopics:
-    def __init__(self, node, sink=None, *, has_sink_consumers=None, batch_sink=None):
+    def __init__(self, node, sink=None, *, has_sink_consumers=None, batch_sink=None,
+                 acquisition_sink=None):
         self.sink, self.batch_sink = sink, batch_sink
+        self.acquisition_sink = acquisition_sink
         # Recording demand is checked for each sample, independently of ROS
         # discovery. A newly started recording must not wait for the timer.
-        self.has_sink_consumers = has_sink_consumers or (lambda: sink is not None or batch_sink is not None)
+        self.has_sink_consumers = has_sink_consumers or (
+            lambda: sink is not None or batch_sink is not None or acquisition_sink is not None)
+        self.message_types = dict(CompressedImage=CompressedImage, Imu=Imu,
+                                  String=String, UInt64MultiArray=UInt64MultiArray)
         types = {'sensor_msgs/msg/CompressedImage': CompressedImage, 'sensor_msgs/msg/Imu': Imu,
                  'std_msgs/msg/String': String, 'std_msgs/msg/UInt64MultiArray': UInt64MultiArray}
         qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -81,48 +82,34 @@ class OsmoTopics:
 
     def _video(self, frame, jpeg, stamp_ns, *, valid_native):
         subscribers = self._subscribed_topics
-        sink_active = (self.sink is not None or self.batch_sink is not None) and self.has_sink_consumers()
-        entries = []
-        if valid_native and (sink_active or '/osmo360/image/compressed' in subscribers):
-            entries.append(('/osmo360/image/compressed', compressed_image(
-                jpeg, stamp_ns, 'osmo360_dual_fisheye', 'bgr8; jpeg compressed bgr8'),
-                stamp_ns))
-        if sink_active or '/osmo360/video/h264' in subscribers:
-            entries.append(('/osmo360/video/h264', compressed_image(
-                frame.raw_h264, stamp_ns, 'osmo360_dual_fisheye', 'h264'),
-                stamp_ns))
-        if sink_active or '/osmo360/video/timing' in subscribers:
-            entries.append(('/osmo360/video/timing', UInt64MultiArray(data=[
-                stamp_ns, frame.timestamp_ns if valid_native else 0,
-                frame.host_receive_monotonic_ns, self.sequence, int(valid_native)]),
-                stamp_ns))
-        if sink_active or '/osmo360/video/metadata' in subscribers:
-            metadata = dict(frame.metadata, _rover_timing={
-                'valid_native': valid_native,
-                'stamp_source': 'camera_native' if valid_native else 'host_receive',
-            })
-            entries.append(('/osmo360/video/metadata', String(data=json.dumps(
-                json_value(metadata), allow_nan=False, separators=(',', ':'))),
-                stamp_ns))
-        self.emit_group(entries, sink_active, subscribers)
+        sink_active = any(callback is not None for callback in (
+            self.sink, self.batch_sink, self.acquisition_sink)) and self.has_sink_consumers()
+        selected = VIDEO_TOPICS.intersection(subscribers)
+        if not valid_native:
+            selected = selected - {'/osmo360/image/compressed'}
+        if sink_active or selected:
+            acquisition = video_acquisition(frame, jpeg, stamp_ns, self.sequence)
+            raw_sink = sink_active and self.acquisition_sink is not None
+            if raw_sink:
+                self.acquisition_sink('osmo360', acquisition)
+            legacy_sink = sink_active and not raw_sink
+            entries = materialize_acquisition(acquisition, None if legacy_sink else selected,
+                                               message_types=self.message_types)
+            self.emit_group(entries, legacy_sink, subscribers)
         self.sequence += 1
 
     def imu(self, sample, stamp_ns):
         subscribers = self._subscribed_topics
-        sink_active = (self.sink is not None or self.batch_sink is not None) and self.has_sink_consumers()
-        if not sink_active and '/osmo360/imu' not in subscribers and '/osmo360/imu/timing' not in subscribers:
+        sink_active = any(callback is not None for callback in (
+            self.sink, self.batch_sink, self.acquisition_sink)) and self.has_sink_consumers()
+        selected = IMU_TOPICS.intersection(subscribers)
+        if not sink_active and not selected:
             return
-        entries = []
-        if sink_active or '/osmo360/imu' in subscribers:
-            message = set_header(Imu(), stamp_ns, 'osmo360_imu_native')
-            message.angular_velocity.x, message.angular_velocity.y, message.angular_velocity.z = sample.gyro
-            message.linear_acceleration.x, message.linear_acceleration.y, message.linear_acceleration.z = sample.accel
-            # No fused orientation. Zero covariance means unknown (not calibrated).
-            message.orientation_covariance[0] = -1.0
-            entries.append(('/osmo360/imu', message, stamp_ns))
-        if sink_active or '/osmo360/imu/timing' in subscribers:
-            entries.append(('/osmo360/imu/timing', UInt64MultiArray(data=[
-                stamp_ns, sample.timestamp_ns, sample.host_receive_monotonic_ns,
-                sample.timestamp_ticks, sample.accel_status, sample.gyro_status]),
-                stamp_ns))
-        self.emit_group(entries, sink_active, subscribers)
+        acquisition = imu_acquisition(sample, stamp_ns)
+        raw_sink = sink_active and self.acquisition_sink is not None
+        if raw_sink:
+            self.acquisition_sink('osmo360', acquisition)
+        legacy_sink = sink_active and not raw_sink
+        entries = materialize_acquisition(acquisition, None if legacy_sink else selected,
+                                           message_types=self.message_types)
+        self.emit_group(entries, legacy_sink, subscribers)

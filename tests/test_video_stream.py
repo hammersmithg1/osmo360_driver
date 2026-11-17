@@ -3,6 +3,7 @@
 import importlib.util
 import hashlib
 import json
+from fractions import Fraction
 from pathlib import Path
 import sys
 import socket
@@ -11,7 +12,7 @@ import threading
 from types import SimpleNamespace
 from unittest import TestCase, mock, skipUnless
 
-from osmo360_camera.video import VideoStream, VideoStreamError, _decoder_bytes
+from osmo360_camera.video import VideoStream, VideoStreamError, _decoder_bytes, _access_unit_evidence
 from osmo360_camera.vendor.preview_metadata import records_from_video
 from osmo360_camera.vendor import datalink, util
 from test_preview_metadata import sei
@@ -22,6 +23,14 @@ FIXTURE = json.loads((ROOT / "tests/fixtures/preview_sei_native.json").read_text
 RAW = bytes.fromhex(FIXTURE["current"][0]["nal_hex"])
 RAW = b"\0\0\0\1" + RAW
 STAMP = FIXTURE["current"][0]["expected"]["frame_clock_ns_raw"]
+LEGACY_STAMP = FIXTURE["old"]["expected"]["frame_clock_ns_raw"]
+END_SEQUENCE = b"\0\0\1\x0a\x80"
+
+
+def clocked_unit(stamp, picture):
+    tlv = bytes.fromhex(FIXTURE["old"]["raw_tlv_hex"])
+    tlv = tlv.replace(struct.pack("<Q", LEGACY_STAMP), struct.pack("<Q", stamp))
+    return sei(tlv) + picture
 
 
 class FakeLink:
@@ -181,6 +190,60 @@ class VideoTests(TestCase):
                 all(not list(records_from_video(p.data)) for p in codec.inputs)
             )
             stream.stop()
+
+    def test_decode_evidence_distinguishes_sparse_non_picture_outputs_from_contiguous_vcl_stall(self):
+        for sparse in (True, False):
+            with self.subTest(sparse=sparse):
+                class SelectiveCodec:
+                    def decode(self, packet):
+                        if not sparse or packet.data.endswith(END_SEQUENCE):
+                            return []
+                        image = FakeImage(packet)
+                        image.is_corrupt = True  # Diagnostic only; no new rejection policy.
+                        return [image]
+
+                stream = VideoStream(queue_size=2)
+                stream._av, stream._decoder = SimpleNamespace(Packet=FakePacket), SelectiveCodec()
+                with self.assertRaisesRegex(VideoStreamError, "Decoder retained more than64"):
+                    for index in range(65):
+                        if sparse:
+                            stream._on_video(clocked_unit(LEGACY_STAMP + 2 * index, b"\0\0\1\x65\x80"), 0)
+                        stream._on_video(clocked_unit(LEGACY_STAMP + 2 * index + 1,
+                                                      END_SEQUENCE if sparse else b"\0\0\1\x41\x80"), 0)
+                stats, diag = stream.stats, stream.stats["decoder"]
+                self.assertEqual(diag["current_unmatched"], 65)
+                self.assertEqual(diag["peak_unmatched"], 65)
+                self.assertEqual(diag["zero_output_units"], 65)
+                self.assertEqual(diag["frames_returned"], 65 if sparse else 0)
+                self.assertEqual(diag["no_vcl_units"], 65 if sparse else 0)
+                self.assertEqual(len(diag["recent"]), 8)
+                fatal = diag["failure"]
+                self.assertEqual(fatal["current_unmatched"], 65)
+                self.assertEqual(fatal["oldest_pending"]["has_vcl"], not sparse)
+                self.assertGreaterEqual(fatal["oldest_pending"]["age_ns"], 0)
+                self.assertEqual(fatal["oldest_pending"]["timestamp_ns"], LEGACY_STAMP + 1)
+                if sparse:
+                    self.assertGreater(stats["latest_video"]["timestamp_ns"], fatal["oldest_pending"]["timestamp_ns"])
+                    self.assertIsNotNone(fatal["last_output_monotonic_ns"])
+                    self.assertTrue(any(row["outputs"] and row["outputs"][0]["is_corrupt"]
+                                        for row in diag["recent"]))
+                else:
+                    self.assertIsNone(fatal["last_output_monotonic_ns"])
+                self.assertNotIn("raw_h264", json.dumps(diag))
+                self.assertNotIn("nal_hex", json.dumps(diag))
+                diag["recent"][0]["input"]["nal_types"].append(99)
+                fatal["oldest_pending"]["nal_types"].append(99)
+                current = stream.stats["decoder"]
+                self.assertNotIn(99, current["recent"][0]["input"]["nal_types"])
+                self.assertNotIn(99, current["failure"]["oldest_pending"]["nal_types"])
+
+    def test_decode_nal_scan_is_bounded_and_does_not_claim_absence_beyond_scan(self):
+        raw = (b"\0\0\1\x06\x80" * 65) + b"\0\0\1\x65\x80"
+        result = _access_unit_evidence(raw, 123, 456)
+        self.assertEqual(len(result["nal_types"]), 64)
+        self.assertTrue(result["nal_types_truncated"])
+        self.assertIsNone(result["has_vcl"])
+        self.assertEqual(result["access_unit_bytes"], len(raw))
 
     def test_header_only_capture_keeps_native_timestamp_through_decoder_mapping(self):
         # The post-resume diagnostic retained the exact SEI, not image pixels.
@@ -562,6 +625,45 @@ class VideoTests(TestCase):
                     self.assertNotIn("quaternions", frame.metadata)
             finally:
                 stream.stop()
+
+    @skipUnless(importlib.util.find_spec("av"), "Optional PyAV dependency is absent")
+    def test_real_end_sequence_units_accumulate_unmatched_while_pictures_keep_decoding(self):
+        import av
+        try:
+            encoder = av.CodecContext.create("libx264", "w")
+        except av.codec.codec.UnknownCodecError:
+            self.skipTest("PyAV has no libx264 encoder for synthetic H.264 input")
+        encoder.width, encoder.height, encoder.pix_fmt = 32, 16, "yuv420p"
+        encoder.time_base = Fraction(1, 30)
+        encoder.options = {"preset": "ultrafast", "tune": "zerolatency",
+                           "x264-params": "keyint=300:bframes=0"}
+        packets = []
+        for index in range(140):
+            image = av.VideoFrame(32, 16, "yuv420p")
+            image.pts, image.time_base = index, encoder.time_base
+            for plane_index, plane in enumerate(image.planes):
+                plane.update(bytes((16 + index % 8 * 16 if plane_index == 0 else 128,)) * plane.buffer_size)
+            packets.extend(encoder.encode(image))
+        packets.extend(encoder.encode(None))
+        stream = VideoStream()
+        stream._av, stream._decoder = av, av.CodecContext.create("h264", "r")
+        stream._decoder.thread_count = 1
+        sequence = 0
+        with self.assertRaisesRegex(VideoStreamError, "Decoder retained more than64"):
+            for index, packet in enumerate(packets):
+                stream._on_video(clocked_unit(LEGACY_STAMP + sequence, bytes(packet)), 0)
+                sequence += 1
+                if index > 5 and index % 2 == 0:
+                    stream._on_video(clocked_unit(LEGACY_STAMP + sequence, END_SEQUENCE), 0)
+                    sequence += 1
+        stats = stream.stats
+        self.assertEqual((stats["encoded_units"], stats["decoded_frames"]), (200, 135))
+        diag = stats["decoder"]
+        self.assertEqual(diag["zero_output_units"], 65)
+        self.assertEqual(diag["frames_returned"], 135)
+        self.assertEqual(diag["failure"]["oldest_pending"]["nal_types"], [6, 10])
+        self.assertFalse(diag["failure"]["oldest_pending"]["has_vcl"])
+        self.assertIsNotNone(diag["failure"]["last_output_monotonic_ns"])
 
 
 class ExplicitBindingTests(TestCase):

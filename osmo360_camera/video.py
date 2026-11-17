@@ -185,6 +185,25 @@ def _decoder_bytes(data):
     return bytes(result)
 
 
+def _access_unit_evidence(raw, stamp, received):
+    """Bounded Annex-B headers only; never retain compressed pixels here."""
+    kinds = []
+    truncated = False
+    for start in _START.finditer(raw):
+        if start.end() >= len(raw):
+            continue
+        if len(kinds) == 64:
+            truncated = True
+            break
+        kinds.append(raw[start.end()] & 31)
+    vcl = any(kind in (1, 2, 3, 4, 5, 19, 20, 21) for kind in kinds)
+    return dict(
+        timestamp_ns=stamp, received_monotonic_ns=received,
+        access_unit_bytes=len(raw), nal_types=kinds, nal_types_truncated=truncated,
+        has_vcl=True if vcl else None if truncated else False,
+    )
+
+
 class VideoStream:
     """Asynchronous Osmo Action-style preview on an already configured link.
 
@@ -228,6 +247,13 @@ class VideoStream:
         self._metadata_error = None
         self._missing_timestamp = self._first_missing_timestamp = None
         self._latest_video = None
+        self._decode_counts = dict(
+            current_unmatched=0, peak_unmatched=0,
+            zero_output_units=0, frames_returned=0, no_vcl_units=0,
+        )
+        self._decode_recent = deque(maxlen=8)
+        self._decode_last_output_ns = None
+        self._decode_failure = None
         self._counts = dict(
             encoded_units=0,
             encoded_bytes=0,
@@ -274,6 +300,12 @@ class VideoStream:
                 latest_video=deepcopy(self._latest_video),
                 first_missing_timestamp=deepcopy(self._first_missing_timestamp),
                 network=dict(self._link.stats) if self._link else {},
+                decoder=dict(
+                    self._decode_counts,
+                    last_output_monotonic_ns=self._decode_last_output_ns,
+                    recent=deepcopy(list(self._decode_recent)),
+                    failure=deepcopy(self._decode_failure),
+                ),
             )
 
     def start(self):
@@ -349,6 +381,32 @@ class VideoStream:
             self._latest_video = _video_evidence(frame)
             self._condition.notify_all()
 
+    def _decoder_backlog(self):
+        count = sum(map(len, self._pending.values())) + len(self._unstamped)
+        with self._condition:
+            self._decode_counts["current_unmatched"] = count
+            self._decode_counts["peak_unmatched"] = max(
+                self._decode_counts["peak_unmatched"], count
+            )
+        return count
+
+    def _decoder_failure_evidence(self, error):
+        now = time.monotonic_ns()
+        pending = [item for entries in self._pending.values() for item in entries]
+        pending.extend(self._unstamped)
+        oldest = min(pending, key=lambda item: item[1]) if pending else None
+        evidence = _access_unit_evidence(oldest[2], oldest[0], oldest[1]) if oldest else None
+        if evidence is not None:
+            evidence["age_ns"] = max(0, now - oldest[1])
+        with self._condition:
+            self._decode_failure = dict(
+                error_type=type(error).__name__, error_message=str(error)[:240],
+                observed_monotonic_ns=now, oldest_pending=evidence,
+                current_unmatched=self._decode_counts["current_unmatched"],
+                last_output_monotonic_ns=self._decode_last_output_ns,
+                recent=deepcopy(list(self._decode_recent)),
+            )
+
     def _on_video(self, data, first_packet):
         # This is completion of one reassembled AU, not its first packet or
         # exposure time. Preserve the camera clock separately for SLAM.
@@ -419,9 +477,46 @@ class VideoStream:
             self._pending.setdefault(stamp, deque()).append(metadata)
         else:
             self._unstamped.append(metadata)
-        packet = self._av.Packet(_decoder_bytes(raw))
-        packet.pts, packet.time_base = stamp, _TIME_BASE
-        for image in self._decoder.decode(packet):
+        event = dict(input=_access_unit_evidence(raw, stamp, received),
+                     output_count=None, outputs=[])
+        with self._condition:
+            self._decode_counts["no_vcl_units"] += event["input"]["has_vcl"] is False
+            self._decode_recent.append(event)
+        self._decoder_backlog()
+        try:
+            packet = self._av.Packet(_decoder_bytes(raw))
+            packet.pts, packet.time_base = stamp, _TIME_BASE
+            self._decode_packet(packet, event)
+        except BaseException as error:
+            self._decoder_backlog()
+            try:
+                self._decoder_failure_evidence(error)
+            except Exception as diagnostic_error:
+                with self._condition:
+                    self._decode_failure = dict(
+                        error_type=type(error).__name__, error_message=str(error)[:240],
+                        diagnostic_error=repr(diagnostic_error)[:240],
+                    )
+            raise
+
+    def _decode_packet(self, packet, event):
+        images = self._decoder.decode(packet)
+        outputs = []
+        for image in images[:8]:
+            outputs.append(dict(
+                pts=image.pts, time_base=str(image.time_base)[:64],
+                timestamp_ns=(int(image.pts * image.time_base * 1_000_000_000)
+                              if image.pts is not None else None),
+                is_corrupt=getattr(image, "is_corrupt", None),
+            ))
+        with self._condition:
+            self._decode_counts["zero_output_units"] += not images
+            self._decode_counts["frames_returned"] += len(images)
+            if images:
+                self._decode_last_output_ns = time.monotonic_ns()
+            event.update(output_count=len(images), outputs=outputs,
+                         outputs_truncated=len(images) > 8)
+        for image in images:
             stamp_out = (
                 int(image.pts * image.time_base * 1_000_000_000)
                 if image.pts is not None
@@ -445,7 +540,7 @@ class VideoStream:
             self._publish(
                 VideoFrame(meta[0], meta[1], image, meta[2], meta[3]), epoch=meta[4]
             )
-        if sum(map(len, self._pending.values())) + len(self._unstamped) > 64:
+        if self._decoder_backlog() > 64:
             raise VideoStreamError(
                 "Decoder retained more than64 access units without matching frames"
             )

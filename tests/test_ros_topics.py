@@ -176,6 +176,53 @@ class RosTopicsTests(unittest.TestCase):
         self.assertTrue(all(entries[0][2] == entries[1][2] == entries[1][1].data[0] for entries in groups))
         self.assertTrue(all(p.queries == 1 for p in self.node.publishers.values()))
 
+    def test_raw_acquisition_sink_records_8000_pairs_without_ros_construction_or_graph_queries(self):
+        active, acquisitions = [False], []
+        legacy, batch = Mock(), Mock()
+        topics = self.OsmoTopics(self.node, sink=legacy, batch_sink=batch,
+            acquisition_sink=lambda source, dto: acquisitions.append((source, dto)),
+            has_sink_consumers=lambda: active[0])
+        topics.imu(object(), 0)
+        active[0] = True
+        for stamp in range(1, 8001):
+            topics.imu(self.sample, stamp)
+        active[0] = False
+        topics.imu(object(), 8001)
+        self.assertEqual(self.created, {})
+        self.assertEqual(len(acquisitions), 8000)
+        self.assertEqual([dto[1] for _, dto in acquisitions], list(range(1, 8001)))
+        self.assertTrue(all(source == 'osmo360' and dto[0] == 'imu' for source, dto in acquisitions))
+        self.assertTrue(all(dto[2:] == (100, 200, 2, (.1, .2, .3), (0., 0., 9.81), 0, 0)
+                            for _, dto in acquisitions))
+        legacy.assert_not_called()
+        batch.assert_not_called()
+        self.assertTrue(all(p.queries == 1 for p in self.node.publishers.values()))
+
+    def test_raw_acquisition_precedes_only_subscribed_dds_and_keeps_missing_clock_semantics(self):
+        order, saved, before = [], [], []
+
+        def acquire(source, dto):
+            before.append(dict(self.created))
+            saved.append(dto)
+            order.append('raw')
+
+        topics = self.OsmoTopics(self.node, acquisition_sink=acquire)
+        publisher = self.node.publishers['/osmo360/imu/timing']
+        publisher.count = 1
+        publisher.publish = lambda message: order.append('dds')
+        topics.refresh_subscribers()
+        topics.imu(self.sample, 1000)
+        self.assertEqual(order, ['raw', 'dds'])
+        self.assertEqual(before, [{}])
+        self.assertEqual(self.created, {'UInt64MultiArray': 1})
+        frame = SimpleNamespace(raw_h264=b'original P', timestamp_ns=None,
+            host_receive_monotonic_ns=240, metadata={})
+        topics.video_unstamped(frame, b'viewing JPEG', 1040)
+        self.assertEqual(self.created, {'UInt64MultiArray': 1})
+        self.assertEqual(saved[-1][:7], ('video', 1040, None, 240, 0, b'original P', b'viewing JPEG'))
+        self.assertEqual(json.loads(saved[-1][7])['_rover_timing'],
+                         {'valid_native': False, 'stamp_source': 'host_receive'})
+
     def test_default_sink_keeps_every_topic_and_native_data_without_dds_subscribers(self):
         saved = []
         topics = self.OsmoTopics(self.node, sink=lambda *args: saved.append(args))
