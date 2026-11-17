@@ -642,12 +642,32 @@ class LinuxUSBNetworkGuard:
                             )
                 event["new_guard_report"] = replacement.report
             event["error"] = type(error).__name__ + ": " + str(error)
-            if isinstance(error, _MutationTargetVanished) and replacement is not None:
+            missing_owned_read = (
+                isinstance(error, FileNotFoundError)
+                and replacement is not None
+                and replacement._missing_owned_sysfs(error)
+            )
+            if replacement is not None and (
+                isinstance(error, _MutationTargetVanished) or missing_owned_read
+            ):
                 proof = self._vanished_handover(replacement, old, deadline)
                 if proof is not None:
                     event["vanished_generation"] = proof
                     raise USBGenerationVanished(proof) from error
             raise
+
+    def _missing_owned_sysfs(self, error):
+        """Classify an ENOENT observation, never treat it as absence proof."""
+        identity = self.identity
+        if identity is None or not isinstance(error.filename, (str, Path)):
+            return False
+        missing = Path(error.filename)
+        roots = (
+            self.net_root / identity.name,
+            Path(identity.net_path),
+            Path(identity.usb_path),
+        )
+        return any(missing == root or missing.is_relative_to(root) for root in roots)
 
     def _vanished_handover(self, candidate, old, deadline):
         """RO reconciliation only; never excuse an uncertain ip operation."""

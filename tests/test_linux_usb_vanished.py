@@ -1,6 +1,7 @@
 """Reconcile only a completely vanished intermediate NIC; fake sysfs/ip."""
 
 import json
+import errno
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -49,6 +50,93 @@ class VanishedGenerationTests(unittest.TestCase):
             self.assertEqual(error.proof[key]["old_ifindex"], index)
             self.assertTrue(error.proof[key]["complete"])
             self.assertTrue(error.proof[key]["absent"])
+
+    def sysfs_read_race(self, *, after_add=False, unplug=True, interference=None,
+                       unrelated=False, error_type=FileNotFoundError):
+        self.host.reset()
+        original = LinuxUSBNetworkGuard._identity
+        fired = []
+        test = self
+
+        def identity(guard, name, mac):
+            # The first _identity succeeds. Race the repeated resolve/read
+            # inside _current after this candidate has already been pinned.
+            if (guard._reset_origin is not None and guard.identity is not None
+                    and (not after_add or "address_add" in guard.attempts) and not fired):
+                fired.append(True)
+                if unplug:
+                    test.unplug()
+                if interference is not None:
+                    interference(test)
+                missing = test.host.root / "unrelated" if unrelated else test.host.net / name
+                code = errno.EACCES if error_type is PermissionError else errno.ENOENT
+                raise error_type(code, "injected pinned sysfs race", str(missing))
+            return original(guard, name, mac)
+
+        with patch.object(LinuxUSBNetworkGuard, "_identity", identity):
+            with self.assertRaises((LinuxUSBNetworkError, OSError)) as caught:
+                self.guard.rebind_after_usb_reset(timeout=1)
+        self.assertEqual(len(fired), 1)
+        return caught.exception
+
+    def test_pinned_sysfs_disappearing_after_ip_snapshot_requires_complete_absence_before_retry(self):
+        error = self.sysfs_read_race()
+        self.assertIsInstance(error, USBGenerationVanished)
+        self.assertEqual(self.host.commands, [])
+        self.assertFalse(error.proof["completed_address_add"])
+        for name in ("parent", "candidate"):
+            self.assertTrue(error.proof[name]["complete"])
+            self.assertTrue(error.proof[name]["absent"])
+        self.assertFalse(self.guard.cleaned)
+        self.assertIs(self.guard.identity, self.original)
+
+    def test_pinned_sysfs_read_loss_after_successful_add_is_typed_without_replaying_add(self):
+        error = self.sysfs_read_race(after_add=True)
+        self.assertIsInstance(error, USBGenerationVanished)
+        self.assertTrue(error.proof["completed_address_add"])
+        self.assertEqual([argv[3] for argv in self.host.commands], ["add"])
+
+    def test_single_missing_read_or_unrelated_enoent_is_not_generation_absence(self):
+        for options in (dict(unplug=False), dict(unrelated=True), dict(error_type=PermissionError)):
+            with self.subTest(options=options):
+                self.setUp()
+                error = self.sysfs_read_race(**options)
+                self.assertIsInstance(error, options.get('error_type', FileNotFoundError))
+                self.assertNotIsInstance(error, USBGenerationVanished)
+                self.assertEqual(self.host.commands, [])
+
+    def test_enoent_from_attempted_ip_command_is_never_a_retryable_read_observation(self):
+        self.host.reset()
+        original = self.host.run
+
+        def uncertain(argv, **options):
+            result = original(argv, **options)
+            if argv[3] == 'add':
+                self.unplug()
+                raise FileNotFoundError(errno.ENOENT, 'uncertain command result', str(self.host.net / self.host.name))
+            return result
+
+        self.guard.run = uncertain
+        with self.assertRaises(FileNotFoundError):
+            self.guard.rebind_after_usb_reset(timeout=1)
+        self.assertEqual([argv[3] for argv in self.host.commands], ['add'])
+        self.assertNotIn('vanished_generation', self.guard.report['rebind_attempts'][-1])
+
+    def test_missing_owned_read_with_incomplete_inventory_or_renamed_index_is_not_retryable(self):
+        def incomplete(case):
+            (case.host.net / "incomplete").mkdir()
+
+        def renamed(case):
+            name = "renamed"
+            (case.host.net / name).symlink_to(case.host.nic, target_is_directory=True)
+            case.host.name, case.host.present = name, True
+
+        for interference in (incomplete, renamed):
+            with self.subTest(interference=interference):
+                self.setUp()
+                error = self.sysfs_read_race(interference=interference)
+                self.assertNotIsInstance(error, USBGenerationVanished)
+                self.assertEqual(self.host.commands, [])
 
     def test_actual_add_rc0_then_disappear_before_up_can_retry_fresh_strict_generation(
         self,
