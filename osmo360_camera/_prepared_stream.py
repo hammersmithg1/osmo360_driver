@@ -437,23 +437,25 @@ class PreparedStream:
     def prepare(self):
         return self._prepare(sleeping=False)
 
-    def prepare_after_sleep(self, *, guard=None):
+    def prepare_after_sleep(self, *, guard=None, deadline=None):
         """Stage an unused plan after proven Sleep and full native USB restore.
 
         The immutable sources must already have been preloaded while awake.
         The caller has stopped all producers and restored native five-function
         USB; the normal strict runtime collector proves that baseline again.
         """
-        return self._prepare(sleeping=True, guard=guard)
+        return self._prepare(sleeping=True, guard=guard, deadline=deadline)
 
-    def _prepare(self, *, sleeping, guard=None):
+    def _prepare(self, *, sleeping, guard=None, deadline=None):
         with self.control.lock:
             if self.prepare_attempted or self.closed:
                 raise PreparedStreamError("Fresh prepared stream is single-use")
             same_owner(self.control, self.owner_receipt)
             if guard is not None:
                 guard()
-            current = self.control.snapshot()
+            current = (self.control.wait_sleep_snapshot(self.sleep_id, deadline=deadline,
+                report=self.report.setdefault('preparation_sleep_readiness', {}))
+                if sleeping and deadline is not None else self.control.snapshot())
             if guard is not None:
                 guard()
             if sleeping:
@@ -571,12 +573,14 @@ class PreparedStream:
                 self.control._remember_quarantine()
                 raise
 
-    def arm_watcher(self):
+    def arm_watcher(self, *, deadline=None):
         with self.control.lock:
             if not self.prepared or self.arm_attempted or self.closed:
                 raise PreparedStreamError("One watcher arm per prepared stream")
             same_owner(self.control, self.owner_receipt)
-            current = self.control.snapshot()
+            current = (self.control.snapshot() if deadline is None else
+                self.control.wait_sleep_snapshot(self.sleep_id, deadline=deadline,
+                    report=self.report.setdefault('sleep_readiness', {})))
             if (
                 current["state"] != "SLEEP"
                 or current.get("command_id") != self.sleep_id
@@ -584,6 +588,8 @@ class PreparedStream:
                 raise PreparedStreamError("Arm near Wake only after exact stable Sleep")
 
             def intent():
+                if deadline is not None and self.clock() >= deadline:
+                    raise TimeoutError('Wake deadline before prepared arm')
                 self.arm_attempted = self.possible_future_apply = True
                 self.preview._scheduled = True
 

@@ -41,6 +41,11 @@ def snapshot(state="AWAKE", sequence=0):
             reboot_disabled=0,
             system_power_level=level,
         ),
+        shadow=dict(source='/dev/shm/osmo-usb-standby-' + NONCE + '/role.txt',
+            target='/sys/devices/platform/soc/a600000.ssusb/mode', inode=[23, 26],
+            mount=dict(fs='tmpfs', point='/sys/devices/platform/soc/a600000.ssusb/mode',
+                       root='/osmo-usb-standby-' + NONCE + '/role.txt'),
+            value='none' if state == 'SLEEP' else 'exit'),
     )
     if sequence:
         value.update(command_id=f"{sequence:016x}", action=action)

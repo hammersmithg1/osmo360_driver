@@ -79,13 +79,16 @@ class Control:
         self.env.events.append("owner.snapshot")
         return self.last
 
+    def wait_sleep_snapshot(self, identifier, *, deadline, report=None):
+        return self.snapshot()
+
     def _submit_sleep(self, proof):
         proof.validate(self.env.clock())
         self.env.events.append("owner.sleep")
         self.last = dict(state="SLEEPING", last_sequence=self.last["last_sequence"] + 1)
         return dict(command_id=f"{self.last['last_sequence']:016x}")
 
-    def submit_wake(self):
+    def submit_wake(self, *, deadline=None):
         self.env.events.append("owner.wake")
         self.env.wake_submitted.set()
         self.last = dict(state="WAKING", last_sequence=self.last["last_sequence"] + 1)
@@ -152,7 +155,7 @@ class Prepared:
         self.env.events.append("prepared.prepare")
         return self
 
-    def arm_watcher(self):
+    def arm_watcher(self, *, deadline=None):
         self.env.events.append("prepared.arm")
         self.possible_future_apply = True
 

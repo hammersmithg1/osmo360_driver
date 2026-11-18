@@ -230,6 +230,33 @@ class RetainedTests(unittest.TestCase):
         self.assertEqual(value.sequence, 44)
         self.assertIs(self.camera._usb_preview, self.old)
 
+    def test_sleep_observation_deadline_failure_never_arms_or_stops_original_lease(self):
+        value = self.backend().prepare()
+        self.control.state, self.control.sequence = 'SLEEP', 1
+        self.control.wait_sleep_snapshot = Mock(side_effect=StandbyUncertain('native observation deadline'))
+        with self.assertRaises(StandbyUncertain):
+            value.arm_watcher(deadline=12.25)
+        self.control.wait_sleep_snapshot.assert_called_once_with(value.sleep_id, deadline=12.25,
+            report=value.report['sleep_readiness'])
+        self.assertFalse(value.arm_attempted)
+        self.assertFalse(value.possible_future_apply)
+        self.old._lease.stop.assert_not_called()
+        self.assertFalse(any(command.endswith(' launch') for command in self.control.commands))
+
+    def test_late_arm_readiness_is_rejected_at_delivery_guard_before_any_helper_start(self):
+        value = self.backend().prepare()
+        self.control.state, self.control.sequence = 'SLEEP', 1
+        def late(*args, **options):
+            self.clock.now = 12.3
+            return self.control.snapshot()
+        self.control.wait_sleep_snapshot = late
+        with self.assertRaises(m.UnknownFutureApply):
+            value.arm_watcher(deadline=12.25)
+        self.assertFalse(value.arm_attempted)
+        self.assertFalse(value.possible_future_apply)
+        self.old._lease.stop.assert_not_called()
+        self.assertFalse(any(command.endswith(' launch') for command in self.control.commands))
+
     def test_reserved_endpoint_is_fetched_and_inode_cleaned_before_local_lease_stop(self):
         run = self.control._run
         def record(command, **options):

@@ -957,7 +957,7 @@ class USBStreamSession:
                         self.control.bind_bootstrap(self.reconnect_control(self.camera))
                 timely()
                 with phase("status_before"):
-                    current = self.control.snapshot()
+                    current = self.control.wait_sleep_snapshot(sleep_id, deadline=deadline)
                 if current["state"] != "SLEEP" or current.get("command_id") != sleep_id:
                     raise ValueError("Camera changed native Sleep during USB rollback")
                 with phase("prepare_after_sleep"):
@@ -968,16 +968,16 @@ class USBStreamSession:
                         sleep_id=sleep_id,
                         wake_id=wake_id,
                     )
-                    candidate.prepare_after_sleep(guard=timely)
+                    candidate.prepare_after_sleep(guard=timely, deadline=deadline)
                 timely()
                 with phase("status_after"):
-                    current = self.control.snapshot()
+                    current = self.control.wait_sleep_snapshot(sleep_id, deadline=deadline)
                 if current["state"] != "SLEEP" or current.get("command_id") != sleep_id:
                     raise ValueError("Exact native Sleep changed during preparation")
                 with phase("publish"):
                     if self._prepare_ready_callback is not None:
                         publication = self._prepare_ready_callback(
-                            candidate, self._native_floor_ns, guard=timely
+                            candidate, self._native_floor_ns, guard=timely, deadline=deadline
                         )
                 timely()
         except BaseException as failure:
@@ -1038,9 +1038,9 @@ class USBStreamSession:
                     "Post-Sleep preparation failed; owner retained", self.report
                 ) from self._prepare_error
 
-    def _wake_once(self):
+    def _wake_once(self, *, deadline=None):
         try:
-            value = self.control.submit_wake()
+            value = self.control.submit_wake(deadline=deadline)
             self._wake_outcome["submission"] = value
             if value["command_id"] != self._wake_id:
                 self._wake_outcome["error"] = ValueError(
@@ -1099,6 +1099,7 @@ class USBStreamSession:
                 )
             self._set_state("WAKING")
             began = self.clock()
+            deadline = began + timeout
             startup = dict(timeout_s=timeout, stages=[])
             self._prepared.report["wake_startup"] = startup
 
@@ -1111,20 +1112,23 @@ class USBStreamSession:
 
             try:
                 stage("watcher_arm_started")
-                self._prepared.arm_watcher()
+                self._prepared.arm_watcher(deadline=deadline)
                 stage("watcher_armed")
+                if self.clock() >= deadline:
+                    raise TimeoutError('Wake deadline after watcher arm; no new input')
                 self._wake_outcome = {}
                 self._late_verified = False
                 self._wake_thread = threading.Thread(
-                    target=self._wake_once, name="osmo-stock-wake", daemon=True
+                    target=self._wake_once, kwargs=dict(deadline=deadline), name="osmo-stock-wake", daemon=True
                 )
+                wake_at = self.clock()
                 wake_host_ns = time.monotonic_ns()
                 self._wake_thread.start()
                 stage("wake_thread_started")
-                elapsed = max(0, began - self._stable_sleep_at)
+                elapsed = max(0, wake_at - self._stable_sleep_at)
                 floor = self._native_floor_ns + int(elapsed * 1_000_000_000)
                 self._preview, attached_imu = self._prepared.attach_data_first(
-                    timeout=timeout, native_floor_ns=floor, wake_host_ns=wake_host_ns
+                    timeout=deadline - self.clock(), native_floor_ns=floor, wake_host_ns=wake_host_ns
                 )
                 stage("data_attached")
                 imu_starter = getattr(self._prepared, "start_imu_after_video", None)
@@ -1135,7 +1139,6 @@ class USBStreamSession:
                 # the first accepted records instead of hiding consumed data.
                 witness = self._prepared.witness
                 video_ready = imu_ready = False
-                deadline = began + timeout
                 while not (video_ready and imu_ready):
                     remaining = deadline - self.clock()
                     if remaining <= 0:

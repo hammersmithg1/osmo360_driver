@@ -25,7 +25,8 @@ class Retained(Prepared):
             raise AssertionError("Not AWAKE")
         return self
 
-    def arm_watcher(self):
+    def arm_watcher(self, *, deadline=None):
+        self.arm_deadline = deadline
         self.env.events.append("retained.arm")
         if self.env.control.last["state"] != "SLEEP":
             raise AssertionError("Not SLEEP")
@@ -159,6 +160,26 @@ class RetainedSessionTests(unittest.TestCase):
         self.assertTrue(session._prepared.report["media_ready_proven"])
         self.assertGreater(session.read_video().timestamp_ns, 300_000_000_000)
         self.assertGreater(session.read_imu().timestamp_ns, 300_000_000_000)
+
+    def test_delayed_sleep_observation_uses_original_deadline_and_full_freshness_dwell(self):
+        env, session, old, factory, _ = self.setup_session()
+        session.sleep()
+        baseline = session._native_floor_ns
+        backend = session._prepared
+        arm = backend.arm_watcher
+        def delayed(*, deadline):
+            self.assertEqual(deadline, 15)
+            env.clock.sleep(2)
+            return arm(deadline=deadline)
+        backend.arm_watcher = delayed
+        backend.attach_data_first = Mock(wraps=backend.attach_data_first)
+        env.clock.sleep(10)
+        session.wake(timeout=5)
+        options = backend.attach_data_first.call_args.kwargs
+        self.assertEqual(options['timeout'], 3)
+        self.assertEqual(options['native_floor_ns'], baseline + 12_000_000_000)
+        self.assertEqual(backend.arm_deadline, 15)
+        self.assertEqual(env.events.count('owner.wake'), 1)
 
     def test_stable_sleep_close_prepares_schema_one_ready_without_holding_core_lock_while_joining(
         self,

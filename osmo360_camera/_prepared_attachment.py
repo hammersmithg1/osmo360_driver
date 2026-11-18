@@ -206,9 +206,10 @@ def decode_metadata(value):
     return value
 
 
-def _stable_sleep(control, owner_receipt, sleep_id):
+def _stable_sleep(control, owner_receipt, sleep_id, *, deadline=None):
     prepared.same_owner(control, owner_receipt)
-    value = control.snapshot()  # Strict native/current-level check lives here.
+    value = (control.snapshot() if deadline is None else
+             control.wait_sleep_snapshot(sleep_id, deadline=deadline))
     prepared.same_owner(control, owner_receipt)
     if (
         value["state"] != "SLEEP"
@@ -223,7 +224,7 @@ def _stable_sleep(control, owner_receipt, sleep_id):
     return value
 
 
-def export_prepared(backend, *, native_floor_ns):
+def export_prepared(backend, *, native_floor_ns, deadline=None):
     """Export only a staged, never-armed backend after its completed Sleep."""
     if not isinstance(backend, prepared.PreparedStream):
         raise TypeError("Owned PreparedStream required")
@@ -248,7 +249,7 @@ def export_prepared(backend, *, native_floor_ns):
             raise PreparedAttachmentError(
                 "Only an unarmed, unstarted prepared Sleep can be exported"
             )
-        _stable_sleep(backend.control, backend.owner_receipt, backend.sleep_id)
+        _stable_sleep(backend.control, backend.owner_receipt, backend.sleep_id, deadline=deadline)
         plan = backend.plan
         prefix = "/dev/shm/osmo-ncm-"
         if not plan["work_dir"].startswith(prefix):
@@ -360,6 +361,7 @@ def restore_prepared(
     lease_factory=PreviewLease,
     video_factory=VideoStream,
     clock=time.monotonic,
+    deadline=None,
 ):
     """Return local unstarted objects for the same existing, never-armed plan.
 
@@ -370,7 +372,7 @@ def restore_prepared(
     with control.lock:
         if camera._imu is not None or camera._usb_preview is not None:
             raise PreparedAttachmentError("Do not adopt over existing camera producers")
-        _stable_sleep(control, value["owner_receipt"], value["sleep_id"])
+        _stable_sleep(control, value["owner_receipt"], value["sleep_id"], deadline=deadline)
         runtime = _runtime(value["runtime"])
         expected = value["plan"]
         plan = plan_builder(
@@ -397,7 +399,7 @@ def restore_prepared(
             nonce=value["assets_nonce"],
         )
         _prove_camera(control, value, assets)
-        _stable_sleep(control, value["owner_receipt"], value["sleep_id"])
+        _stable_sleep(control, value["owner_receipt"], value["sleep_id"], deadline=deadline)
         network = (
             network_guard
             if network_guard is not None

@@ -19,7 +19,7 @@ import time
 from ._prepared_attachment import decode_metadata, export_prepared, restore_prepared
 from ._prepared_plan import build_prepared_fast_plan
 from ._prepared_stream import preparation_run
-from ._standby_control import SOURCES, parse_snapshot
+from ._standby_control import SOURCES, parse_snapshot, NativeSleepObservationMismatch, wait_sleep_observation
 from ._stream_defaults import build_stream_session
 from ._stream_session import StreamSessionError
 from ._usb_bootstrap import BootstrapError
@@ -128,9 +128,20 @@ def _discover(control):
     return work
 
 
-def _status_at(control, work):
+def _status_at(control, work, *, deadline=None, clock=time.monotonic, report=None):
+    def timely():
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError('Standby discovery observation deadline')
+    def run(command):
+        timely()
+        if deadline is None:
+            return control._run(command)
+        remaining = deadline - clock()
+        if remaining < .1:
+            raise TimeoutError('Insufficient discovery status task budget')
+        return control._run(command, timeout_ms=min(5000, int(remaining * 1000)), pre_send=timely)
     for name, digest in SOURCES.items():
-        control._run(
+        run(
             '[ "$(sha256sum '
             + Q(work + "/" + name)
             + ' | cut -d" " -f1)" = '
@@ -138,17 +149,31 @@ def _status_at(control, work):
             + " ]"
         )
     # Execute only after both packaged SHA256s matched the retained files.
-    control._run("python3 -B " + Q(work + "/usb_standby_owner.py") + " status")
     nonce = re.fullmatch(WORK, work)[1]
-    return parse_snapshot(
-        control.bootstrap.pull_bytes(
-            "/blackbox/export_tmp/osmo_probe_" + nonce + ".json", max_bytes=16384
-        ),
-        nonce=nonce,
-    )
+    def query():
+        run("python3 -B " + Q(work + "/usb_standby_owner.py") + " status")
+        timely()
+        value = parse_snapshot(control.bootstrap.pull_bytes(
+            "/blackbox/export_tmp/osmo_probe_" + nonce + ".json", max_bytes=16384,
+            **({} if deadline is None else {'timeout': min(10, deadline - clock())})), nonce=nonce)
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError('Standby discovery observation arrived after deadline')
+        return value
+    try:
+        return query()
+    except NativeSleepObservationMismatch as error:
+        if deadline is None:
+            raise
+        def guard():
+            session = control.bootstrap.session
+            if (control.pending_task is not None or control._unknown_task or session.quarantined):
+                raise ValueError('Unknown discovery task; no status retry')
+        return wait_sleep_observation(query, previous=error.observation, work=work,
+            identifier=error.observation['command_id'], deadline=deadline, clock=clock,
+            sleep=control.sleep, report=report, guard=guard, first_mismatch=error)
 
 
-def _read_metadata(control):
+def _read_metadata(control, *, deadline=None):
     program = (
         "import usb_standby_owner as m; b=m.base_module();w=m.environment(b);c=m.configuration(w);"
         "p=w/'status.lock';p.mkdir();\ntry:m.export_status(b,w,c,m.read(w/'session.json'))\nfinally:p.rmdir()"
@@ -158,7 +183,10 @@ def _read_metadata(control):
         "/blackbox/export_tmp/osmo_probe_" + control.nonce + ".json", max_bytes=16384
     )
     value = decode_metadata(raw)
-    control.snapshot()  # Restore the regular diagnostic export and fresh Sleep proof.
+    if deadline is None:
+        control.snapshot()
+    else:
+        control.wait_sleep_snapshot(control.last['command_id'], deadline=deadline)
     return value
 
 
@@ -192,7 +220,7 @@ def _wait_native(control, *, clock=time.monotonic, sleep=time.sleep):
         return
 
 
-def _publish_metadata(control, value, *, guard=None):
+def _publish_metadata(control, value, *, guard=None, deadline=None):
     value = decode_metadata(value)
     expected = dict(
         work=control.work,
@@ -231,7 +259,8 @@ def _publish_metadata(control, value, *, guard=None):
     )
     if guard is not None:
         guard()
-    snapshot = control.snapshot()
+    snapshot = (control.snapshot() if deadline is None else
+                control.wait_sleep_snapshot(value['sleep_id'], deadline=deadline))
     if guard is not None:
         guard()
     if snapshot["state"] != "SLEEP" or snapshot["command_id"] != value["sleep_id"]:
@@ -298,7 +327,8 @@ class ResumableUSBStream:
                         "Existing camera producers cannot be borrowed", self.report
                     )
                 manager = self._core.idle_probe.__self__
-                manager.ensure(deadline=manager.clock() + manager.timeout, resolve=True)
+                discovery_deadline = manager.clock() + manager.timeout
+                manager.ensure(deadline=discovery_deadline, resolve=True)
                 control = self._core.control
                 self._unknown_shadow = (
                     True  # Unknown discovery never authorizes a new owner.
@@ -306,7 +336,8 @@ class ResumableUSBStream:
                 work = _discover(control)
                 self.attachment["discovered"] = True
                 if work is not None:
-                    snapshot = _status_at(control, work)
+                    snapshot = _status_at(control, work, deadline=discovery_deadline,
+                        clock=manager.clock, report=self.attachment.setdefault('sleep_readiness', {}))
                     receipt = dict(
                         work=work,
                         nonce=snapshot["nonce"],
@@ -326,7 +357,7 @@ class ResumableUSBStream:
                         existing=True, work=work, state=snapshot["state"]
                     )
                     if snapshot["state"] == "SLEEP":
-                        metadata = _read_metadata(control)
+                        metadata = _read_metadata(control, deadline=discovery_deadline)
                         backend = restore_prepared(
                             self.camera,
                             control,
@@ -336,6 +367,7 @@ class ResumableUSBStream:
                             decode=self.options.get("decode", True),
                             queue_size=self.options.get("queue_size", 1),
                             imu_options=self._core.imu_options,
+                            deadline=discovery_deadline,
                         )
                         self._core.prepared_factory.assets = backend.assets
                         self._core.attach_sleep(
@@ -378,12 +410,14 @@ class ResumableUSBStream:
                 raise  # Actual stable Sleep remains owned; no automatic recovery.
             return result
 
-    def _publish_ready(self, backend, native_floor_ns, *, guard=None):
+    def _publish_ready(self, backend, native_floor_ns, *, guard=None, deadline=None):
         """Worker callback: caller holds control lock, NEVER wrapper lock."""
-        metadata = export_prepared(backend, native_floor_ns=native_floor_ns)
+        metadata = export_prepared(backend, native_floor_ns=native_floor_ns,
+                                   **({} if deadline is None else {'deadline': deadline}))
         if guard is not None:
             guard()
-        return _publish_metadata(backend.control, metadata, guard=guard)
+        return _publish_metadata(backend.control, metadata, guard=guard,
+                                 **({} if deadline is None else {'deadline': deadline}))
 
     def wake(self, **options):
         with self._lock:

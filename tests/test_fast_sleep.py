@@ -74,7 +74,7 @@ class IMU(Capture):
 
 
 class SleepingPrepared(Prepared):
-    def prepare_after_sleep(self, *, guard=None):
+    def prepare_after_sleep(self, *, guard=None, deadline=None):
         if guard:
             guard()
         self.env.events.append("prepared.after_sleep")

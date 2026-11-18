@@ -449,12 +449,14 @@ class RetainedStream:
             )
             return self
 
-    def arm_watcher(self):
+    def arm_watcher(self, *, deadline=None):
         with self.control.lock:
             if not self.prepared or self.arm_attempted or self.closed:
                 raise PreparedStreamError("One near-Wake retained helper arm required")
             same_owner(self.control, self.owner_receipt)
-            state = self.control.snapshot()
+            state = (self.control.snapshot() if deadline is None else
+                self.control.wait_sleep_snapshot(self.sleep_id, deadline=deadline,
+                    report=self.report.setdefault('sleep_readiness', {})))
             if state["state"] != "SLEEP" or state.get("command_id") != self.sleep_id:
                 raise PreparedStreamError("Arm only during the exact stable Sleep")
             if not self.old_preview._lease.healthy:
@@ -463,6 +465,8 @@ class RetainedStream:
                 )
 
             def intent():
+                if deadline is not None and self.clock() >= deadline:
+                    raise TimeoutError('Wake deadline before retained arm')
                 self.arm_attempted = self.possible_future_apply = True
 
             try:

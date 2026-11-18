@@ -40,6 +40,9 @@ class Control:
     def snapshot(self):
         return deepcopy(self.last)
 
+    def wait_sleep_snapshot(self, identifier, *, deadline, report=None):
+        return self.snapshot()
+
 
 class Core:
     def __init__(self, events, control=None):

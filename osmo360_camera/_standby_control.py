@@ -47,6 +47,18 @@ class StandbyUncertain(StandbyControlError):
         self.command_id = command_id
 
 
+class NativeSleepObservationMismatch(ValueError):
+    """Valid completed Sleep receipt, but its current level/role is unsettled.
+
+    Stock clients such as BLE can briefly resume S0 before returning to S2.
+    This observation never authorizes a key, arm, or an AWAKE state claim.
+    """
+
+    def __init__(self, observation):
+        super().__init__('Cached owner state disagrees with current native manager')
+        self.observation = deepcopy(observation)
+
+
 def _token(value):
     return (
         type(value) is dict
@@ -167,8 +179,6 @@ def parse_snapshot(data, *, nonce, owner=None, service=None):
         raise ValueError("Uninitialized owner cannot claim a stable state")
     if value["state"] in ("AWAKE", "SLEEP"):
         level = ready.get("system_power_level")
-        if level not in ((0,) if value["state"] == "AWAKE" else (2, 3)):
-            raise ValueError("Cached owner state disagrees with current native manager")
         if sequence:
             result = value.get("last_result", {})
             if (
@@ -219,7 +229,89 @@ def parse_snapshot(data, *, nonce, owner=None, service=None):
                     != (True, 5, "exit", "peripheral")
                 ):
                     raise ValueError("Wake real EXIT/native terminal proof missing")
+        # A retryable observation must first pass every receipt/owner/source
+        # check above. Other invalid levels and malformed receipts stay fatal.
+        if value['state'] == 'SLEEP':
+            _sleep_observation_identity(value, '/dev/shm/osmo-usb-standby-' + nonce, value['command_id'])
+            if level in (0, 2, 3) and (level == 0 or value['shadow']['value'] != 'none'):
+                raise NativeSleepObservationMismatch(value)
+        if level not in ((0,) if value["state"] == "AWAKE" else (2, 3)):
+            raise ValueError("Cached owner state disagrees with current native manager")
     return deepcopy(value)
+
+
+def _sleep_observation_identity(value, work, identifier):
+    """Pin the completed receipt and the same native-owned role mount."""
+    if type(value) is not dict:
+        raise ValueError('Previously completed Sleep snapshot required')
+    shadow = value.get('shadow')
+    target = '/sys/devices/platform/soc/a600000.ssusb/mode'
+    name = work.rsplit('/', 1)[-1]
+    if (value.get('state') != 'SLEEP' or value.get('command_id') != identifier
+            or value.get('action') != 'sleep' or value.get('last_sequence') != int(identifier, 16)
+            or type(shadow) is not dict or shadow.get('source') != work + '/role.txt'
+            or shadow.get('target') != target or type(shadow.get('inode')) is not list
+            or len(shadow['inode']) != 2 or any(type(item) is not int or item <= 0 for item in shadow['inode'])
+            or shadow.get('mount') != dict(fs='tmpfs', point=target, root='/' + name + '/role.txt')
+            or shadow.get('value') not in ('none', 'exit')):
+        raise ValueError('Exact completed Sleep and owned role observation required')
+    return deepcopy((value['nonce'], value['owner'], value['service'], value['last_result'],
+                     {key: shadow[key] for key in ('source', 'target', 'inode', 'mount')}))
+
+
+def wait_sleep_observation(query, *, previous, work, identifier, deadline,
+                           clock=time.monotonic, sleep=time.sleep, report=None, guard=None,
+                           first_mismatch=None):
+    """RO re-observation only; one absolute deadline, never a new input.
+
+    The old receipt stays pinned. Native0 is never accepted as Sleep; only a
+    later fresh2/3 with the same owned shadow back to none can authorize arm.
+    """
+    if not _finite(deadline) or not _identifier(identifier):
+        raise ValueError('Exact Sleep identifier and absolute deadline required')
+    expected = _sleep_observation_identity(previous, work, identifier)
+    floor = previous['at']['boottime']
+    evidence = report if report is not None else {}
+    evidence.update(deadline=deadline, attempts=0, ready=False, observations=[])
+    last_error = None
+    def timely():
+        if clock() >= deadline:
+            raise StandbyUncertain('Native Sleep observation deadline; no arm or input',
+                                   command_id=identifier) from last_error
+        if guard is not None:
+            guard()
+    while True:
+        timely()
+        try:
+            if first_mismatch is not None:
+                error, first_mismatch = first_mismatch, None
+                raise error
+            value = query()
+        except NativeSleepObservationMismatch as error:
+            value, last_error = error.observation, error
+        timely()  # A late fresh status cannot authorize the native helper.
+        if (_sleep_observation_identity(value, work, identifier) != expected
+                or value['at']['boottime'] < floor):
+            raise ValueError('Sleep owner/receipt/role generation changed during observation')
+        floor = value['at']['boottime']
+        level = value['requested_readiness']['system_power_level']
+        stable = level in (2, 3) and value['shadow']['value'] == 'none'
+        if level not in (0, 2, 3):
+            raise ValueError('Unexpected native Sleep observation level')
+        _record_sleep_observation(evidence, value, clock, stable)
+        if stable:
+            evidence['ready'] = True
+            return deepcopy(value)
+        # A level2/3 with exit is a mixed native observation, not stable Sleep.
+        sleep(min(.05, max(0, deadline - clock())))
+
+
+def _record_sleep_observation(evidence, value, clock, stable):
+    evidence['attempts'] += 1
+    evidence['observations'].append(dict(at=clock(), native_boottime=value['at']['boottime'],
+        native_level=value['requested_readiness']['system_power_level'],
+        shadow_value=value['shadow']['value'], command_id=value['command_id'], stable=stable))
+    del evidence['observations'][:-8]
 
 
 @dataclass(frozen=True)
@@ -297,6 +389,7 @@ class StandbyControl:
         self.readonly_reconnect = readonly_reconnect
         self.status_reconnect_attempts = self.status_reconnect_successes = 0
         self._status_reconnect_events = []
+        self._sleep_readiness_report = None
         self._adapter_factory = adapter_factory or (
             lambda transport: USBBootstrap(
                 transport, session=D1Session(transport, reuse_owned_id=True)
@@ -378,6 +471,7 @@ class StandbyControl:
         # Rows contain primitives and fixed-key dicts; append/update is under U.
         return dict(reconnect_attempts=self.status_reconnect_attempts,
             reconnect_successes=self.status_reconnect_successes,
+            sleep_readiness=deepcopy(self._sleep_readiness_report),
             reconnect_events=[dict(row,
                 generation=dict(row['generation']) if type(row['generation']) is dict else None,
                 result_proof=dict(row['result_proof']) if type(row['result_proof']) is dict else None)
@@ -634,7 +728,18 @@ class StandbyControl:
     def _script(self):
         return Q(self.work + "/usb_standby_owner.py")
 
-    def _snapshot(self):
+    def _snapshot(self, *, deadline=None):
+        def timely():
+            if deadline is not None and self.clock() >= deadline:
+                raise StandbyUncertain('Snapshot deadline; no new status START')
+        def budget_ms():
+            timely()
+            if deadline is None:
+                return 5000
+            remaining = deadline - self.clock()
+            if remaining < .1:
+                raise StandbyUncertain('Insufficient status task budget before deadline')
+            return min(5000, int(remaining * 1000))
         if self._verify_on_snapshot:
             for name, digest in SOURCES.items():
                 self._run(
@@ -642,16 +747,24 @@ class StandbyControl:
                     + Q(self.work + "/" + name)
                     + ' | cut -d" " -f1)" = '
                     + digest
-                    + " ]"
+                    + " ]", timeout_ms=budget_ms(), pre_send=timely if deadline is not None else None
                 )
             self._verify_on_snapshot = False
-        self._run("python3 " + self._script() + " status")
+        self._run("python3 " + self._script() + " status", timeout_ms=budget_ms(),
+                  pre_send=timely if deadline is not None else None)
+        timely()
         raw = self.bootstrap.pull_bytes(
-            "/blackbox/export_tmp/osmo_probe_" + self.nonce + ".json", max_bytes=16384
+            "/blackbox/export_tmp/osmo_probe_" + self.nonce + ".json", max_bytes=16384,
+            **({} if deadline is None else {'timeout': min(10, deadline - self.clock())})
         )
-        value = parse_snapshot(
-            raw, nonce=self.nonce, owner=self.owner, service=self.service
-        )
+        timely()
+        try:
+            value = parse_snapshot(raw, nonce=self.nonce, owner=self.owner, service=self.service)
+        except NativeSleepObservationMismatch as error:
+            if (self.last is not None
+                    and error.observation['at']['boottime'] < self.last['at']['boottime']):
+                raise ValueError('Owner boot clock went backwards') from error
+            raise
         if (
             self.last is not None
             and value["at"]["boottime"] < self.last["at"]["boottime"]
@@ -665,11 +778,27 @@ class StandbyControl:
             self.pending_command = None
         return deepcopy(value)
 
-    def snapshot(self):
+    def snapshot(self, *, deadline=None):
         with self.lock:
             if not self.launch_attempted:
                 raise StandbyControlError("No owned launch/attachment")
-            return self._snapshot()
+            return self._snapshot() if deadline is None else self._snapshot(deadline=deadline)
+
+    def wait_sleep_snapshot(self, identifier, *, deadline, report=None):
+        """Wait only for a previously completed owned Sleep, before arm."""
+        with self.lock:
+            previous = deepcopy(self.last)
+            owned = (self.work, self.nonce, deepcopy(self.owner), deepcopy(self.service))
+            def guard():
+                if (owned != (self.work, self.nonce, self.owner, self.service)
+                        or self.pending_command is not None or self.pending_task is not None
+                        or self._unknown_task or self.bootstrap.session.quarantined):
+                    raise StandbyUncertain('Pending/changed Sleep ownership; no observation retry', command_id=identifier)
+            guard()
+            self._sleep_readiness_report = report if report is not None else {}
+            return wait_sleep_observation(lambda: self.snapshot(deadline=deadline), previous=previous,
+                work=self.work, identifier=identifier, deadline=deadline,
+                clock=self.clock, sleep=self.sleep, report=self._sleep_readiness_report, guard=guard)
 
     def stage_sources(self, files, work, *, guard=None):
         """Copy a verified installed source group, or explicitly report absence.
@@ -750,8 +879,8 @@ class StandbyControl:
             )
             return self._snapshot()
 
-    def _submit(self, action, proof=None):
-        value = self._snapshot()
+    def _submit(self, action, proof=None, *, deadline=None):
+        value = self._snapshot() if deadline is None else self._snapshot(deadline=deadline)
         if self.pending_command is not None or value["state"] != (
             "AWAKE" if action == "sleep" else "SLEEP"
         ):
@@ -777,6 +906,8 @@ class StandbyControl:
 
         def before_send():
             nonlocal attempted
+            if deadline is not None and self.clock() >= deadline:
+                raise StandbyUncertain('Input deadline before delivery; no key', command_id=identifier)
             if proof is not None:
                 proof.validate(self.clock())
             self.pending_command = identifier  # BEFORE the one possibly delivered call.
@@ -812,9 +943,9 @@ class StandbyControl:
             proof.validate(self.clock())
             return self._submit("sleep", proof)
 
-    def submit_wake(self):
+    def submit_wake(self, *, deadline=None):
         with self.lock:
-            return self._submit("wake")
+            return self._submit("wake", deadline=deadline)
 
     def wait(self, identifier, target, *, timeout=15):
         if (
@@ -828,16 +959,36 @@ class StandbyControl:
             )
         with self.lock:
             deadline = self.clock() + timeout
+            sleep_identity = sleep_floor = None
+            readiness = None
             while True:
                 if self.clock() >= deadline:
                     raise StandbyUncertain(
                         "Command proof deadline; no input retry", command_id=identifier
                     )
                 try:
-                    value = self._snapshot()
+                    value = self._snapshot(deadline=deadline)
                 except BaseException as error:
                     command = "python3 " + self._script() + " status"
                     detail = self._status_error_detail(error, command)
+                    if isinstance(error, NativeSleepObservationMismatch) and target == 'SLEEP':
+                        observed = error.observation
+                        if (self.pending_command != identifier or self.pending_task is not None
+                                or self._unknown_task or self.bootstrap.session.quarantined):
+                            raise StandbyUncertain('Pending/unknown Sleep observation; no retry', command_id=identifier) from error
+                        identity = _sleep_observation_identity(observed, self.work, identifier)
+                        if sleep_identity is None:
+                            sleep_identity, sleep_floor = identity, observed['at']['boottime']
+                            readiness = dict(deadline=deadline, attempts=0, ready=False, observations=[])
+                            self._sleep_readiness_report = readiness
+                        if identity != sleep_identity or observed['at']['boottime'] < sleep_floor:
+                            raise ValueError('Sleep observation generation changed') from error
+                        sleep_floor = observed['at']['boottime']
+                        _record_sleep_observation(readiness, observed, self.clock, False)
+                        detail['native_sleep_observation'] = deepcopy(readiness['observations'][-1])
+                        self._attach_status_detail(error, detail)
+                        self.sleep(min(.05, max(0, deadline - self.clock())))
+                        continue
                     if self._resume_status_reader(error, command, identifier, target, deadline, detail):
                         self._attach_status_detail(error, detail)
                         continue
@@ -864,6 +1015,12 @@ class StandbyControl:
                         command_id=identifier,
                     )
                 if value.get("command_id") == identifier and value["state"] == target:
+                    if sleep_identity is not None:
+                        if (_sleep_observation_identity(value, self.work, identifier) != sleep_identity
+                                or value['at']['boottime'] < sleep_floor):
+                            raise ValueError('Stable Sleep observation generation changed')
+                        _record_sleep_observation(readiness, value, self.clock, True)
+                        readiness['ready'] = True
                     for row in self._status_reconnect_events:
                         if row['command_id'] == identifier and row['resumed']:
                             row['command_proven'] = True

@@ -68,6 +68,9 @@ class Control:
             command_id=f"{self.sequence:016x}",
         )
 
+    def wait_sleep_snapshot(self, identifier, *, deadline, report=None):
+        return self.snapshot()
+
     def _run(self, command, **options):
         self.events.append("control_start")
         if options.get("pre_send"):
