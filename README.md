@@ -293,6 +293,12 @@ an unknown pending camera operation. Restarting the Pi is not required.
 
 Standard compressed-image consumers should use the JPEG topic. The `h264` topic
 is an original-video archive channel; it needs an H.264 decoder, not compressed_image_transport.
+JPEG images, their native timing and IMU are the primary input for ROS/SLAM.
+A recording may join the H.264 stream between random-access pictures, so its
+raw access units can depend on parameter sets and reference pictures sent
+before the recording started. Standalone decoding of such an archive is not
+verified by this adapter. The rover integration builds session playback from
+the independent JPEG images.
 
 SDK video frames can lack native timestamps after missing/unsupported SEI.
 These pictures remain visible in the live preview, and their original H.264 AUs

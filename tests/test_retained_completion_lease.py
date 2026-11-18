@@ -148,7 +148,10 @@ class CompletionLeaseTests(unittest.TestCase):
             self.assertEqual(m.completion_server(self.work, self.cfg), "finished")
         self.assertEqual(timer.call_args_list[0].args, (m.signal.ITIMER_REAL, 40.0))
         self.assertEqual(timer.call_args_list[1].args, (m.signal.ITIMER_REAL, 0))
-        server.assert_called_once_with(self.work, self.cfg, guard=self.guard)
+        server.assert_called_once()
+        self.assertEqual(server.call_args.args, (self.work, self.cfg))
+        self.assertEqual(server.call_args.kwargs['guard'], self.guard)
+        self.assertTrue(callable(server.call_args.kwargs['checkpoint']))
 
     def test_server_handoffs_past_old_expiry_but_exits_at_original_budget(self):
         self.write(self.work / "result.json", {k: v for k, v in self.done.items() if k != "closed"})

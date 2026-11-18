@@ -74,7 +74,8 @@ def ram_failure_snapshot(b, path, kind):
         value = json.loads(raw) if len(raw) <= 8192 else None
         if type(value) is dict:
             keys = {'native_status': ('state', 'command_id', 'action', 'last_sequence', 'owner', 'service', 'error'),
-                'result': ('terminal', 'reset_attempted', 'completed_boottime', 'worker', 'lease_sequence', 'lease_expires')}.get(kind)
+                'result': ('terminal', 'reset_attempted', 'completed_boottime', 'worker', 'lease_sequence', 'lease_expires'),
+                'responder_error': ('schema', 'nonce', 'phase', 'pid', 'at', 'error_type', 'error', 'errno', 'completion_port')}.get(kind)
             if keys is not None:
                 value = {key: value[key] for key in keys if key in value}
             if kind == 'native_status' and type(json.loads(raw).get('last_result')) is dict:
@@ -94,6 +95,7 @@ def ram_failure_snapshot(b, path, kind):
 
 def failure_payload(work, cfg, b, where, error, stage):
     paths = {'checkpoint': work / 'checkpoint.json', 'worker_error': work / 'worker-error.json',
+        'responder_error': work / 'serve-error.json',
         'result': work / 'result.json', 'reset_intent': work / 'reset-intent.json',
         'native_status': Path(cfg['standby_work']) / 'status.json',
         'lease_state': Path(cfg['lease_work']) / 'lease.state'}
@@ -104,6 +106,8 @@ def failure_payload(work, cfg, b, where, error, stage):
         snapshots={kind: ram_failure_snapshot(b, path, kind) for kind, path in paths.items()})
     if type(getattr(error, 'pin_difference', None)) is dict:
         value['pin_difference'] = error.pin_difference
+    if type(getattr(error, 'responder_returncode', None)) is int:
+        value['responder_returncode'] = error.responder_returncode
     # JSON escaping can expand a bounded text. Keep exact error/stage and mark
     # any lower-priority snapshot omission instead of exceeding the8KiB cap.
     for key in ('result', 'native_status', 'worker_error', 'reset_intent', 'lease_state', 'checkpoint'):
@@ -548,19 +552,51 @@ def completion_guard(work, cfg):
 
 def completion_server(work, cfg):
     """Finite UDP reader only: no UDC, key, power or lease-writing path."""
-    guard = completion_guard(work, cfg)
-    deadline = completion_deadline(cfg, guard, boot())
-    def expired(*args): raise TimeoutError('Finite completion responder alarm')
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, max(.001, deadline - boot()))
-    try: return _completion_server(work, cfg, guard=guard)
+    phase = 'guard'
+    previous = None
+    def checkpoint(name):
+        nonlocal phase
+        phase = name
+    try:
+        guard = completion_guard(work, cfg)
+        deadline = completion_deadline(cfg, guard, boot())
+        def expired(*args): raise TimeoutError('Finite completion responder alarm')
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, max(.001, deadline - boot()))
+        return _completion_server(work, cfg, guard=guard, checkpoint=checkpoint)
+    except BaseException as error:
+        # stderr is intentionally detached. Preserve the FIRST child failure
+        # in private RAM so the supervisor can export it before stock recovery.
+        # This receipt is diagnostic only: it never relaxes a proof or delays
+        # recovery with durable storage, another command or a retry.
+        try: responder_error(work, cfg, phase, error)
+        except BaseException: pass
+        raise
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+        if previous is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
 
 
-def _completion_server(work, cfg, *, guard=None):
+def responder_error(work, cfg, phase, error):
+    """Bounded first-error receipt; same exclusive/no-follow RAM write rules."""
+    value = dict(schema=1, nonce=cfg['nonce'], phase=diagnostic_text(phase, 48),
+        pid=os.getpid(), at=boot(), error_type=diagnostic_text(type(error).__name__, 64),
+        error=diagnostic_text(error, 256),
+        errno=error.errno if isinstance(error, OSError) and type(error.errno) is int else None,
+        completion_port=cfg['completion_port'])
+    raw = encoded(value)
+    if len(raw) > 2048: raise ValueError('Responder diagnostic exceeds2KiB')
+    fd = os.open(work / 'serve-error.json',
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        if stream.write(raw) != len(raw): raise OSError('Short responder diagnostic write')
+
+
+def _completion_server(work, cfg, *, guard=None, checkpoint=lambda name: None):
+    checkpoint('modules')
     observer, owner, base = modules(work, cfg); b = observer.base
+    checkpoint('result')
     done = b.read_json(work / 'result.json')
     if cfg['completion_port'] is None: raise ValueError('Completion responder was not requested')
     guard = completion_guard(work, cfg) if guard is None else guard
@@ -577,21 +613,30 @@ def _completion_server(work, cfg, *, guard=None):
         state, now = completion_live_lease(cfg, b, done)
         completion_deadline(cfg, guard, boot())
         return state, now
+    checkpoint('current')
     state, now = current()
+    checkpoint('terminal')
     completion_terminal(cfg, done, now, closed=False)
+    checkpoint('socket')
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        checkpoint('bind_device')
         sock.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), done['post']['ifname'].encode() + b'\0')
+        checkpoint('bind_port')
         sock.bind((cfg['camera_ip'], cfg['completion_port']))
+        checkpoint('ready')
         b.write_new(work / 'serve-ready.json', dict(nonce=cfg['nonce'], process=base.proc_token(),
             port=cfg['completion_port'], ifname=done['post']['ifname']))
+        checkpoint('wait_done')
         while not (work / 'done.json').exists():
             current(); time.sleep(.01)  # Socket is bound but cannot reply yet.
+        checkpoint('validate_done')
         final = b.read_json(work / 'done.json')
         if {key: value for key, value in final.items() if key != 'closed'} != done:
             raise ValueError('Final DONE must be this exact immutable worker result')
         done = final
         state, now = current()
         completion_terminal(cfg, done, now)
+        checkpoint('serve')
         while True:
             state, now = current()
             sock.settimeout(max(.001, min(.1, deadline - boot(), state['expires'] - now)))
@@ -602,6 +647,17 @@ def _completion_server(work, cfg, *, guard=None):
             if reply is not None:
                 current()  # No stale reply after an intervening close/expiry.
                 sock.sendto(reply, peer)
+
+
+def responder_startup_check(responder, deadline):
+    """Keep the original deadline; distinguish child exit from late readiness."""
+    code = responder.poll()
+    if code is not None:
+        error = RuntimeError('Completion responder exited before readiness (returncode=' + str(code) + ')')
+        error.responder_returncode = code
+        raise error
+    if boot() >= deadline:
+        raise TimeoutError('Completion responder readiness deadline')
 
 
 def supervise(work, cfg):
@@ -638,8 +694,7 @@ def supervise(work, cfg):
                         responder_deadline = boot() + 1
                         responder = spawn(work, '_serve')
                         continue
-                    if responder.poll() is not None or boot() >= responder_deadline:
-                        raise RuntimeError('Completion responder failed before readiness')
+                    responder_startup_check(responder, responder_deadline)
                     if not (work / 'serve-ready.json').exists(): continue
                     ready = b.read_json(work / 'serve-ready.json')
                     if (ready.get('nonce') != cfg['nonce'] or ready.get('process', {}).get('pid') != responder.pid

@@ -7,9 +7,10 @@ acquisition_sink(source, immutable_tuple) runs before ROS construction, allowing
 a separate recording process to use acquisition.materialize_acquisition().
 Archival priority is acquisition_sink, then batch_sink, then the legacy sink.
 
-Browser JPEG is a viewing copy. /video/h264 retains the original Annex-B
-access units, including DJI metadata. SLAM can consume /image/compressed;
-offline tools can decode the original H.264 without the extra JPEG generation.
+JPEG images and native timing provide independent frames for ROS/SLAM.
+/video/h264 retains arriving Annex-B access units, including DJI metadata.
+A recording that joins an existing stream may need earlier parameter sets
+and reference pictures; standalone H.264 decoding is not verified here.
 Access units without a native timestamp stay in the same H.264 sequence, but
 their host-arrival-stamped JPEG is excluded from the SLAM image topic.
 """
