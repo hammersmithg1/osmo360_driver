@@ -98,7 +98,7 @@ class VideoFirstTests(unittest.TestCase):
         value.__class__ = retained.RetainedStream
         value.network = retained_fixtures.Network(fixture.events, 1)
 
-        def completion(remaining):
+        def completion(remaining, *, deadline):
             ready = dict(ok=True, ncm_interface="usb1")
             value._start_provisional(ready, remaining)
             return ready

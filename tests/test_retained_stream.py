@@ -1,6 +1,7 @@
 """Retained lease/receipt/generation tests; no USB or sockets are opened."""
 
 from copy import deepcopy
+import errno
 import hashlib
 import json
 import socket
@@ -40,8 +41,10 @@ class Network:
         )
         self.report = dict(ready=dict(ok=True, ncm_interface=self.identity.name))
         self.gone, self.next = generation == 0, None
+        self.deadlines = []
 
-    def _old_index_absent(self, identity):
+    def _old_index_absent(self, identity, *, deadline=None):
+        self.deadlines.append(deadline)
         return self.gone, {"absent": self.gone}
 
     def rebind_after_usb_reset(self, **options):
@@ -124,6 +127,16 @@ class RetainedTests(unittest.TestCase):
             owner_receipt=deepcopy(RECEIPT),
             link_into=Mock(),
         )
+        def pull(path, **options):
+            self.events.append('endpoint.pull')
+            nonce = path.rsplit('_', 1)[1].removesuffix('.json')
+            guard = dict(pid=44, start='345')
+            return json.dumps(dict(schema=1, nonce=nonce, guard=guard,
+                worker=dict(pid=55, start='456'),
+                endpoint=dict(schema=1, nonce=nonce, owner=guard, fd=7,
+                    socket_identity=[9, 99], ifname='usb0', ifindex=12, port=54321),
+                export_identity=dict(device=9, inode=100))).encode()
+        self.control.bootstrap.pull_bytes = Mock(side_effect=pull)
 
     def backend(self, **options):
         return m.RetainedStream(
@@ -174,6 +187,8 @@ class RetainedTests(unittest.TestCase):
         self.assertNotEqual(
             value.manifest["completion_port"], self.plan["lease"]["port"]
         )
+        self.assertEqual(value.manifest['completion_port'], 0)
+        self.assertIsNone(value.endpoint)
         self.assertFalse(value.arm_attempted)
         self.assertFalse(value.possible_future_apply)
         self.old._lease.stop.assert_not_called()
@@ -214,6 +229,79 @@ class RetainedTests(unittest.TestCase):
         self.old._lease.stop.assert_called_once_with(close_camera=False)
         self.assertEqual(value.sequence, 44)
         self.assertIs(self.camera._usb_preview, self.old)
+
+    def test_reserved_endpoint_is_fetched_and_inode_cleaned_before_local_lease_stop(self):
+        run = self.control._run
+        def record(command, **options):
+            if ';os.unlink(p)' in command: self.events.append('endpoint.unlink')
+            return run(command, **options)
+        self.control._run = record
+        value = self.armed()
+        output = '/blackbox/export_tmp/osmo_rebind_endpoint_' + value.nonce + '.json'
+        self.control.bootstrap.pull_bytes.assert_called_once_with(output, max_bytes=4096, timeout=2)
+        self.assertEqual(value.endpoint['port'], 54321)
+        cleanup = next(command for command in self.control.commands if ';os.unlink(p)' in command)
+        self.assertIn('(9, 100)', cleanup)
+        self.assertIn(output, cleanup)
+        self.assertEqual(value.manifest['completion_port'], 0)
+        self.assertLess(self.events.index('endpoint.pull'), self.events.index('endpoint.unlink'))
+        self.assertLess(self.events.index('endpoint.unlink'), self.events.index(('old_lease.stop', dict(close_camera=False))))
+        self.assertFalse(any('UDC' in command or command.endswith(' wake') for command in self.control.commands))
+
+    def assert_arm_failure_retains_guard(self, value):
+        with self.assertRaises(m.UnknownFutureApply):
+            value.arm_watcher()
+        self.assertTrue(value.possible_future_apply)
+        self.assertIsNone(value.endpoint)
+        self.old._lease.stop.assert_not_called()
+        with self.assertRaises(m.PreparedStreamError):
+            value.arm_watcher()
+        self.assertEqual(sum(command.endswith(' launch') for command in self.control.commands), 1)
+
+    def test_foreign_endpoint_preserves_unknown_guard_and_old_lease(self):
+        value = self.backend().prepare()
+        self.control.state, self.control.sequence = 'SLEEP', 1
+        raw = self.control.bootstrap.pull_bytes.side_effect('unused_' + value.nonce + '.json')
+        corrupt = json.loads(raw)
+        corrupt['endpoint']['nonce'] = '00' * 6
+        self.control.bootstrap.pull_bytes = Mock(return_value=json.dumps(corrupt).encode())
+        self.assert_arm_failure_retains_guard(value)
+
+    def test_failed_endpoint_cleanup_preserves_unknown_guard_and_old_lease(self):
+        value = self.backend().prepare()
+        self.control.state, self.control.sequence = 'SLEEP', 1
+        def reject(command):
+            if ';os.unlink(p)' in command: raise OSError('cleanup receipt lost')
+        self.control.failure = reject
+        self.assert_arm_failure_retains_guard(value)
+
+    def test_missing_endpoint_pull_preserves_unknown_guard_and_old_lease(self):
+        value = self.backend().prepare()
+        self.control.state, self.control.sequence = 'SLEEP', 1
+        self.control.bootstrap.pull_bytes = Mock(side_effect=TimeoutError('endpoint pull missing'))
+        self.assert_arm_failure_retains_guard(value)
+        self.assertFalse(any(';os.unlink(p)' in command for command in self.control.commands))
+
+    def test_endpoint_receipt_rejects_duplicate_foreign_or_unbounded_fields(self):
+        value = self.backend().prepare()
+        raw = self.control.bootstrap.pull_bytes.side_effect('unused_' + value.nonce + '.json')
+        valid = json.loads(raw)
+        self.assertEqual(m.decode_endpoint(raw, value.manifest)['endpoint']['port'], 54321)
+        for mutate in (
+            lambda item: item.update(schema=True),
+            lambda item: item.update(extra=1),
+            lambda item: item['endpoint'].update(port=self.plan['lease']['port']),
+            lambda item: item['endpoint'].update(socket_identity=[9, True]),
+            lambda item: item['endpoint'].update(owner=dict(pid=99, start='1')),
+            lambda item: item['export_identity'].update(inode=0),
+        ):
+            corrupt = deepcopy(valid)
+            mutate(corrupt)
+            with self.subTest(corrupt=corrupt), self.assertRaises(ValueError):
+                m.decode_endpoint(json.dumps(corrupt).encode(), value.manifest)
+        for corrupt in (b'x' * 4097, raw.replace(b'"schema": 1', b'"schema": 1, "schema": 1', 1)):
+            with self.subTest(raw=corrupt[:80]), self.assertRaises(ValueError):
+                m.decode_endpoint(corrupt, value.manifest)
 
     def test_abandon_keeps_heartbeat_when_mask_is_restored_but_drain_is_unproven(self):
         for proof in (
@@ -323,7 +411,7 @@ class RetainedTests(unittest.TestCase):
                 test.assertNotIn("imu_start", test.events)
                 return self.raw, (
                     test.plan["lease"]["camera_ip"],
-                    value.manifest["completion_port"],
+                    value.endpoint["port"],
                 )
 
             def close(self):
@@ -363,6 +451,59 @@ class RetainedTests(unittest.TestCase):
         self.assertFalse(
             any("apply.sh" in command for command in self.control.commands)
         )
+        deadlines = self.network.deadlines + middle.deadlines + final.deadlines
+        self.assertTrue(deadlines)
+        self.assertEqual(set(deadlines), {45.0})
+
+    def test_initial_completion_inventory_retries_unregister_under_exact_wake_deadline(self):
+        # Exercise the real guard/inventory implementation against fake sysfs,
+        # including the FIRST absence probe before rebind_after_usb_reset().
+        from test_linux_usb_rebind import LinuxUSBRebindTests
+        fixture = LinuxUSBRebindTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        value = self.armed()
+        fixture.host.reset()
+        value.network, value.baseline = fixture.guard, fixture.baseline
+        value.clock = lambda: fixture.host.now
+        value.sleep = lambda seconds: setattr(fixture.host, 'now', fixture.host.now + seconds)
+        entry = fixture.host.net / 'departing'
+        entry.mkdir()
+        (entry / 'ifindex').write_text('20')
+        read, errors, deadlines = Path.read_text, [], []
+        absent = type(fixture.guard)._old_index_absent
+        test = self
+        def unregister(path, *args, **kwargs):
+            if path == entry / 'ifindex':
+                test.assertEqual(fixture.host.commands, [])
+                path.unlink()
+                entry.rmdir()
+                errors.append(errno.EINVAL)
+                raise OSError(errno.EINVAL, 'netdev unregister', str(path))
+            return read(path, *args, **kwargs)
+        def observe(guard, old, snapshot=None, *, deadline=None):
+            deadlines.append(deadline)
+            return absent(guard, old, snapshot, deadline=deadline)
+        class Sock:
+            def settimeout(self, timeout): pass
+            def sendto(self, raw, peer):
+                _, ticket, challenge = m.QUERY.unpack(raw)
+                self.raw = json.dumps(test.receipt(value, ticket, challenge)).encode()
+            def recvfrom(self, limit):
+                return self.raw, (test.plan['lease']['camera_ip'], value.endpoint['port'])
+            def close(self): pass
+        value.socket_factory = lambda *args: Sock()
+        with (patch.object(Path, 'read_text', unregister),
+              patch.object(type(fixture.guard), '_old_index_absent', observe),
+              patch.object(m, 'bind_socket')):
+            value.attach_data_first(timeout=13, native_floor_ns=1, wake_host_ns=2)
+        self.assertEqual(errors, [errno.EINVAL])
+        self.assertEqual(deadlines[0], 13.0)
+        self.assertEqual(set(deadlines), {13.0})
+        self.assertAlmostEqual(fixture.host.now, .1)
+        self.assertEqual(fixture.guard.report['inventory_retries']['count'], 1)
+        self.assertTrue(value.lease_proven)
+        self.assertEqual([index for index, _ in fixture.host.generations], [9, 9])
 
     def test_no_completion_stops_provisional_locally_without_media_input_or_rollback(
         self,
@@ -457,7 +598,7 @@ class RetainedTests(unittest.TestCase):
                     # final native proof is deliberately withheld past t10.
                     leases[-1].renew()
                     raise socket.timeout()
-                return self.raw, (test.plan['lease']['camera_ip'], value.manifest['completion_port'])
+                return self.raw, (test.plan['lease']['camera_ip'], value.endpoint['port'])
 
             def close(self):
                 pass
@@ -481,7 +622,7 @@ class RetainedTests(unittest.TestCase):
         value.network = Network(self.events, 1)
         commands = list(self.control.commands)
 
-        def completion(remaining):
+        def completion(remaining, *, deadline):
             ready = dict(ok=True, ncm_interface='usb1')
             value._start_provisional(ready, remaining)
             value._provisional_lease.renew = Mock(side_effect=TimeoutError('final ACK lost'))
@@ -503,7 +644,7 @@ class RetainedTests(unittest.TestCase):
         value = self.armed()
         value.network = Network(self.events, 1)
 
-        def completion(remaining):
+        def completion(remaining, *, deadline):
             ready = dict(ok=True, ncm_interface="usb1")
             value._start_provisional(ready, remaining)
             return ready

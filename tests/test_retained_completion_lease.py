@@ -28,6 +28,7 @@ class CompletionLeaseTests(unittest.TestCase):
             nonce="ab" * 6,
             lease_nonce="cd" * 16,
             lease_work=str(self.lease),
+            lease_port=51337,
             standby_owner=dict(pid=22, start="123"),
             sys_service=dict(pid=33, start="234"),
             wake_command_id="0000000000000002",
@@ -35,7 +36,7 @@ class CompletionLeaseTests(unittest.TestCase):
             host_ip="192.168.253.2",
             camera_ip="192.168.253.1",
             dev_mac="02:00:00:00:00:01",
-            completion_port=54321,
+            completion_port=0,
         )
         pre = dict(
             udc_identity=[10, 11], ifname="usb0", ifindex=12,
@@ -60,6 +61,9 @@ class CompletionLeaseTests(unittest.TestCase):
             nonce=self.cfg["nonce"], owner=dict(pid=44, start="345"),
             deadline_boottime=190.0,
         )
+        self.endpoint = dict(schema=1, nonce=self.cfg['nonce'], owner=self.guard['owner'],
+            fd=7, socket_identity=[9, 99], ifname='usb0', ifindex=12, port=54321)
+        self.write(self.work / 'endpoint.json', self.endpoint)
         self.raw = m.COMPLETION_QUERY.pack(m.COMPLETION_MAGIC, m.completion_ticket(self.cfg), 42)
         self.peer = (self.cfg["host_ip"], 54322)
 
@@ -186,6 +190,7 @@ class CompletionLeaseTests(unittest.TestCase):
             patch.object(m, "boot", side_effect=lambda: clock.boottime),
             patch.object(m.time, "monotonic", side_effect=lambda: clock.monotonic),
             patch.object(m.socket, "socket", return_value=FakeSocket()),
+            patch.object(m, 'endpoint_socket'),
             patch.object(m, "attribute", side_effect=lambda path: self.cfg["dev_mac"] if path.name == "address" else "12"),
             patch.object(m, "ipv4", return_value=self.cfg["camera_ip"] + "/30"),
         ):

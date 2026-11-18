@@ -40,7 +40,7 @@ from .vendor.util import bind_socket
 
 HELPER = "retained_sleep_060.py"
 # The camera source is installed only after its independent source/HW review.
-HELPER_SHA = "0e07a4db5754213b73ecf769970958977cb01b4821a4b48ab37379785190b9bc"
+HELPER_SHA = "e9d066ff0b47f509c72c0cd3a672893e51487f748645f67745fc1cdfe335546d"
 SOURCES = dict(BASE_SOURCES, **{HELPER: HELPER_SHA})
 Q = shlex.quote
 QUERY = struct.Struct("!8s16sQ")
@@ -57,6 +57,43 @@ def completion_ticket(lease_nonce, helper_nonce, wake_id):
         + bytes.fromhex(helper_nonce)
         + bytes.fromhex(wake_id)
     ).digest()[:16]
+
+
+def decode_endpoint(raw, manifest):
+    """A fresh reserved endpoint, never permission to skip final completion."""
+    if type(raw) is not bytes or not 0 < len(raw) <= 4096:
+        raise ValueError('Bounded reserved endpoint receipt required')
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value: raise ValueError('Duplicate endpoint field')
+            value[key] = item
+        return value
+    def token(value):
+        return (type(value) is dict and set(value) == {'pid', 'start'}
+            and type(value['pid']) is int and value['pid'] > 1
+            and isinstance(value['start'], str) and value['start'].isdigit())
+    value = json.loads(raw, object_pairs_hook=unique)
+    if (type(value) is not dict or set(value) != {'schema', 'nonce', 'guard', 'worker', 'endpoint', 'export_identity'}
+            or type(value['schema']) is not int or value['schema'] != 1 or value['nonce'] != manifest['nonce']
+            or not token(value['guard']) or not token(value['worker'])):
+        raise ValueError('Exact correlated reserved endpoint receipt required')
+    endpoint, identity = value['endpoint'], value['export_identity']
+    keys = {'schema', 'nonce', 'owner', 'fd', 'socket_identity', 'ifname', 'ifindex', 'port'}
+    if (type(endpoint) is not dict or set(endpoint) != keys
+            or type(endpoint['schema']) is not int or endpoint['schema'] != 1
+            or endpoint['nonce'] != manifest['nonce'] or endpoint['owner'] != value['guard']
+            or type(endpoint['fd']) is not int or not 3 <= endpoint['fd'] < 1048576
+            or type(endpoint['socket_identity']) is not list or len(endpoint['socket_identity']) != 2
+            or any(type(item) is not int or item <= 0 for item in endpoint['socket_identity'])
+            or not isinstance(endpoint['ifname'], str) or not re.fullmatch('[A-Za-z0-9_.-]{1,15}', endpoint['ifname'])
+            or type(endpoint['ifindex']) is not int or endpoint['ifindex'] <= 0
+            or type(endpoint['port']) is not int or not 1024 <= endpoint['port'] <= 65535
+            or endpoint['port'] == manifest['lease_port']
+            or type(identity) is not dict or set(identity) != {'device', 'inode'}
+            or any(type(item) is not int or item <= 0 for item in identity.values())):
+        raise ValueError('Exact owned endpoint/socket/export identity required')
+    return value
 
 
 def decode_completion(raw, *, manifest, ticket, challenge):
@@ -346,6 +383,7 @@ class RetainedStream:
         self.sequence = None
         self._provisional_lease = None
         self._provisional_row = None
+        self.endpoint = None
         self.report = dict(retained_ecm=True, errors=[], native_restored=False)
 
     def prepare(self):
@@ -376,9 +414,6 @@ class RetainedStream:
                 )
             self.prepare_attempted = True
             self.assets.link_into(self.work)
-            port = 49152 + secrets.randbelow(16384)
-            if port == self.plan["lease"]["port"]:
-                port = 49152 + (port - 49151) % 16384
             lease = self.plan["lease"]
             value = dict(
                 schema=1,
@@ -400,7 +435,7 @@ class RetainedStream:
                 camera_ip=lease["camera_ip"],
                 host_ip=lease["host_ip"],
                 host_sequence=old._lease.last_ack["sequence"],
-                completion_port=port,
+                completion_port=0,  # Kernel-selected and reserved by native owner before Wake.
             )
             data = json.dumps(
                 value, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -434,6 +469,15 @@ class RetainedStream:
                 self.control._run(
                     "python3 -B " + Q(self.script) + " launch", pre_send=intent
                 )
+                output = '/blackbox/export_tmp/osmo_rebind_endpoint_' + self.nonce + '.json'
+                raw = self.control.bootstrap.pull_bytes(output, max_bytes=4096, timeout=2)
+                reserved = decode_endpoint(raw, self.manifest)
+                identity = reserved['export_identity']
+                program = ('import os,sys;p=sys.argv[1];s=os.lstat(p);assert (s.st_dev,s.st_ino)=='
+                    + repr((identity['device'], identity['inode'])) + ';os.unlink(p)')
+                self.control._run(bounded('python3 -c ' + Q(program) + ' ' + Q(output)))
+                self.endpoint = reserved['endpoint']
+                self.report['reserved_endpoint'] = deepcopy(self.endpoint)
                 # Local closure sends no CLOSE opcode and cannot roll back ECM.
                 self.old_preview._lease.stop(close_camera=False)
                 self.sequence = self.old_preview._lease._sequence
@@ -499,7 +543,10 @@ class RetainedStream:
         row["first_ack_host_monotonic_ns"] = time.monotonic_ns()
         remaining()
 
-    def _completion(self, remaining):
+    def _completion(self, remaining, *, deadline):
+        if self.endpoint is None:
+            raise PreparedStreamError('Original reserved completion endpoint required')
+        port = self.endpoint['port']
         ticket = completion_ticket(
             self.manifest["lease_nonce"], self.nonce, self.wake_id
         )
@@ -509,7 +556,7 @@ class RetainedStream:
         try:
             while True:
                 remaining()
-                absent, _ = self.network._old_index_absent(self.network.identity)
+                absent, _ = self.network._old_index_absent(self.network.identity, deadline=deadline)
                 if absent:
                     self._stop_provisional()
                     if sock is not None:
@@ -532,7 +579,7 @@ class RetainedStream:
                     try:
                         self._start_provisional(ready, remaining)
                     except (OSError, PreviewLeaseError):
-                        if self.network._old_index_absent(self.network.identity)[0]:
+                        if self.network._old_index_absent(self.network.identity, deadline=deadline)[0]:
                             self._stop_provisional()
                             continue
                         raise
@@ -550,7 +597,7 @@ class RetainedStream:
                         QUERY.pack(MAGIC, ticket, challenge),
                         (
                             self.plan["lease"]["camera_ip"],
-                            self.manifest["completion_port"],
+                            port,
                         ),
                     )
                     raw, peer = sock.recvfrom(1025)
@@ -559,7 +606,7 @@ class RetainedStream:
                     continue  # Only data-only receipt polls; no native input.
                 if peer != (
                     self.plan["lease"]["camera_ip"],
-                    self.manifest["completion_port"],
+                    port,
                 ):
                     continue
                 remaining()
@@ -569,7 +616,7 @@ class RetainedStream:
                     )
                 except (ValueError, TypeError, KeyError):
                     continue
-                if self.network._old_index_absent(self.network.identity)[0]:
+                if self.network._old_index_absent(self.network.identity, deadline=deadline)[0]:
                     continue
                 # Recheck the pinned generation and all original host state;
                 # the receipt can never authorize alias/route drift.
@@ -614,7 +661,7 @@ class RetainedStream:
             return value
 
         try:
-            ready = self._completion(remaining)
+            ready = self._completion(remaining, deadline=deadline)
             remaining()
             fresh = self.preview = self.preview_factory(
                 self.camera,
@@ -635,7 +682,7 @@ class RetainedStream:
             before = lease._sequence
             ack = lease.renew()
             if (not lease.healthy or not ack or ack["sequence"] <= before
-                    or self.network._old_index_absent(self.network.identity)[0]):
+                    or self.network._old_index_absent(self.network.identity, deadline=deadline)[0]):
                 raise PreparedStreamError("Fresh final-generation lease ACK required")
             if self._provisional_row is not None:
                 self._provisional_row.update(

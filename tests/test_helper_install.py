@@ -147,7 +147,7 @@ class HelperHostTests(unittest.TestCase):
         )
         self.assertEqual(manifest, self.package["manifest"])
         self.assertEqual(files, self.package["sources"])
-        self.assertEqual(sum(len(raw) for raw in files.values()), 182282)
+        self.assertEqual(sum(len(raw) for raw in files.values()), 187764)
         self.assertLessEqual(len(self.package["packed"]), 65536)
 
     def test_absent_root_falls_back_without_running_unknown_installer_or_staging(self):
@@ -175,7 +175,7 @@ class HelperHostTests(unittest.TestCase):
             ("prepared", "/dev/shm/osmo-prepared-assets-bbbbbbbbbbbb"),
             (
                 "retained",
-                "/dev/shm/osmo-usb-standby-aaaaaaaaaaaa/retained-assets-0e07a4db5754",
+                "/dev/shm/osmo-usb-standby-aaaaaaaaaaaa/retained-assets-e9d066ff0b47",
             ),
         ):
             files = {name: self.package["sources"][name] for name in m.GROUPS[group]}

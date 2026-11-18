@@ -48,30 +48,15 @@ class ResponderDiagnosticsTests(unittest.TestCase):
     def receipt(self):
         return json.loads((self.work / 'serve-error.json').read_text())
 
-    def test_real_busy_udp_port_is_reported_and_exported_before_readiness(self):
-        native_socket = socket.socket
-        test = self
-
-        class DeviceSocket:
-            """Only the privileged device bind is mocked; UDP port bind is real."""
-            def __init__(self, *args): self.sock = native_socket(*args)
-            def __enter__(self): return self
-            def __exit__(self, *args): self.sock.close()
-            def setsockopt(self, level, option, value):
-                test.assertEqual((level, option, value), (socket.SOL_SOCKET,
-                    getattr(socket, 'SO_BINDTODEVICE', 25), b'usb0\0'))
-            def bind(self, target): return self.sock.bind(target)
-
-        with native_socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied:
-            occupied.bind(('127.0.0.1', 0))
-            self.cfg.update(camera_ip='127.0.0.1', completion_port=occupied.getsockname()[1])
-            with self.environment(), patch.object(m.socket, 'socket', DeviceSocket):
-                with self.assertRaises(OSError) as caught:
-                    m.completion_server(self.work, self.cfg)
-        self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
+    def test_missing_inherited_socket_is_reported_and_exported_before_readiness(self):
+        self.f.write(self.work / 'endpoint.json', dict(self.f.endpoint, fd=999999))
+        with self.environment():
+            with self.assertRaises(OSError) as caught:
+                m.completion_server(self.work, self.cfg)
+        self.assertEqual(caught.exception.errno, errno.EBADF)
         value = self.receipt()
         self.assertEqual((value['phase'], value['error_type'], value['errno']),
-                         ('bind_port', 'OSError', errno.EADDRINUSE))
+                         ('reservation', 'OSError', errno.EBADF))
         self.assertEqual(value['completion_port'], self.cfg['completion_port'])
         self.assertLessEqual((self.work / 'serve-error.json').stat().st_size, 2048)
         self.assertFalse((self.work / 'serve-ready.json').exists())
@@ -88,7 +73,7 @@ class ResponderDiagnosticsTests(unittest.TestCase):
             exported = m.failure_payload(self.work, self.cfg, self.f.base(),
                 'supervisor', error, 'supervisor-recovery')
         saved = json.loads(exported['snapshots']['responder_error']['text'])
-        self.assertEqual((saved['phase'], saved['errno']), ('bind_port', errno.EADDRINUSE))
+        self.assertEqual((saved['phase'], saved['errno']), ('reservation', errno.EBADF))
         self.assertEqual(exported['responder_returncode'], 1)
         self.assertLessEqual(len(m.encoded(exported)), m.MAX_FAILURE)
 

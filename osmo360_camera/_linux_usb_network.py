@@ -12,6 +12,7 @@ Import/construction does no I/O.
 """
 
 from dataclasses import asdict, dataclass
+import errno
 import math
 from pathlib import Path
 import re
@@ -186,38 +187,84 @@ class LinuxUSBNetworkGuard:
             raise LinuxUSBNetworkError("Incomplete Linux interface index inventory")
         return indexes
 
-    def _old_index_absent(self, old, snapshot=None):
-        """A failed/incomplete read is never evidence that the old NIC vanished."""
-        try:
-            snapshot = self.capture() if snapshot is None else snapshot
-            network._parse(snapshot)  # Successful address/route/DNS capture.
-            indexes = self._interface_indexes(snapshot)
-        except (
-            OSError,
-            network.NetworkGuardError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ) as error:
-            raise LinuxUSBNetworkError(
-                "Cannot prove complete Linux interface inventory"
-            ) from error
-        present = old.ifindex in indexes
-        sysfs_indexes = []
-        try:
-            # No skipped entries, including unreadable/disappearing interfaces.
-            for entry in self.net_root.iterdir():
-                index = int((entry / "ifindex").read_text())
-                if index <= 0:
-                    raise ValueError("Invalid sysfs ifindex")
-                sysfs_indexes.append(index)
-        except (OSError, ValueError) as error:
-            raise LinuxUSBNetworkError(
-                "Cannot prove complete sysfs interface inventory"
-            ) from error
-        if len(set(sysfs_indexes)) != len(sysfs_indexes):
-            raise LinuxUSBNetworkError("Duplicate sysfs interface index")
-        absent = not present and old.ifindex not in sysfs_indexes
+    def _interface_inventory(self, snapshot=None, *, deadline=None, camera=None):
+        """Read both complete views; retry only unregistering sysfs ifindex reads.
+
+        Linux netdev_show returns EINVAL after NETREG_REGISTERED, before the
+        sysfs entry disappears. Neither EINVAL nor ENOENT proves absence. During
+        an active reset only, discard BOTH views and retry under its original
+        deadline. No network mutation or other failed read is retried here.
+        """
+        last_transient = None
+        while True:
+            if deadline is not None and self.clock() >= deadline:
+                raise LinuxUSBNetworkError(
+                    "Complete interface inventory did not settle before reset deadline"
+                ) from last_transient
+            try:
+                snapshot = self.capture(camera) if snapshot is None else snapshot
+                network._parse(snapshot)  # Successful address/route/DNS capture.
+                indexes = self._interface_indexes(snapshot)
+            except (
+                OSError,
+                network.NetworkGuardError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise LinuxUSBNetworkError(
+                    "Cannot prove complete Linux interface inventory"
+                ) from error
+            sysfs_indexes, transient = [], None
+            try:
+                # No skipped entries, including newly appearing interfaces.
+                for entry in self.net_root.iterdir():
+                    try:
+                        value = (entry / "ifindex").read_text()
+                    except OSError as error:
+                        if deadline is None or error.errno not in (
+                            errno.ENOENT, errno.EINVAL
+                        ):
+                            raise
+                        transient = error
+                        break
+                    index = int(value)
+                    if index <= 0:
+                        raise ValueError("Invalid sysfs ifindex")
+                    sysfs_indexes.append(index)
+            except (OSError, ValueError) as error:
+                raise LinuxUSBNetworkError(
+                    "Cannot prove complete sysfs interface inventory"
+                ) from error
+            if transient is not None:
+                last_transient = transient
+                retries = self.report.setdefault(
+                    "inventory_retries", dict(count=0, errors=[])
+                )
+                retries["count"] += 1
+                # Keep diagnostics bounded even if a host continually churns.
+                if len(retries["errors"]) < 8:
+                    retries["errors"].append(
+                        dict(errno=transient.errno, path=str(entry / "ifindex"))
+                    )
+                if self.clock() >= deadline:
+                    raise LinuxUSBNetworkError(
+                        "Complete sysfs interface inventory did not settle before reset deadline"
+                    ) from transient
+                self.sleep(min(0.1, max(0, deadline - self.clock())))
+                snapshot = None  # A supplied/pre-error ip snapshot is stale too.
+                continue
+            if len(set(sysfs_indexes)) != len(sysfs_indexes):
+                raise LinuxUSBNetworkError("Duplicate sysfs interface index")
+            if deadline is not None and self.clock() >= deadline:
+                raise LinuxUSBNetworkError(
+                    "Complete interface inventory exceeded reset deadline"
+                )
+            return snapshot, indexes, sysfs_indexes
+
+    @staticmethod
+    def _index_absence(old, indexes, sysfs_indexes):
+        absent = old.ifindex not in indexes and old.ifindex not in sysfs_indexes
         return (
             absent,
             dict(
@@ -228,6 +275,13 @@ class LinuxUSBNetworkGuard:
                 absent=absent,
             ),
         )
+
+    def _old_index_absent(self, old, snapshot=None, *, deadline=None):
+        """A failed/incomplete read is never evidence that the old NIC vanished."""
+        _, indexes, sysfs_indexes = self._interface_inventory(
+            snapshot, deadline=deadline
+        )
+        return self._index_absence(old, indexes, sysfs_indexes)
 
     def _networkd_state(self, index):
         values = {}
@@ -373,7 +427,9 @@ class LinuxUSBNetworkGuard:
         if key in ("address_add", "link_up") and self._reset_origin is not None:
             snapshot, state = self._snapshot()
             current = self._current((snapshot, state))
-            absent, proof = self._old_index_absent(self._reset_origin, snapshot)
+            absent, proof = self._old_index_absent(
+                self._reset_origin, snapshot, deadline=self._reset_deadline
+            )
             if current is None:
                 vanished("Original interface disappeared before mutation")
             if not absent:
@@ -573,7 +629,11 @@ class LinuxUSBNetworkGuard:
         ready_completed = False
         try:
             while True:
-                absent, proof = self._old_index_absent(old)
+                if self.clock() >= deadline:
+                    raise LinuxUSBNetworkError(
+                        "Old USB generation did not disappear before deadline"
+                    )
+                absent, proof = self._old_index_absent(old, deadline=deadline)
                 if self.clock() >= deadline:
                     raise LinuxUSBNetworkError(
                         "Old USB generation did not disappear before deadline"
@@ -598,9 +658,12 @@ class LinuxUSBNetworkGuard:
                 self.baseline, old.mac, timeout=max(0, deadline - self.clock())
             )
             ready_completed = True
-            snapshot, state = replacement._snapshot()
+            snapshot, indexes, sysfs_indexes = replacement._interface_inventory(
+                deadline=deadline, camera=network.CAMERA
+            )
+            state = network._parse(snapshot, network.CAMERA)
             current = replacement._current((snapshot, state))
-            absent, proof = replacement._old_index_absent(old, snapshot)
+            absent, proof = replacement._index_absence(old, indexes, sysfs_indexes)
             ready = network.evaluate(self.baseline, after=snapshot, host_mac=old.mac)
             if (
                 current is None
@@ -694,11 +757,15 @@ class LinuxUSBNetworkGuard:
         elif events:
             return None
         try:
-            snapshot = self.capture()
+            snapshot, indexes, sysfs_indexes = self._interface_inventory(
+                deadline=deadline
+            )
             restored = network.evaluate(self.baseline, after=snapshot, cleanup=True)
-            parent_gone, parent_proof = self._old_index_absent(old, snapshot)
-            candidate_gone, candidate_proof = candidate._old_index_absent(
-                candidate.identity, snapshot
+            parent_gone, parent_proof = self._index_absence(
+                old, indexes, sysfs_indexes
+            )
+            candidate_gone, candidate_proof = self._index_absence(
+                candidate.identity, indexes, sysfs_indexes
             )
             if (
                 not restored["ok"]

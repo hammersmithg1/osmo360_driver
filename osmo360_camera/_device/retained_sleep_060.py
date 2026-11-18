@@ -95,7 +95,7 @@ def ram_failure_snapshot(b, path, kind):
 
 def failure_payload(work, cfg, b, where, error, stage):
     paths = {'checkpoint': work / 'checkpoint.json', 'worker_error': work / 'worker-error.json',
-        'responder_error': work / 'serve-error.json',
+        'responder_error': work / 'serve-error.json', 'endpoint': work / 'endpoint.json',
         'result': work / 'result.json', 'reset_intent': work / 'reset-intent.json',
         'native_status': Path(cfg['standby_work']) / 'status.json',
         'lease_state': Path(cfg['lease_work']) / 'lease.state'}
@@ -181,7 +181,7 @@ def manifest(work):
             or not isinstance(cfg['lease_nonce'], str) or not re.fullmatch('[0-9a-f]{32}', cfg['lease_nonce'])
             or type(cfg['lease_port']) is not int or not 49152 <= cfg['lease_port'] <= 65535
             or (cfg['completion_port'] is not None and (type(cfg['completion_port']) is not int
-                or not 49152 <= cfg['completion_port'] <= 65535 or cfg['completion_port'] == cfg['lease_port']))
+                or cfg['completion_port'] != 0))
             or type(cfg['host_sequence']) is not int or not 1 <= cfg['host_sequence'] < 2**64
             or type(cfg['plan_sha256']) is not dict or set(cfg['plan_sha256']) != NAMES
             or any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v) for v in cfg['plan_sha256'].values())
@@ -409,6 +409,7 @@ def rebind_once(work, cfg, observer, base, pre, guard, checkpoint=lambda name: N
 def worker(work, cfg):
     observer, owner, base = modules(work, cfg); b = observer.base
     stage = 'worker-start'
+    reservation = endpoint = None
     def checkpoint(name):
         nonlocal stage
         stage = name
@@ -422,9 +423,14 @@ def worker(work, cfg):
             if not base.alive(guard['owner']) or boot() >= guard['deadline_boottime']:
                 raise TimeoutError('Independent guard/deadline unavailable')
             source_state(observer, cfg)
+            if reservation is not None: endpoint_socket(cfg, endpoint, reservation)
         fresh(); checkpoint('source-sleep'); armed_at = boot()
         sleep_arm_proof(observer, cfg, armed_at)
         checkpoint('snapshot-at-arm'); pre = snapshot(observer, base, cfg)
+        if cfg['completion_port'] is not None:
+            endpoint = endpoint_metadata(cfg, b.read_json(work / 'endpoint.json'), owner=guard['owner'], post=pre)
+            reservation = socket.socket(fileno=endpoint['fd'])
+            endpoint_socket(cfg, endpoint, reservation)
         b.write_new(work / 'armed.json', dict(nonce=cfg['nonce'], worker=base.proc_token(), pre=pre, at=armed_at))
         proof = None
         checkpoint('waiting-exact-sleep-wake')
@@ -441,11 +447,14 @@ def worker(work, cfg):
         try: export_failure(work, cfg, b, 'worker', error, stage)
         except BaseException: pass  # Independent guard remains armed throughout.
         b.write_new(work / 'worker-error.json', dict(nonce=cfg['nonce'], stage=stage, error=str(error)[:300]))
+    finally:
+        if reservation is not None: reservation.close()
 
 
-def spawn(work, mode):
+def spawn(work, mode, *, pass_fds=()):
     return subprocess.Popen([sys.executable, str(work / 'retained_sleep_060.py'), mode],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True, pass_fds=pass_fds)
 
 
 def publish_done(work, cfg, b, done):
@@ -550,6 +559,72 @@ def completion_guard(work, cfg):
     return guard
 
 
+def endpoint_metadata(cfg, value, *, owner=None, post=None):
+    keys = {'schema', 'nonce', 'owner', 'fd', 'socket_identity', 'ifname', 'ifindex', 'port'}
+    if (type(value) is not dict or set(value) != keys or type(value['schema']) is not int
+            or value['schema'] != 1 or value['nonce'] != cfg['nonce'] or not token(value['owner'])
+            or type(value['fd']) is not int or not 3 <= value['fd'] < 1048576
+            or type(value['socket_identity']) is not list or len(value['socket_identity']) != 2
+            or any(type(item) is not int or item <= 0 for item in value['socket_identity'])
+            or not isinstance(value['ifname'], str) or not re.fullmatch('[A-Za-z0-9_.-]{1,15}', value['ifname'])
+            or type(value['ifindex']) is not int or value['ifindex'] <= 0
+            or type(value['port']) is not int or not 1024 <= value['port'] <= 65535
+            or value['port'] == cfg['lease_port']):
+        raise ValueError('Exact owned reserved UDP endpoint required')
+    if owner is not None and value['owner'] != owner:
+        raise ValueError('Endpoint belongs to a different supervisor')
+    if post is not None and (value['ifname'], value['ifindex']) != (post['ifname'], post['ifindex']):
+        raise ValueError('Reserved native USB identity changed')
+    return value
+
+
+def endpoint_socket(cfg, value, sock):
+    """The inherited open socket, never a second bind of its numeric port."""
+    info = os.fstat(sock.fileno())
+    device = sock.getsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), 16).rstrip(b'\0')
+    if (not stat.S_ISSOCK(info.st_mode) or [info.st_dev, info.st_ino] != value['socket_identity']
+            or sock.family != socket.AF_INET or sock.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_DGRAM
+            or sock.getsockname() != (cfg['camera_ip'], value['port'])
+            or device != value['ifname'].encode('ascii')):
+        raise ValueError('Same reserved UDP socket FD/address/device required')
+
+
+def reserve_endpoint(work, cfg, b, base, pre):
+    """Kernel allocation precedes reset; this open FD survives the handoff."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), pre['ifname'].encode() + b'\0')
+        sock.bind((cfg['camera_ip'], 0))
+        info = os.fstat(sock.fileno())
+        value = dict(schema=1, nonce=cfg['nonce'], owner=base.proc_token(), fd=sock.fileno(),
+            socket_identity=[info.st_dev, info.st_ino], ifname=pre['ifname'], ifindex=pre['ifindex'],
+            port=sock.getsockname()[1])
+        endpoint_metadata(cfg, value, owner=base.proc_token(), post=pre)
+        endpoint_socket(cfg, value, sock)
+        b.write_new(work / 'endpoint.json', value)
+        return sock, value
+    except BaseException:
+        sock.close()
+        raise
+
+
+def export_endpoint(work, cfg, b, ready):
+    """Fresh bounded pre-Wake receipt; host unlinks only this exported inode."""
+    endpoint_metadata(cfg, ready['endpoint'], owner=ready['guard'])
+    if ready.get('nonce') != cfg['nonce'] or not token(ready.get('worker')):
+        raise ValueError('Correlated armed worker/endpoint required')
+    output = Path('/blackbox/export_tmp/osmo_rebind_endpoint_' + cfg['nonce'] + '.json')
+    b.private(output.parent, directory=True)
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        info = os.fstat(stream.fileno())
+        value = dict(ready, schema=1, export_identity=dict(device=info.st_dev, inode=info.st_ino))
+        raw = encoded(value)
+        if len(raw) > 4096: raise ValueError('Endpoint receipt exceeds4KiB')
+        if stream.write(raw) != len(raw): raise OSError('Short endpoint receipt write')
+    return value
+
+
 def completion_server(work, cfg):
     """Finite UDP reader only: no UDC, key, power or lease-writing path."""
     phase = 'guard'
@@ -617,15 +692,13 @@ def _completion_server(work, cfg, *, guard=None, checkpoint=lambda name: None):
     state, now = current()
     checkpoint('terminal')
     completion_terminal(cfg, done, now, closed=False)
-    checkpoint('socket')
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        checkpoint('bind_device')
-        sock.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), done['post']['ifname'].encode() + b'\0')
-        checkpoint('bind_port')
-        sock.bind((cfg['camera_ip'], cfg['completion_port']))
+    checkpoint('reservation')
+    endpoint = endpoint_metadata(cfg, b.read_json(work / 'endpoint.json'), owner=guard['owner'], post=done['post'])
+    with socket.socket(fileno=endpoint['fd']) as sock:
+        endpoint_socket(cfg, endpoint, sock)
         checkpoint('ready')
         b.write_new(work / 'serve-ready.json', dict(nonce=cfg['nonce'], process=base.proc_token(),
-            port=cfg['completion_port'], ifname=done['post']['ifname']))
+            port=endpoint['port'], ifname=done['post']['ifname'], socket_identity=endpoint['socket_identity']))
         checkpoint('wait_done')
         while not (work / 'done.json').exists():
             current(); time.sleep(.01)  # Socket is bound but cannot reply yet.
@@ -662,7 +735,8 @@ def responder_startup_check(responder, deadline):
 
 def supervise(work, cfg):
     observer, owner, base = modules(work, cfg); b = observer.base
-    short = hard = child = responder = None
+    short = hard = child = responder = reservation = None
+    endpoint = None
     responder_deadline = None
     try:
         short, hard = base.Alarm(90), base.Alarm(240)
@@ -670,7 +744,12 @@ def supervise(work, cfg):
         deadline = sampled + proof['remaining']
         b.write_new(work / 'guard.json', dict(nonce=cfg['nonce'], owner=base.proc_token(), deadline_boottime=deadline,
             alarm90=proof, alarm240=hard_proof))
-        child = spawn(work, '_worker')
+        if cfg['completion_port'] is not None:
+            sleep_arm_proof(observer, cfg, boot())
+            pre = snapshot(observer, base, cfg)
+            reservation, endpoint = reserve_endpoint(work, cfg, b, base, pre)
+            if boot() >= deadline: raise TimeoutError('Late endpoint reservation')
+        child = spawn(work, '_worker', pass_fds=() if reservation is None else (reservation.fileno(),))
         while True:
             readable, _, _ = select.select([short.fd, hard.fd], [], [], .05)
             if readable or boot() >= deadline: raise TimeoutError('Independent retained-six deadline')
@@ -680,7 +759,8 @@ def supervise(work, cfg):
                 armed = b.read_json(work / 'armed.json')
                 if armed.get('nonce') != cfg['nonce'] or armed['worker']['pid'] != child.pid or not base.alive(armed['worker']):
                     raise ValueError('Owned worker readiness mismatch')
-                b.write_new(work / 'owner-ready.json', dict(nonce=cfg['nonce'], guard=base.proc_token(), worker=armed['worker']))
+                b.write_new(work / 'owner-ready.json', dict(nonce=cfg['nonce'], guard=base.proc_token(),
+                    worker=armed['worker'], endpoint=endpoint))
             if (work / 'result.json').exists():
                 result = b.read_json(work / 'result.json')
                 if (result.get('nonce') != cfg['nonce'] or result.get('terminal') is not True or result.get('reset_attempted') != 1
@@ -692,14 +772,17 @@ def supervise(work, cfg):
                 if cfg['completion_port'] is not None:
                     if responder is None:
                         responder_deadline = boot() + 1
-                        responder = spawn(work, '_serve')
+                        endpoint_metadata(cfg, endpoint, owner=base.proc_token(), post=result['post'])
+                        endpoint_socket(cfg, endpoint, reservation)
+                        responder = spawn(work, '_serve', pass_fds=(reservation.fileno(),))
                         continue
                     responder_startup_check(responder, responder_deadline)
                     if not (work / 'serve-ready.json').exists(): continue
                     ready = b.read_json(work / 'serve-ready.json')
                     if (ready.get('nonce') != cfg['nonce'] or ready.get('process', {}).get('pid') != responder.pid
                             or not token(ready.get('process')) or not base.alive(ready['process'])
-                            or ready.get('port') != cfg['completion_port'] or ready.get('ifname') != result['post']['ifname']):
+                            or ready.get('port') != endpoint['port'] or ready.get('ifname') != result['post']['ifname']
+                            or ready.get('socket_identity') != endpoint['socket_identity']):
                         raise ValueError('Owned completion responder readiness required')
                 if select.select([short.fd, hard.fd], [], [], 0)[0]: raise TimeoutError('RTC already expired')
                 completion_live_lease(cfg, b, result)
@@ -724,6 +807,7 @@ def supervise(work, cfg):
     except BaseException as error:
         recover_with_diagnostic(owner, base, work, cfg, b, error, hard)
     finally:
+        if reservation is not None: reservation.close()
         for alarm in (short, hard):
             if alarm is not None: alarm.close()
 
@@ -739,7 +823,11 @@ def frontend(work, cfg, mode):
         while not (work / 'owner-ready.json').exists():
             if child.poll() is not None or time.monotonic() >= deadline: raise TimeoutError('Guard arm receipt missing; never relaunch')
             time.sleep(.02)
-        return b.read_json(work / 'owner-ready.json')
+        ready = b.read_json(work / 'owner-ready.json')
+        if (ready.get('nonce') != cfg['nonce'] or not token(ready.get('guard')) or ready['guard']['pid'] != child.pid
+                or not token(ready.get('worker')) or not base.alive(ready['guard']) or not base.alive(ready['worker'])):
+            raise ValueError('Same live armed supervisor/worker required')
+        return export_endpoint(work, cfg, b, ready) if cfg['completion_port'] is not None else ready
     if mode == 'cancel':
         if (work / 'reset-intent.json').exists(): raise ValueError('Reset already attempted; no cancellation claim')
         b.write_new(work / 'cancel.json', dict(nonce=cfg['nonce']))
