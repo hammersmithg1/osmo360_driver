@@ -170,7 +170,19 @@ class OsmoCamera:
 
     def read_settings(self, *, strict=True):
         cam = self.camera
+        if self.stream is not None and self.stream.state == 'SLEEP':
+            raise ValueError('Сначала разбуди камеру')
         try:
+            field = 'USB-управление'
+            if self.stream is not None:
+                if self.stream.state != 'AWAKE':
+                    raise RuntimeError('SDK не подтвердил активную USB-сессию')
+                # Data-first Wake deliberately precedes C1 control readiness.
+                # Keep readers running while the SDK pins the new generation
+                # and resolves its exact Wake/task proof before ordinary GETs.
+                proof = self.stream.verify_control(timeout=20)
+                if type(proof) is not dict or proof.get('state') != 'AWAKE':
+                    raise RuntimeError('SDK не подтвердил готовность USB-управления')
             field = 'экспозицию'
             exposure = int(cam.exposure_mode().mode)
             field = 'ISO'
@@ -194,7 +206,8 @@ class OsmoCamera:
             # Never expose a stale or guessed snapshot as verified settings.
             # Metadata GET failures do not invalidate already healthy data.
             self.settings = {}
-            self.settings_error = f'Не удалось прочитать {field}: {exc}'
+            self.settings_error = (f'Не удалось подтвердить USB-управление: {exc}' if field == 'USB-управление'
+                                   else f'Не удалось прочитать {field}: {exc}')
             if strict:
                 raise RuntimeError(self.settings_error) from exc
             return False
@@ -334,9 +347,10 @@ class OsmoCamera:
             self.apply_settings(settings)
         elif action == 'refresh':
             self.require_session_state()
-            if self.state == 'sleeping':
+            if self.state == 'sleeping' or self.stream is not None and self.stream.state == 'SLEEP':
                 raise ValueError('Сначала разбуди камеру')
-            self.connect()
+            if self.stream is None:
+                self.connect()
             self.read_settings(strict=False)
             if not self.enabled:
                 self.state = 'idle'

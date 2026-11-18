@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from osmo360_camera import controls
-from osmo360_camera.transport import RequestTimeout
+from osmo360_camera.transport import CameraDisconnected, RequestTimeout
+from osmo360_camera._standby_control import StandbyUncertain
 from osmo360_driver.clock import CameraClock
 from osmo360_driver.runtime import OsmoCamera, json_value, validate_settings
 
@@ -54,6 +55,7 @@ class RuntimeTests(unittest.TestCase):
             state=Mock(), system_mode=Mock(), install_helpers=Mock(return_value={
                 'installed': True, 'already_installed': True, 'autostart_hydration_verified': True,
                 'reboot_attempted': False}), **methods)
+        owner.camera.usb_stream.return_value.verify_control.return_value = {'state': 'AWAKE'}
         owner.stream, owner.enabled, owner.settings = None, False, {}
         owner.helpers_ready, owner.preparation = True, {}
         owner.start_readers = Mock()
@@ -113,6 +115,116 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(owner.settings['shutter_denominator'], 0)
         self.assertEqual(owner.settings['iso'], 0)
         self.assertEqual(validate_settings({'exposure_mode': 1}), {'exposure_mode': 1})
+
+    def test_initial_and_warm_settings_wait_for_public_control_proof_after_readers(self):
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                owner, events = self.settings_owner(), []
+                session = owner.camera.usb_stream.return_value
+                if warm:
+                    owner.stream, session.state = session, 'SLEEP'
+                    def wake():
+                        events.append('wake')
+                        session.state = 'AWAKE'
+                    session.wake.side_effect = wake
+                else:
+                    session.start.side_effect = lambda: events.append('start')
+                def readers():
+                    events.append('readers')
+                    owner.enabled = True
+                owner.start_readers.side_effect = readers
+                # Reproduce a stale C1 generation: settings would raise cached
+                # LIBUSB_ERROR_IO until the public SDK barrier verifies it.
+                ready, original = [], owner.camera.exposure_mode.side_effect
+                def verify(**options):
+                    self.assertTrue(owner.enabled)
+                    events.append('verified')
+                    ready.append(True)
+                    return {'state': 'AWAKE'}
+                def get():
+                    if not ready: raise CameraDisconnected('LIBUSB_ERROR_IO')
+                    events.append('get')
+                    return original()
+                session.verify_control.side_effect = verify
+                owner.camera.exposure_mode.side_effect = get
+                owner.activate()
+                self.assertEqual(events, ['wake' if warm else 'start', 'readers', 'verified', 'get'])
+                session.verify_control.assert_called_once_with(timeout=20)
+                self.assertEqual(owner.settings_error, '')
+                self.assertTrue(owner.enabled)
+                self.assertEqual(owner.state, 'streaming')
+                session.close.assert_not_called()
+
+    def test_failed_or_false_control_proof_is_metadata_warning_without_get_or_capture_stop(self):
+        for outcome in (False, None, {}, {'state': 'SLEEP'},
+                        CameraDisconnected('LIBUSB_ERROR_IO'), StandbyUncertain('owned Wake task unknown')):
+            with self.subTest(outcome=outcome):
+                owner = self.settings_owner()
+                session = owner.camera.usb_stream.return_value
+                if isinstance(outcome, Exception):
+                    session.verify_control.side_effect = outcome
+                else:
+                    session.verify_control.return_value = outcome
+                owner.start_readers.side_effect = lambda: setattr(owner, 'enabled', True)
+                owner.activate()
+                self.assertTrue(owner.enabled)
+                self.assertEqual(owner.state, 'streaming')
+                self.assertEqual(owner.settings, {})
+                self.assertIn('Не удалось подтвердить USB-управление', owner.settings_error)
+                owner.camera.exposure_mode.assert_not_called()
+                session.close.assert_not_called()
+                session.sleep.assert_not_called()
+                session.recover.assert_not_called()
+                session.verify_control.assert_called_once_with(timeout=20)
+                # A refresh may obtain the real proof later. It must use the
+                # same barrier instead of directly reconnecting around it.
+                owner.camera.connected = False
+                owner.camera.connect = Mock(side_effect=AssertionError('connect bypass'))
+                session.verify_control.side_effect = None
+                session.verify_control.return_value = {'state': 'AWAKE'}
+                owner.execute('refresh', None)
+                owner.camera.connect.assert_not_called()
+                self.assertEqual(session.verify_control.call_count, 2)
+                self.assertEqual(owner.settings_error, '')
+                self.assertTrue(owner.settings)
+                self.assertTrue(owner.enabled)
+                self.assertEqual(owner.state, 'streaming')
+
+    def test_strict_control_warning_preserves_cause_and_sleep_refresh_never_wakes(self):
+        owner = self.settings_owner()
+        owner.stream = owner.camera.usb_stream.return_value
+        failure = StandbyUncertain('running prior task')
+        owner.stream.verify_control.side_effect = failure
+        with self.assertRaisesRegex(RuntimeError, 'USB-управление') as caught:
+            owner.read_settings()
+        self.assertIs(caught.exception.__cause__, failure)
+        owner.camera.exposure_mode.assert_not_called()
+        owner.stream.state, owner.state = 'SLEEP', 'sleeping'
+        owner.camera.connected = False
+        owner.camera.connect = Mock()
+        owner.stream.verify_control.reset_mock()
+        for read in (lambda: owner.execute('refresh', None), lambda: owner.read_settings(strict=False)):
+            with self.assertRaisesRegex(ValueError, 'разбуди'):
+                read()
+        owner.stream.verify_control.assert_not_called()
+        owner.camera.connect.assert_not_called()
+        owner.stream.wake.assert_not_called()
+
+    def test_failed_refresh_control_proof_keeps_capture_and_never_issues_settings_get(self):
+        owner = self.settings_owner()
+        owner.stream = owner.camera.usb_stream.return_value
+        owner.state, owner.enabled = 'streaming', True
+        owner.stream.verify_control.side_effect = CameraDisconnected('LIBUSB_ERROR_IO')
+        owner.camera.connected = False
+        owner.camera.connect = Mock(side_effect=AssertionError('connect bypass'))
+        owner.execute('refresh', None)
+        self.assertTrue(owner.enabled)
+        self.assertEqual(owner.state, 'streaming')
+        self.assertEqual(owner.settings, {})
+        self.assertIn('USB-управление', owner.settings_error)
+        owner.camera.exposure_mode.assert_not_called()
+        owner.camera.connect.assert_not_called()
+        owner.stream.close.assert_not_called()
 
     def test_missing_shutter_is_only_tolerated_in_auto_or_program(self):
         for mode, status in ((controls.ExposureMode.MANUAL, 0xDF), (controls.ExposureMode.PROGRAM, 0xE0)):
