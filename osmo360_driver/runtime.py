@@ -17,6 +17,7 @@ from osmo360_camera import (
 from osmo360_camera.transport import CameraDisconnected, RequestTimeout
 from .clock import CameraClock
 from .jpeg import PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_QUALITY, PreviewEncoder
+from osmo360_camera._usb_charging import USBChargingError, attached_camera_count
 
 
 def _ignore_video(*_):
@@ -87,7 +88,20 @@ def validate_settings(value):
 
 class OsmoCamera:
     def __init__(self, on_video=None, on_imu=None, on_error=None, *, on_unstamped_video=None,
-                 on_video_lazy=None, camera_factory=Camera, host_offset_ns=None):
+                 on_video_lazy=None, camera_factory=Camera, host_offset_ns=None,
+                 usb_charging=None, before_power_restore=None):
+        if usb_charging is not None and type(usb_charging) is not bool:
+            raise ValueError('usb_charging must be bool or None')
+        if before_power_restore is not None and not callable(before_power_restore):
+            raise ValueError('before_power_restore must be callable or None')
+        self.usb_charging = usb_charging
+        self.before_power_restore = before_power_restore
+        self._power_lease = None
+        self._power_rebind_allowed = False
+        self._close_power_error = None
+        self.power = dict(requested=usb_charging, state='unmanaged' if usb_charging is None else 'unprepared',
+                          ready=usb_charging is None, error='', physical_proof='unknown',
+                          policy_readback_is_cache=True)
         # The lazy callback replaces both legacy video callbacks, receiving
         # (frame, full_jpeg_factory, stamp). Call the factory synchronously only
         # if an archival/ROS consumer needs the unchanged full-resolution JPEG.
@@ -130,7 +144,7 @@ class OsmoCamera:
         self.worker.start()
 
     def command(self, action, settings=None):
-        if action not in ('start', 'stop', 'sleep', 'wake', 'reboot', 'configure', 'refresh'):
+        if action not in ('start', 'stop', 'sleep', 'wake', 'reboot', 'configure', 'refresh', 'prepare_power'):
             raise ValueError('Неизвестная команда Osmo 360')
         if action == 'configure':
             settings = validate_settings(settings)
@@ -153,6 +167,7 @@ class OsmoCamera:
             return dict(enabled=self.enabled, state=self.state, busy=self.busy, error=self.error,
                         command_elapsed_s=round(now - self.command_started_at, 1) if self.busy and self.command_started_at is not None else None,
                         preparation=dict(self.preparation),
+                        power=json_value(self.power),
                         frame_age_s=age, capture_fps=round(fps, 1) if age is not None and age < 2 else 0,
                         frames=self.frames, imu_samples=self.imu_samples,
                         timestamp_missing_frames=self.timestamp_missing_frames,
@@ -171,6 +186,94 @@ class OsmoCamera:
             if not self.enabled or not self.frame or self.sequence <= after or time.monotonic() - self.frame[2] > 1:
                 return None
             return self.sequence, self.frame
+
+    def hold_power(self, state='preparing'):
+        if getattr(self, 'usb_charging', None) is None:
+            return
+        # Publish the closed gate before synchronously releasing the webcam.
+        # A parent timer must not reopen it while the callback/SET is running.
+        with self.condition:
+            self.power = dict(self.power, ready=False, state=state, error='')
+        try:
+            if self.before_power_restore is not None:
+                self.before_power_restore()
+        except Exception as error:
+            self.power = dict(self.power, ready=False, state='error', error=str(error))
+            raise
+
+    def prepare_power(self, *, verified_rebind=False):
+        if getattr(self, 'usb_charging', None) is None:
+            return self.power
+        self.hold_power()
+        try:
+            count = attached_camera_count()
+            if count == 0:
+                if self._power_lease is not None and self._power_lease.receipt is not None:
+                    raise USBChargingError('Previously owned Osmo disappeared; original charging policy is unknown')
+                self.power = dict(self.power, state='absent', ready=True, error='',
+                                  evidence={'complete_usb_inventory': True, 'matching_cameras': 0})
+                return self.power
+            if count != 1:
+                raise USBChargingError('USB charging requires exactly one supported Osmo camera')
+            self.require_session_state()
+            self.connect(wait_ready=False)
+            if self._power_lease is None:
+                self._power_lease = self.camera.usb_charging(self.usb_charging)
+            self.power = self._power_lease.prepare(
+                verified_rebind=verified_rebind or self._power_rebind_allowed)
+            self._power_rebind_allowed = False
+            if self.power.get('ready') is not True:
+                raise USBChargingError('USB battery charging policy is not ready', self.power)
+            return self.power
+        except Exception as error:
+            detail = getattr(error, 'report', None) or self.power
+            self.power = dict(detail, requested=self.usb_charging, ready=False,
+                              state=detail.get('state', 'error'), error=str(error))
+            raise
+
+    def recheck_power(self, *, sleeping=False):
+        if self.usb_charging is None:
+            return
+        if self._power_lease is None:
+            raise USBChargingError('USB charging policy has no prepared lease')
+        try:
+            # SDK start/wake returns data first. Readers keep draining while
+            # ordinary control/diagnostic readiness is verified; no SET here.
+            control = self.stream._core.control
+            if sleeping:
+                previous = control.last
+                if (self.stream.state != 'SLEEP' or type(previous) is not dict
+                        or previous.get('state') != 'SLEEP' or not previous.get('command_id')):
+                    raise USBChargingError('SDK has no completed native Sleep receipt for charging recheck')
+                proof = control.wait_sleep_snapshot(previous['command_id'], deadline=time.monotonic()+20)
+                if type(proof) is not dict or proof.get('state') != 'SLEEP':
+                    raise USBChargingError('SDK has not verified current native Sleep for charging recheck')
+            else:
+                proof = self.stream.verify_control(timeout=20)
+                if type(proof) is not dict or proof.get('state') != 'AWAKE':
+                    raise USBChargingError('SDK has not verified current AWAKE control for charging recheck')
+            self.power = self._power_lease.recheck(control=control, verified_rebind=True)
+            if self.power.get('ready') is not True:
+                raise USBChargingError('USB charging changed during the verified USB transition', self.power)
+            self.power.setdefault('evidence', {})['verified_control_state'] = proof['state']
+        except Exception as error:
+            detail = getattr(error, 'report', None) or self.power
+            self.power = dict(detail, requested=self.usb_charging, ready=False, error=str(error))
+            raise
+
+    def restore_power(self):
+        if self._power_lease is None:
+            return
+        self.hold_power('restoring')
+        try:
+            report = self._power_lease.restore(verified_rebind=self._power_rebind_allowed)
+            # A verified original restore ends our requested power policy. It
+            # must not reopen a webcam merely because native restoration is OK.
+            self.power = dict(report, ready=False)
+        except Exception as error:
+            detail = getattr(error, 'report', None) or self.power
+            self.power = dict(detail, requested=self.usb_charging, ready=False, error=str(error))
+            raise
 
     def connect(self, *, wait_ready=True):
         if self.camera is None:
@@ -303,6 +406,8 @@ class OsmoCamera:
 
     def close_stream(self):
         try:
+            if self.stream is not None:
+                self.hold_power('usb_transition')
             self.stop_readers()
             if self.stream is not None:
                 report = self.stream.close()
@@ -325,6 +430,7 @@ class OsmoCamera:
             # Camera.close clears SDK ownership only after verified cleanup.
             self.camera.close()
             self.stream = None
+            self._power_rebind_allowed = True
 
     def failure_stats(self, error=None):
         """Only existing SDK/local reports; no query, reconnect or lifecycle."""
@@ -353,21 +459,38 @@ class OsmoCamera:
     def activate(self):
         self.require_session_state()
         # The resumable SDK owns readiness, standby discovery and wake.
-        self.connect(wait_ready=False)
         if self.enabled:
             return
         if self.stream is None:
+            self.prepare_power()
+            self.connect(wait_ready=False)
             self.prepare_helpers()
+            if self.usb_charging is not None and self.preparation.get('reboot_attempted'):
+                self.prepare_power(verified_rebind=True)
+            self.hold_power('usb_transition')
             self.state = 'starting'
             self.stream = self.camera.usb_stream(fast_sleep=True, retain_ecm=True, queue_size=8,
                                                  imu_options={'queue_size': 32768})
             self.stream.start()
         elif self.stream.state == 'SLEEP':
+            self.hold_power('usb_transition')
+            self.connect(wait_ready=False)
             self.state = 'waking'
             self.stream.wake()
         # Drain video and 8 kHz IMU immediately. Optional camera GETs stay on
         # the owner thread, but must neither block readers nor fail capture.
         self.start_readers()
+        if self.usb_charging is not None:
+            self.state = 'checking_power'
+            try:
+                self.recheck_power()
+            except Exception as error:
+                try:
+                    self.close_stream()
+                except Exception as cleanup:
+                    if hasattr(error, 'add_note'):
+                        error.add_note('Capture cleanup after charging verification failure: ' + str(cleanup))
+                raise
         self.state = 'reading_settings'
         self.read_settings(strict=False)
         if self.enabled:
@@ -375,6 +498,7 @@ class OsmoCamera:
 
     def apply_settings(self, values):
         self.require_session_state()
+        self.hold_power('usb_transition')
         restart = self.enabled
         self.close_stream()
         self.connect()
@@ -401,10 +525,13 @@ class OsmoCamera:
         if restart:
             self.activate()
         else:
+            self.prepare_power()
             self.state = 'idle'
 
     def execute(self, action, settings):
-        if action in ('start', 'wake'):
+        if action == 'prepare_power':
+            self.prepare_power()
+        elif action in ('start', 'wake'):
             self.activate()
         elif action in ('stop', 'sleep'):
             self.require_session_state()
@@ -413,13 +540,17 @@ class OsmoCamera:
                     self.state = 'idle' if self.camera and self.camera.connected else 'disconnected'
                     return
                 self.activate()
+            self.hold_power('sleeping')
             self.state = 'sleeping_camera'
             self.stop_readers()
             if self.stream.state == 'AWAKE':
                 self.stream.sleep()
+            if self.usb_charging is not None:
+                self.recheck_power(sleeping=True)
             self.state = 'sleeping'
         elif action == 'reboot':
             self.require_session_state()
+            self.hold_power('usb_transition')
             verified_helpers = getattr(self, '_verified_helpers', None)
             if self.stream is not None and self.stream.state == 'SLEEP':
                 self.state = 'waking'
@@ -434,6 +565,8 @@ class OsmoCamera:
                 reboot_attempted=False, boot_id_before=self._helpers_previous_boot_id,
                 profile=(verified_helpers or {}).get('profile'))
             self.camera.reboot(timeout=90)
+            if self.usb_charging is not None:
+                self.prepare_power(verified_rebind=True)
             self.clock = CameraClock(self.host_offset_ns)
             self.read_settings(strict=False)
             self.state = 'idle'
@@ -460,6 +593,8 @@ class OsmoCamera:
                         self.error = error
                         try:
                             self.close_stream()
+                            if self.usb_charging is not None:
+                                self.prepare_power(verified_rebind=True)
                         except Exception as exc:
                             self.error += '; cleanup: ' + str(exc)
                         self.state = 'error'
@@ -486,10 +621,16 @@ class OsmoCamera:
         finally:
             try:
                 self.close_stream()
+                self.restore_power()
                 if self.camera is not None:
                     self.camera.close()
             except Exception as exc:
                 self.error = str(exc)
+                if (self.usb_charging is not None and self._power_lease is not None
+                        and (self._power_lease.receipt is not None or getattr(self._power_lease, 'uncertain', False))):
+                    self._close_power_error = exc
+                    self.power = dict(self.power, ready=False, state='unknown',
+                                      error='Original charging policy restore is incomplete: ' + str(exc))
                 self.on_error(self.error)
 
     def failed(self, error):
@@ -577,3 +718,6 @@ class OsmoCamera:
         self.worker.join(timeout=120)
         if self.worker.is_alive():
             raise RuntimeError('Osmo cleanup не завершён; проверь USB перед повторным запуском')
+        if self._close_power_error is not None:
+            raise USBChargingError('Original USB battery charging policy restoration failed: '
+                                   + str(self._close_power_error), self.power) from self._close_power_error

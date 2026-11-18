@@ -34,6 +34,7 @@ from .usb_preview import USBPreview, USBPreviewError
 from ._stream_session import StreamSessionError
 from ._helper_lifecycle import HelperLifecycleError
 from ._helper_install import HelperInstallError
+from ._usb_charging import USBChargingLease, USBChargingError
 
 __all__ = [
     "Camera",
@@ -73,4 +74,6 @@ __all__ = [
     "StreamSessionError",
     "HelperLifecycleError",
     "HelperInstallError",
+    "USBChargingLease",
+    "USBChargingError",
 ]

@@ -445,7 +445,17 @@ class ResumableUSBStream:
                     "Unknown retained shadow; refusing implicit cleanup or reboot",
                     self.report,
                 )
-            return self._core.close()
+            result = self._core.close()
+            if getattr(self._core, 'cleanup_safe', False) is True:
+                transport = getattr(self.camera, '_transport', None)
+                identity = getattr(transport, '_device_identity', None)
+                if (getattr(transport, 'connected', False) and getattr(transport, '_thread', None) is not None
+                        and type(identity) is dict):
+                    # A scoped charging lease can restore after this verified
+                    # normal USB rollback without accepting an external replug.
+                    self.camera._usb_charging_closed_transition = (
+                        self, transport, transport._thread, identity.get('bus'), identity.get('address'))
+            return result
 
     def __enter__(self):
         return self.start()

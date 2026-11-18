@@ -400,5 +400,53 @@ requests full JPEG encoding only when a recorder or ROS image subscriber needs
 it. Raw H.264-only subscribers do not require that conversion. Legacy
 `on_video(frame, jpeg_bytes, stamp)` callbacks still receive full JPEGs.
 
-The SDK helpers and vendor codecs were carried over without modification.
-Project code is MIT; upstream attribution remains in `osmo360_camera/vendor/`.
+### Optional USB battery charging policy
+
+`Camera.usb_charging(False)` creates an explicit charging lease. Construction
+does not open USB or change the camera. Keep the lease outside the capture
+context so capture finishes before the original charging policy is restored:
+
+```python
+with Camera() as camera:
+    with camera.usb_charging(False) as charging:
+        with camera.usb_stream() as stream:
+            # Read video/IMU here; stop your readers before closing the stream.
+            ...
+    print(charging.status)  # Original policy restoration report.
+```
+
+This disables battery charging, not USB power for the camera's electronics,
+and does not impose a USB input-current limit. On the test camera, a controlled
+idle A/B reported USB current of 1.394 → 0.875 → 1.394 A when charging was
+disabled and restored. Requests for input-current limits of 100 and 500 mA
+were not applied by that firmware. These observations do not measure current
+at the Raspberry Pi's USB power switch.
+
+The capability validates the native driver, camera boot and sysfs identities.
+It currently supports the tested `5.15.148-ab639` kernel and charger-module
+hash. Unsupported hardware/firmware fails before policy writes. The helper
+and original-state receipt live in camera RAM; this feature does not install
+a camera startup hook or change persistent camera settings.
+
+The original policy is captured once and restored exactly, including an
+already disabled charger or a nondefault restriction. A new camera boot
+invalidates the old receipt; it must not restore settings from the old boot.
+Sleep is not a new boot. Unknown diagnostic outcomes block further writes;
+cached policy, fresh telemetry and physical proof are reported separately.
+Successful policy readback does not establish a hard current limit.
+
+For an embedded application, `OsmoCamera(usb_charging=False,
+before_power_restore=...)` manages the lease across stream toggles. The
+synchronous callback must stop other USB capture consumers before charging
+changes or restoration. Queue `prepare_power` before enabling those consumers;
+wait for terminal actor status and `power.ready == True`. Start/wake transitions
+are checked before the parent releases its capture gate. The default `None`
+preserves the SDK's previous charging behavior. Rover opts into `False` and
+holds its webcam gate automatically; no extra web setting is required.
+
+Normal scope exit restores the original policy. Abrupt host termination cannot
+run that cleanup, so it must not be presented as a successful restoration.
+`Camera.close()` alone does not own a separately created charging lease; use
+the nesting above or explicitly restore it after verified capture cleanup.
+
+Project code is MIT; vendor-code attribution remains in `osmo360_camera/vendor/`.

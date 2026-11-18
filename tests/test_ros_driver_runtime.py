@@ -45,6 +45,10 @@ class RuntimeTests(unittest.TestCase):
         # Replay the hardware GET snapshot, including Program + shutter DF.
         native = json.loads((Path(__file__).parent / 'fixtures/camera_controls_native.json').read_text())['current_gets']
         owner = OsmoCamera.__new__(OsmoCamera)
+        owner.usb_charging = None
+        owner.power = dict(requested=None, state='unmanaged', ready=True, error='')
+        owner._power_lease = None
+        owner._power_rebind_allowed = False
         getters = {
             'exposure_mode': controls.decode_exposure_mode, 'iso': controls.decode_iso,
             'white_balance': controls.decode_white_balance, 'shutter': controls.decode_shutter,

@@ -461,6 +461,18 @@ class Camera:
         return self._usb_preview
 
     @_serialized
+    def usb_charging(self, enabled, *, timeout=45):
+        """Create an optional scoped battery USB charging policy lease.
+
+        Construction is pure; call prepare() or enter its context outside all
+        capture contexts. Close the lease after capture stops to restore its
+        exact same-boot original policy. This does not cap USB input current.
+        Camera.close() does not own this separate, explicitly scoped lease.
+        """
+        from ._usb_charging import USBChargingLease
+        return USBChargingLease(self, enabled, timeout=timeout)
+
+    @_serialized
     def usb_stream(
         self,
         *,
