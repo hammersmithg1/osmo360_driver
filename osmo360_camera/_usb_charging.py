@@ -21,6 +21,7 @@ import zlib
 from . import _app, _usb
 from ._helper_install import _controller
 from ._prepared_stream import upload
+from .controls import CameraReplyError
 from .transport import RequestTimeout
 
 
@@ -102,12 +103,13 @@ class USBChargingLease:
     this lease. Hold it outside the stream context so stop/Sleep does not turn
     charging back on while another camera still uses the host's USB budget.
     """
-    def __init__(self, camera, enabled, *, timeout=45, clock=time.monotonic):
+    def __init__(self, camera, enabled, *, timeout=45, clock=time.monotonic, sleep=time.sleep):
         if type(enabled) is not bool:
             raise ValueError('USB battery charging enabled must be bool')
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('Charging timeout must be finite and positive')
         self.camera, self.enabled, self.timeout, self.clock = camera, enabled, timeout, clock
+        self.sleep = sleep
         self.control = self.generation = self.boot_id = None
         self.receipt = None
         self.work = self.output = None
@@ -162,11 +164,60 @@ class USBChargingLease:
                     or not 0 <= self.clock()-self._idle_proof['at'] <= 5):
                 raise USBChargingError('USB charging requires a fresh same-generation idle proof', self._report)
 
+    def _idle_state(self, deadline):
+        """Retry only the observed E1 GET rejection, never a policy operation."""
+        started = self.clock()
+        limit = min(deadline, started + 2)
+        evidence = dict(started_at=started, deadline=limit, attempts=0,
+                        observed_e1_rejections=0, history=[], outcome='pending')
+        observations = self._report.setdefault('evidence', {}).setdefault('idle_get_readiness', [])
+        observations.append(evidence)
+        del observations[:-4]
+        first_e1 = None
+        try:
+            while True:
+                self._guard(deadline)
+                self._assert_local_idle()
+                remaining = limit - self.clock()
+                if remaining <= 0:
+                    raise TimeoutError('Read-only idle GET readiness deadline')
+                evidence['attempts'] += 1
+                try:
+                    value = self.camera.state(timeout=remaining)
+                except CameraReplyError as error:
+                    if error.status != 0xE1:
+                        raise
+                    if first_e1 is None:
+                        first_e1 = error
+                    evidence['observed_e1_rejections'] += 1
+                    evidence['history'].append(dict(at=self.clock(), status=0xE1,
+                                                    payload_hex=error.payload[:16].hex()))
+                    del evidence['history'][:-8]
+                    self._guard(deadline)
+                    self._assert_local_idle()
+                    remaining = limit - self.clock()
+                    if remaining <= 0:
+                        raise TimeoutError('Read-only idle GET readiness deadline')
+                    self.sleep(min(.05, remaining))
+                    continue
+                self._guard(deadline)
+                self._assert_local_idle()
+                if self.clock() >= limit:
+                    raise TimeoutError('Read-only idle GET observation arrived after readiness deadline')
+                evidence.update(outcome='response', finished_at=self.clock())
+                return value
+        except BaseException as error:
+            evidence.update(outcome='error', finished_at=self.clock(),
+                            error=(type(error).__name__ + ': ' + str(error))[:280])
+            if first_e1 is not None and isinstance(error, TimeoutError):
+                raise USBChargingError(str(error), self.status) from first_e1
+            raise
+
     def _prove_idle(self, deadline):
         self._guard(deadline)
         self._assert_local_idle()
         try:
-            state = self.camera.state(timeout=min(2, deadline-self.clock()))
+            state = self._idle_state(deadline)
             if state.recording_state != 0:
                 raise USBChargingError('USB charging writes require fresh Record0', self._report)
             reply = self.camera._transport.request(0, 0x88, _app.query_payload(),

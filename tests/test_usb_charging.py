@@ -14,11 +14,25 @@ from unittest.mock import Mock, patch
 
 from osmo360_camera import Camera
 from osmo360_camera import _usb_charging as m
+from osmo360_camera.controls import CameraReplyError, ControlDecodeError
+from osmo360_camera.transport import CameraDisconnected
 
 
 BOOT = '11111111-1111-1111-1111-111111111111'
 NEW_BOOT = '22222222-2222-2222-2222-222222222222'
 ORIGINAL = dict(charge_disable=0, restrict_chg=0, restrict_cur=500000)
+
+
+class Clock:
+    def __init__(self):
+        self.now, self.sleeps = 0., []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 class Environment:
@@ -202,6 +216,118 @@ class ChargingHostTests(unittest.TestCase):
         with self.assertRaises(m.USBChargingError):
             self.lease.prepare()
         self.assertEqual(self.env.native, [])
+
+    def test_observed_e1_idle_get_retries_readonly_then_requires_fresh_record0_and_app_absence(self):
+        clock = Clock()
+        lease = m.USBChargingLease(self.env.camera, False, clock=clock, sleep=clock.sleep)
+        first = CameraReplyError(0xE1, b'\xe1')
+        self.env.camera.state.side_effect = [first, SimpleNamespace(recording_state=0),
+                                             SimpleNamespace(recording_state=0)]
+        report = lease.prepare()
+        self.assertTrue(report['ready'])
+        self.assertEqual(self.env.native, ['prepare'])
+        self.assertEqual(clock.sleeps, [.05])
+        self.assertEqual(self.env.camera.state.call_count, 3)
+        self.assertEqual(self.env.camera._transport.request.call_count, 2)
+        self.assertTrue(all(call.args[:2] == (0, 0x88)
+                            for call in self.env.camera._transport.request.call_args_list))
+        observations = report['evidence']['idle_get_readiness']
+        self.assertEqual([row['attempts'] for row in observations], [2, 1])
+        self.assertEqual(observations[0]['observed_e1_rejections'], 1)
+        self.assertEqual(observations[0]['history'][0]['payload_hex'], 'e1')
+        self.assertEqual(report['evidence']['idle']['method'], 'C1_Record0_and_APP_absent')
+
+    def test_persistent_e1_obeys_local_and_global_deadline_and_retains_original_rejection(self):
+        for timeout, expected in ((45, 2.), (.12, .12)):
+            with self.subTest(timeout=timeout):
+                env, clock = Environment(), Clock()
+                first = CameraReplyError(0xE1, b'\xe1')
+                env.camera.state.side_effect = first
+                lease = m.USBChargingLease(env.camera, False, timeout=timeout,
+                                           clock=clock, sleep=clock.sleep)
+                with patch.object(m, '_controller', return_value=env.control):
+                    with self.assertRaises(m.USBChargingError) as caught:
+                        lease.prepare()
+                self.assertIs(caught.exception.__cause__, first)
+                self.assertAlmostEqual(clock.now, expected)
+                self.assertEqual(env.native, [])
+                self.assertFalse(lease.stage_attempted)
+                self.assertEqual(len(env.commands), 2)  # Already completed boot export and cleanup only.
+                env.camera._transport.request.assert_not_called()
+                observation = lease.status['evidence']['idle_get_readiness'][0]
+                self.assertEqual(observation['attempts'], env.camera.state.call_count)
+                self.assertEqual(observation['observed_e1_rejections'], observation['attempts'])
+                self.assertLessEqual(len(observation['history']), 8)
+                self.assertEqual(observation['outcome'], 'error')
+                self.assertFalse(lease.status['ready'])
+                self.assertTrue(all(0 < call.kwargs['timeout'] <= expected
+                                    for call in env.camera.state.call_args_list))
+
+    def test_non_e1_malformed_disconnect_or_record1_after_e1_never_retries_or_stages(self):
+        for outcome in (CameraReplyError(0xE0, b'\xe0'), CameraReplyError(0xE3, b'\xe3'),
+                        ControlDecodeError('Malformed state'), CameraDisconnected('USB gone'),
+                        SimpleNamespace(recording_state=1)):
+            with self.subTest(outcome=outcome):
+                env, clock = Environment(), Clock()
+                env.camera.state.side_effect = [CameraReplyError(0xE1, b'\xe1'), outcome]
+                lease = m.USBChargingLease(env.camera, False, clock=clock, sleep=clock.sleep)
+                with patch.object(m, '_controller', return_value=env.control):
+                    with self.assertRaises(m.USBChargingError):
+                        lease.prepare()
+                self.assertEqual(env.camera.state.call_count, 2)
+                self.assertEqual(clock.sleeps, [.05])
+                self.assertEqual(env.native, [])
+                self.assertFalse(lease.stage_attempted)
+                env.camera._transport.request.assert_not_called()
+
+    def test_idle_get_backoff_checks_generation_pending_and_capture_ownership_before_retry(self):
+        for change in ('generation', 'pending', 'quarantined', 'capture'):
+            with self.subTest(change=change):
+                env, clock = Environment(), Clock()
+                env.camera.state.side_effect = CameraReplyError(0xE1, b'\xe1')
+                def sleep(seconds):
+                    clock.sleep(seconds)
+                    if change == 'generation': env.camera._transport._thread = object()
+                    elif change == 'pending': env.control.pending_task = 42
+                    elif change == 'quarantined': env.control.bootstrap.session.quarantined = True
+                    else: env.camera._record_owned = True
+                lease = m.USBChargingLease(env.camera, False, clock=clock, sleep=sleep)
+                with patch.object(m, '_controller', return_value=env.control):
+                    with self.assertRaises(m.USBChargingError):
+                        lease.prepare()
+                self.assertEqual(env.camera.state.call_count, 1)
+                self.assertEqual(env.native, [])
+                self.assertFalse(lease.stage_attempted)
+
+    def test_cancelled_idle_get_backoff_does_not_retry_or_start_policy_helper(self):
+        clock = Clock()
+        self.env.camera.state.side_effect = CameraReplyError(0xE1, b'\xe1')
+        sleep = Mock(side_effect=KeyboardInterrupt('cancelled'))
+        lease = m.USBChargingLease(self.env.camera, False, clock=clock, sleep=sleep)
+        with self.assertRaisesRegex(m.USBChargingError, 'KeyboardInterrupt: cancelled'):
+            lease.prepare()
+        self.assertEqual(self.env.camera.state.call_count, 1)
+        self.assertEqual(self.env.native, [])
+        self.assertFalse(lease.stage_attempted)
+        sleep.assert_called_once_with(.05)
+
+    def test_late_valid_state_after_e1_cannot_authorize_app_query_or_policy_set(self):
+        clock = Clock()
+        first = CameraReplyError(0xE1, b'\xe1')
+        def state(**_):
+            if not clock.sleeps:
+                raise first
+            clock.now = 2.
+            return SimpleNamespace(recording_state=0)
+        self.env.camera.state.side_effect = state
+        lease = m.USBChargingLease(self.env.camera, False, clock=clock, sleep=clock.sleep)
+        with self.assertRaises(m.USBChargingError) as caught:
+            lease.prepare()
+        self.assertIs(caught.exception.__cause__, first)
+        self.assertFalse(lease.status['ready'])
+        self.assertEqual(self.env.native, [])
+        self.assertFalse(lease.stage_attempted)
+        self.env.camera._transport.request.assert_not_called()
 
     def test_ignored_policy_is_a_failure_and_not_reported_as_ready(self):
         self.env.ignored = True
