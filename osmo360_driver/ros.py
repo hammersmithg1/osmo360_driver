@@ -81,7 +81,16 @@ class OsmoTopics:
             raise ValueError('video_unstamped requires a missing native timestamp')
         self._video(frame, jpeg, stamp_ns, valid_native=False)
 
-    def _video(self, frame, jpeg, stamp_ns, *, valid_native):
+    def video_lazy(self, frame, jpeg_factory, stamp_ns):
+        """Acquire this frame now; encode full JPEG only for current demand.
+
+        Missing native clocks retain their raw H.264/timing/metadata, without
+        paying for a JPEG which cannot enter the synchronized image topic.
+        """
+        self._video(frame, None, stamp_ns, valid_native=frame.timestamp_ns is not None,
+                    jpeg_factory=jpeg_factory)
+
+    def _video(self, frame, jpeg, stamp_ns, *, valid_native, jpeg_factory=None):
         subscribers = self._subscribed_topics
         sink_active = any(callback is not None for callback in (
             self.sink, self.batch_sink, self.acquisition_sink)) and self.has_sink_consumers()
@@ -89,6 +98,9 @@ class OsmoTopics:
         if not valid_native:
             selected = selected - {'/osmo360/image/compressed'}
         if sink_active or selected:
+            if jpeg_factory is not None:
+                jpeg = jpeg_factory() if valid_native and (
+                    sink_active or '/osmo360/image/compressed' in selected) else b''
             acquisition = video_acquisition(frame, jpeg, stamp_ns, self.sequence)
             raw_sink = sink_active and self.acquisition_sink is not None
             if raw_sink:

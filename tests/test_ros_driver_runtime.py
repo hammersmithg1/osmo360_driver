@@ -561,15 +561,16 @@ class RuntimeTests(unittest.TestCase):
         owner.stream = SimpleNamespace(stats={}, read_video=lambda **kw: next(frames))
         owner.enabled = True
         def video(frame, jpeg, stamp):
+            self.assertEqual(jpeg, b'full jpeg')
             received.append(stamp)
             if len(received) == 2:
                 owner.reader_stop.set()
         owner.on_video = video
         owner.on_unstamped_video = lambda frame, jpeg, stamp: unstamped.append(stamp)
-        cv2 = SimpleNamespace(IMWRITE_JPEG_QUALITY=1,
-                              imencode=lambda *args: (True, SimpleNamespace(tobytes=lambda: b'jpeg')))
+        encoder = SimpleNamespace(for_frame=lambda frame: SimpleNamespace(
+            full=lambda: b'full jpeg', preview=lambda: b'preview jpeg'))
         try:
-            with patch.dict('sys.modules', {'cv2': cv2}):
+            with patch('osmo360_driver.runtime.PreviewEncoder', return_value=encoder):
                 owner.video_loop()
             self.assertEqual(received, [6000, 6100])
             self.assertEqual(unstamped, [6500])
@@ -578,7 +579,82 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(owner.clock.last['video'], 200)
             self.assertEqual(owner.capture_error, '')
             self.assertTrue(owner.enabled)
-            self.assertEqual(owner.latest()[1][0], b'jpeg')
+            self.assertEqual(owner.latest()[1][0], b'preview jpeg')
+        finally:
+            owner.stream = None
+            owner.close()
+
+    def test_lazy_video_callback_precedes_live_preview_without_eager_full_jpeg(self):
+        events = []
+        frame = SimpleNamespace(timestamp_ns=100, host_receive_monotonic_ns=1000, metadata={})
+        full = Mock(return_value=b'full jpeg')
+        jpegs = SimpleNamespace(full=full, preview=lambda: events.append('preview') or b'preview jpeg')
+        encoder = Mock()
+        encoder.for_frame.return_value = jpegs
+
+        def acquire(actual, factory, stamp):
+            self.assertIs(actual, frame)
+            self.assertIs(factory, full)
+            self.assertEqual(stamp, 6000)
+            events.append('acquire')
+            owner.reader_stop.set()
+
+        legacy = Mock()
+        owner = OsmoCamera(on_video=legacy, on_video_lazy=acquire, host_offset_ns=5000)
+        owner.stream = SimpleNamespace(stats={}, read_video=lambda **kw: frame)
+        owner.enabled = True
+        try:
+            with patch('osmo360_driver.runtime.PreviewEncoder', return_value=encoder):
+                owner.video_loop()
+            self.assertEqual(events, ['acquire', 'preview'])
+            full.assert_not_called()
+            legacy.assert_not_called()
+            self.assertEqual(owner.latest()[1][0], b'preview jpeg')
+            self.assertEqual(owner.status()['mode'], {'width': 2048, 'height': 1024, 'fps': 30})
+            self.assertEqual(owner.status()['preview'], {'width': 1024, 'height': 512, 'jpeg_quality': 75})
+        finally:
+            owner.stream = None
+            owner.close()
+
+    def test_missing_native_clock_uses_lazy_callback_with_mapped_host_time(self):
+        frame = SimpleNamespace(timestamp_ns=None, host_receive_monotonic_ns=1500, metadata={})
+        full = Mock(return_value=b'full jpeg')
+        jpegs = SimpleNamespace(full=full, preview=lambda: b'preview jpeg')
+        callback = Mock(side_effect=lambda *_: owner.reader_stop.set())
+        owner = OsmoCamera(on_video_lazy=callback, host_offset_ns=5000)
+        owner.stream = SimpleNamespace(stats={}, read_video=lambda **kw: frame)
+        owner.enabled = True
+        try:
+            with patch('osmo360_driver.runtime.PreviewEncoder', return_value=SimpleNamespace(for_frame=lambda _: jpegs)):
+                owner.video_loop()
+            callback.assert_called_once_with(frame, full, 6500)
+            full.assert_not_called()
+            self.assertEqual(owner.timestamp_missing_frames, 1)
+            self.assertEqual(owner.latest()[1][0], b'preview jpeg')
+            self.assertNotIn('video', owner.clock.last)
+        finally:
+            owner.stream = None
+            owner.close()
+
+    def test_default_video_callbacks_do_not_request_full_jpeg(self):
+        owner = OsmoCamera(host_offset_ns=5000)
+        frame = SimpleNamespace(timestamp_ns=100, host_receive_monotonic_ns=1000, metadata={})
+        full = Mock(return_value=b'full jpeg')
+        jpegs = SimpleNamespace(full=full, preview=lambda: b'preview jpeg')
+
+        def read(**_):
+            owner.reader_stop.set()
+            return frame
+
+        owner.stream = SimpleNamespace(stats={}, read_video=read)
+        owner.enabled = True
+        try:
+            with patch('osmo360_driver.runtime.PreviewEncoder', return_value=SimpleNamespace(for_frame=lambda _: jpegs)):
+                owner.video_loop()
+            full.assert_not_called()
+            self.assertEqual(owner.frames, 1)
+            self.assertEqual(owner.capture_error, '')
+            self.assertEqual(owner.latest()[1][0], b'preview jpeg')
         finally:
             owner.stream = None
             owner.close()

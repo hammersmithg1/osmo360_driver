@@ -306,6 +306,78 @@ class RosTopicsTests(unittest.TestCase):
             topics.video(frame, b'jpeg', 1000)
         self.assertEqual(publisher.messages, [])
 
+    def test_lazy_video_encodes_full_jpeg_only_for_current_image_or_recording_demand(self):
+        active, saved = [False], []
+        demand = Mock(side_effect=lambda: active[0])
+        factory = Mock(return_value=b'full jpeg92')
+        topics = self.OsmoTopics(self.node, acquisition_sink=lambda source, dto: saved.append(dto),
+                                 has_sink_consumers=demand)
+        topics.video_lazy(self.frame, factory, 1000)
+        factory.assert_not_called()
+        self.assertEqual(saved, [])
+        active[0] = True
+        topics.video_lazy(self.frame, factory, 1001)
+        factory.assert_called_once_with()
+        self.assertEqual(saved[0][:7], ('video', 1001, 100, 200, 1, b'original Annex-B', b'full jpeg92'))
+        self.assertEqual(self.created, {})
+        active[0] = False
+        topics.video_lazy(self.frame, factory, 1002)
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(len(saved), 1)
+        publisher = self.node.publishers['/osmo360/image/compressed']
+        publisher.count = 1
+        topics.refresh_subscribers()
+        topics.video_lazy(self.frame, factory, 1003)
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(publisher.messages[0].data, b'full jpeg92')
+        self.assertEqual(topics.sequence, 4)
+        self.assertEqual(demand.call_count, 4)
+
+    def test_lazy_video_raw_only_and_missing_native_consumers_never_encode_full_jpeg(self):
+        topics = self.OsmoTopics(self.node)
+        for topic in ('/osmo360/video/h264', '/osmo360/video/timing', '/osmo360/video/metadata'):
+            self.node.publishers[topic].count = 1
+        topics.refresh_subscribers()
+        factory = Mock(side_effect=AssertionError('Full JPEG must remain lazy'))
+        topics.video_lazy(self.frame, factory, 1000)
+        self.assertEqual(self.node.publishers['/osmo360/video/h264'].messages[0].data, b'original Annex-B')
+        saved = []
+        topics.acquisition_sink = lambda source, dto: saved.append(dto)
+        topics.has_sink_consumers = lambda: True
+        self.node.publishers['/osmo360/image/compressed'].count = 1
+        topics.refresh_subscribers()
+        missing = SimpleNamespace(raw_h264=b'original P', timestamp_ns=None,
+                                   host_receive_monotonic_ns=240, metadata={})
+        topics.video_lazy(missing, factory, 1040)
+        factory.assert_not_called()
+        self.assertEqual(saved[0][:7], ('video', 1040, None, 240, 1, b'original P', b''))
+        self.assertEqual(self.node.publishers['/osmo360/image/compressed'].messages, [])
+        self.assertEqual(self.node.publishers['/osmo360/video/timing'].messages[-1].data,
+                         [1040, 0, 240, 1, 0])
+
+    def test_lazy_video_shares_one_full_jpeg_between_recording_and_ros(self):
+        active, saved = [True], []
+        demand = Mock(side_effect=lambda: active[0])
+
+        def full():
+            # Stop during encoding: admission still belongs to this acquisition
+            # callback, and the sink can apply its own normal rejection policy.
+            active[0] = False
+            return b'full jpeg92'
+
+        factory = Mock(side_effect=full)
+        topics = self.OsmoTopics(self.node, acquisition_sink=lambda source, dto: saved.append(dto),
+                                 has_sink_consumers=demand)
+        publisher = self.node.publishers['/osmo360/image/compressed']
+        publisher.count = 1
+        topics.refresh_subscribers()
+        topics.video_lazy(self.frame, factory, 1000)
+        factory.assert_called_once_with()
+        demand.assert_called_once_with()
+        self.assertEqual(saved[0][6], b'full jpeg92')
+        self.assertIs(saved[0][6], publisher.messages[0].data)
+        self.assertEqual(topics.sequence, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

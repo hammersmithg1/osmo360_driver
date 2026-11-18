@@ -16,6 +16,11 @@ from osmo360_camera import (
 )
 from osmo360_camera.transport import CameraDisconnected, RequestTimeout
 from .clock import CameraClock
+from .jpeg import PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_QUALITY, PreviewEncoder
+
+
+def _ignore_video(*_):
+    pass
 
 
 def json_value(value):
@@ -82,11 +87,15 @@ def validate_settings(value):
 
 class OsmoCamera:
     def __init__(self, on_video=None, on_imu=None, on_error=None, *, on_unstamped_video=None,
-                 camera_factory=Camera, host_offset_ns=None):
-        self.on_video = on_video or (lambda *_: None)
+                 on_video_lazy=None, camera_factory=Camera, host_offset_ns=None):
+        # The lazy callback replaces both legacy video callbacks, receiving
+        # (frame, full_jpeg_factory, stamp). Call the factory synchronously only
+        # if an archival/ROS consumer needs the unchanged full-resolution JPEG.
+        self.on_video_lazy = on_video_lazy
+        self.on_video = on_video or _ignore_video
         self.on_imu = on_imu or (lambda *_: None)
         self.on_error = on_error or (lambda *_: None)
-        self.on_unstamped_video = on_unstamped_video or (lambda *_: None)
+        self.on_unstamped_video = on_unstamped_video or _ignore_video
         self.camera_factory = camera_factory
         self.camera = self.stream = None
         self.clock = CameraClock(host_offset_ns)
@@ -149,6 +158,8 @@ class OsmoCamera:
                         timestamp_missing_frames=self.timestamp_missing_frames,
                         imu_age_s=now - self.imu_at if self.imu_at else None,
                         mode={'width': 2048, 'height': 1024, 'fps': 30},
+                        preview={'width': PREVIEW_WIDTH, 'height': PREVIEW_HEIGHT,
+                                 'jpeg_quality': PREVIEW_QUALITY},
                         projection='dual_fisheye', settings=dict(self.settings), settings_error=self.settings_error,
                         clock=self.clock.status(), calibration=self.calibration,
                         stats=self.capture_stats)
@@ -493,7 +504,7 @@ class OsmoCamera:
 
     def video_loop(self):
         try:
-            import cv2
+            preview_encoder = PreviewEncoder()
             last = time.monotonic()
             while not self.reader_stop.is_set():
                 try:
@@ -512,15 +523,15 @@ class OsmoCamera:
                     # it must never enter the synchronized image topic.
                     stamp = frame.host_receive_monotonic_ns + self.host_offset_ns
                     self.timestamp_missing_frames += 1
-                ok, encoded = cv2.imencode('.jpg', frame.bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                if not ok:
-                    raise RuntimeError('Не удалось подготовить JPEG Osmo')
-                jpeg = encoded.tobytes()
+                jpegs = preview_encoder.for_frame(frame)
                 # Before web consumers; raw_h264 is preserved by the recorder.
-                if native_timestamp:
-                    self.on_video(frame, jpeg, stamp)
+                if self.on_video_lazy is not None:
+                    self.on_video_lazy(frame, jpegs.full, stamp)
                 else:
-                    self.on_unstamped_video(frame, jpeg, stamp)
+                    callback = self.on_video if native_timestamp else self.on_unstamped_video
+                    if callback is not _ignore_video:
+                        callback(frame, jpegs.full(), stamp)
+                jpeg = jpegs.preview()
                 calibration = {k: v for k, v in frame.metadata.items() if k.startswith('calibration_')}
                 if calibration:
                     self.calibration = json_value(calibration)

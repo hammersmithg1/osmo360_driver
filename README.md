@@ -391,5 +391,14 @@ IMU readers stop and join before any sleep/wake/close transition. Errors retain
 the SDK's verified cleanup behavior; there is no forced collector kill or
 automatic reboot/retry of an uncertain USB owner.
 
+The live JPEG returned by `OsmoCamera.latest()` is a 1024×512, quality-75
+preview. `status()['mode']` still describes the 2048×1024 capture; `preview`
+reports the viewing settings separately. The standard ROS image topic and
+recording sink retain the original full-resolution quality-92 JPEG path.
+The ROS nodes use `on_video_lazy=topics.video_lazy`: its synchronous callback
+requests full JPEG encoding only when a recorder or ROS image subscriber needs
+it. Raw H.264-only subscribers do not require that conversion. Legacy
+`on_video(frame, jpeg_bytes, stamp)` callbacks still receive full JPEGs.
+
 The SDK helpers and vendor codecs were carried over without modification.
 Project code is MIT; upstream attribution remains in `osmo360_camera/vendor/`.
