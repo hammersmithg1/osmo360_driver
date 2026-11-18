@@ -1,0 +1,1224 @@
+{
+  "schema": 1,
+  "source": "Real Osmo360 USB DIAG; one SDK-owned finite collector",
+  "raw_sha256": "4545181092a67da9bf249cda00140fe990b40e705d8b38178a89ef260d626e83",
+  "raw_bytes": 8117783,
+  "packets": [
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d07000000118d8a0e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080111fb530e1b030000001a0c2cac1d41902a75be8c53ba3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338839693,
+          "timestamp_ticks": 13338825723,
+          "x": 9.854534149169922,
+          "y": -0.23942017555236816,
+          "z": 0.363918662071228,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d0700000011e68b0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080111fb530e1b030000001a0c6488ae3b000000808c58f4bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338840038,
+          "timestamp_ticks": 13338825723,
+          "x": 0.005326317623257637,
+          "y": -0.0,
+          "z": -0.007456844672560692,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d0700000011718d0e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211935d0e1b030000001a0c2cac1d4149328ebe0c22c43e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338840433,
+          "timestamp_ticks": 13338828179,
+          "x": 9.854534149169922,
+          "y": -0.2777273952960968,
+          "z": 0.38307225704193115,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d0700000011838e0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211935d0e1b030000001a0c50a00bbb6488ae3b50a08bba2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338840707,
+          "timestamp_ticks": 13338828179,
+          "x": -0.002130527049303055,
+          "y": 0.005326317623257637,
+          "z": -0.0010652635246515274,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d070000001127900e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802112b670e1b030000001a0cda211e4110f97ebecc3abf3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338841127,
+          "timestamp_ticks": 13338830635,
+          "x": 9.883264541625977,
+          "y": -0.24899697303771973,
+          "z": 0.3734954595565796,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d07000000115d910e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802112b670e1b030000001a0c5a141d3c7870513b000000002003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338841437,
+          "timestamp_ticks": 13338830635,
+          "x": 0.009587371721863747,
+          "y": 0.003195790573954582,
+          "z": 0.0,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d0700000011e3920e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211c3700e1b030000001a0cda211e410ebf57be4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338841827,
+          "timestamp_ticks": 13338833091,
+          "x": 9.883264541625977,
+          "y": -0.2106897532939911,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d0700000011eb930e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211c3700e1b030000001a0c7870513c50a08bbb50a00b3b2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338842091,
+          "timestamp_ticks": 13338833091,
+          "x": 0.012783162295818329,
+          "y": -0.00426105409860611,
+          "z": 0.002130527049303055,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d0700000011b7950e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802115b7a0e1b030000001a0cc2be1e410ae89cbe0c22c43e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338842551,
+          "timestamp_ticks": 13338835547,
+          "x": 9.921571731567383,
+          "y": -0.3064578175544739,
+          "z": 0.38307225704193115,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d0700000011c5960e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802115b7a0e1b030000001a0c787051bb50a00b3b50a00bbb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338842821,
+          "timestamp_ticks": 13338835547,
+          "x": -0.003195790573954582,
+          "y": 0.002130527049303055,
+          "z": -0.002130527049303055,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d070000001150980e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211f3830e1b030000001a0c66d31d41902a75be4d09c93e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338843216,
+          "timestamp_ticks": 13338838003,
+          "x": 9.864110946655273,
+          "y": -0.23942017555236816,
+          "z": 0.3926490843296051,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d07000000115e990e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211f3830e1b030000001a0c0000008050a00b3b50a08b3a2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338843486,
+          "timestamp_ticks": 13338838003,
+          "x": -0.0,
+          "y": 0.002130527049303055,
+          "z": 0.0010652635246515274,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d0700000011f29a0e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802118b8d0e1b030000001a0c2cac1d4110f97ebe0b85b03e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338843890,
+          "timestamp_ticks": 13338840459,
+          "x": 9.854534149169922,
+          "y": -0.24899697303771973,
+          "z": 0.3447650372982025,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d0700000011009c0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802118b8d0e1b030000001a0c6488ae3b50a08b3a787051bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338844160,
+          "timestamp_ticks": 13338840459,
+          "x": 0.005326317623257637,
+          "y": 0.0010652635246515274,
+          "z": -0.003195790573954582,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000087b080000000d0700000011c29d0e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08031123970e1b030000001a0c66d31d41c86384be4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338844610,
+          "timestamp_ticks": 13338842915,
+          "x": 9.864110946655273,
+          "y": -0.2585737705230713,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000087b080000000d0700000011119f0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08031123970e1b030000001a0c6488ae3b50a08b3a7870d1bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338844945,
+          "timestamp_ticks": 13338842915,
+          "x": 0.005326317623257637,
+          "y": 0.0010652635246515274,
+          "z": -0.006391581147909164,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d070000001154d50e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08011123a10e1b030000001a0c440f1d4149328ebe4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338858836,
+          "timestamp_ticks": 13338845475,
+          "x": 9.816226959228516,
+          "y": -0.2777273952960968,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d0700000011a8d60e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08011123a10e1b030000001a0c50a00b3c50a08bba50a00bbb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338859176,
+          "timestamp_ticks": 13338845475,
+          "x": 0.00852210819721222,
+          "y": -0.0010652635246515274,
+          "z": -0.002130527049303055,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d070000001133d80e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021123ab0e1b030000001a0c2cac1d410f5c6bbe8bb6a63e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338859571,
+          "timestamp_ticks": 13338848035,
+          "x": 9.854534149169922,
+          "y": -0.2298433631658554,
+          "z": 0.3256114423274994,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d070000001150d90e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021123ab0e1b030000001a0c7870513b8c58f43b7870513b2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338859856,
+          "timestamp_ticks": 13338848035,
+          "x": 0.003195790573954582,
+          "y": 0.007456844672560692,
+          "z": 0.003195790573954582,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d0700000011dfda0e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021123b50e1b030000001a0c14491e41ca0098be8c53ba3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338860255,
+          "timestamp_ticks": 13338850595,
+          "x": 9.892841339111328,
+          "y": -0.2968810200691223,
+          "z": 0.363918662071228,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d07000000111adc0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021123b50e1b030000001a0c50a08b3a7870513c787051bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338860570,
+          "timestamp_ticks": 13338850595,
+          "x": 0.0010652635246515274,
+          "y": 0.012783162295818329,
+          "z": -0.003195790573954582,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d0700000011e6dd0e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021123bf0e1b030000001a0c66d31d41094b89becc3abf3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338861030,
+          "timestamp_ticks": 13338853155,
+          "x": 9.864110946655273,
+          "y": -0.26815059781074524,
+          "z": 0.3734954595565796,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d0700000011e5de0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021123bf0e1b030000001a0c50a08b3a6488ae3b50a00bbb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338861285,
+          "timestamp_ticks": 13338853155,
+          "x": 0.0010652635246515274,
+          "y": 0.005326317623257637,
+          "z": -0.002130527049303055,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d070000001179e00e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021123c90e1b030000001a0c2cac1d4110f97ebe4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338861689,
+          "timestamp_ticks": 13338855715,
+          "x": 9.854534149169922,
+          "y": -0.24899697303771973,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d070000001191e10e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021123c90e1b030000001a0c50a00b3c6488aebb50a08bbb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338861969,
+          "timestamp_ticks": 13338855715,
+          "x": 0.00852210819721222,
+          "y": -0.005326317623257637,
+          "z": -0.00426105409860611,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d070000001158e30e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021123d30e1b030000001a0c7e361d41891993be8bb6a63e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338862424,
+          "timestamp_ticks": 13338858275,
+          "x": 9.825803756713867,
+          "y": -0.28730419278144836,
+          "z": 0.3256114423274994,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d070000001157e40e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021123d30e1b030000001a0c50a08b3c7870513c000000002003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338862679,
+          "timestamp_ticks": 13338858275,
+          "x": 0.01704421639442444,
+          "y": 0.012783162295818329,
+          "z": 0.0,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d0700000011f0e50e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021123dd0e1b030000001a0cf2841d410f5c6bbecb9dab3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338863088,
+          "timestamp_ticks": 13338860835,
+          "x": 9.84495735168457,
+          "y": -0.2298433631658554,
+          "z": 0.33518823981285095,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d07000000110de70e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021123dd0e1b030000001a0c6488ae3b50a08b3c50a08b3a2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338863373,
+          "timestamp_ticks": 13338860835,
+          "x": 0.005326317623257637,
+          "y": 0.01704421639442444,
+          "z": 0.0010652635246515274,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb190000097b080000000d0700000011bbe80e1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08031123e70e1b030000001a0cf2841d41094b89becb9dab3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338863803,
+          "timestamp_ticks": 13338863395,
+          "x": 9.84495735168457,
+          "y": -0.26815059781074524,
+          "z": 0.33518823981285095,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb190000097b080000000d07000000116eea0e1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08031123e70e1b030000001a0c50a00bbb8c58f43b6efc3fbc2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338864238,
+          "timestamp_ticks": 13338863395,
+          "x": -0.002130527049303055,
+          "y": 0.007456844672560692,
+          "z": -0.011717898771166801,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d0700000011ba200f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080111bbf00e1b030000001a0c66d31d4149328ebecdd7d23e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338878138,
+          "timestamp_ticks": 13338865851,
+          "x": 9.864110946655273,
+          "y": -0.2777273952960968,
+          "z": 0.4118026793003082,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d070000001136220f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080111bbf00e1b030000001a0c00000080787051bb8c58f4bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338878518,
+          "timestamp_ticks": 13338865851,
+          "x": -0.0,
+          "y": -0.003195790573954582,
+          "z": -0.007456844672560692,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d0700000011e9230f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021153fa0e1b030000001a0cb85d1d410f5c6bbecc3abf3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338878953,
+          "timestamp_ticks": 13338868307,
+          "x": 9.835380554199219,
+          "y": -0.2298433631658554,
+          "z": 0.3734954595565796,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d07000000113d250f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021153fa0e1b030000001a0c50a08bba50a00b3b000000002003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338879293,
+          "timestamp_ticks": 13338868307,
+          "x": -0.0010652635246515274,
+          "y": 0.002130527049303055,
+          "z": 0.0,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d070000001109270f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211eb030f1b030000001a0c440f1d414acfa1be0b85b03e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338879753,
+          "timestamp_ticks": 13338870763,
+          "x": 9.816226959228516,
+          "y": -0.31603461503982544,
+          "z": 0.3447650372982025,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d070000001117280f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211eb030f1b030000001a0c7870513b7870d13b000000002003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338880023,
+          "timestamp_ticks": 13338870763,
+          "x": 0.003195790573954582,
+          "y": 0.006391581147909164,
+          "z": 0.0,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d0700000011a2290f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211830d0f1b030000001a0c440f1d4149328ebecc3abf3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338880418,
+          "timestamp_ticks": 13338873219,
+          "x": 9.816226959228516,
+          "y": -0.2777273952960968,
+          "z": 0.3734954595565796,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d0700000011052b0f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211830d0f1b030000001a0c50a08b3b50a08bba7870d1bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338880773,
+          "timestamp_ticks": 13338873219,
+          "x": 0.00426105409860611,
+          "y": -0.0010652635246515274,
+          "z": -0.006391581147909164,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d0700000011952c0f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802111b170f1b030000001a0c66d31d410f5c6bbe8c53ba3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338881173,
+          "timestamp_ticks": 13338875675,
+          "x": 9.864110946655273,
+          "y": -0.2298433631658554,
+          "z": 0.363918662071228,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d0700000011d52d0f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802111b170f1b030000001a0c50a08b3a50a08b3a50a08b3b2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338881493,
+          "timestamp_ticks": 13338875675,
+          "x": 0.0010652635246515274,
+          "y": 0.0010652635246515274,
+          "z": 0.00426105409860611,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d07000000115f2f0f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211b3200f1b030000001a0c66d31d4110f97ebecb9dab3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338881887,
+          "timestamp_ticks": 13338878131,
+          "x": 9.864110946655273,
+          "y": -0.24899697303771973,
+          "z": 0.33518823981285095,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d070000001186300f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211b3200f1b030000001a0c6488aebb50a00bbb50a00b3c2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338882182,
+          "timestamp_ticks": 13338878131,
+          "x": -0.005326317623257637,
+          "y": -0.002130527049303055,
+          "z": 0.00852210819721222,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d070000001116320f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802114b2a0f1b030000001a0c7e361d41ca0098be0c22c43e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338882582,
+          "timestamp_ticks": 13338880587,
+          "x": 9.825803756713867,
+          "y": -0.2968810200691223,
+          "z": 0.38307225704193115,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d07000000113d330f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802114b2a0f1b030000001a0c8c58f43b50a00b3b000000002003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338882877,
+          "timestamp_ticks": 13338880587,
+          "x": 0.007456844672560692,
+          "y": 0.002130527049303055,
+          "z": 0.0,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000a7b080000000d070000001186350f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08031183330f1b030000001a0c7e361d4149328ebe0c22c43e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338883462,
+          "timestamp_ticks": 13338882947,
+          "x": 9.825803756713867,
+          "y": -0.2777273952960968,
+          "z": 0.38307225704193115,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000a7b080000000d070000001194360f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08031183330f1b030000001a0c64882e3c7870d13b6efc3fbc2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338883732,
+          "timestamp_ticks": 13338882947,
+          "x": 0.010652635246515274,
+          "y": 0.006391581147909164,
+          "z": -0.011717898771166801,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d0700000011056c0f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080111e73c0f1b030000001a0c224b1c4149328ebe8c53ba3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338897413,
+          "timestamp_ticks": 13338885351,
+          "x": 9.768342971801758,
+          "y": -0.2777273952960968,
+          "z": 0.363918662071228,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d07000000114a6d0f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080111e73c0f1b030000001a0c64882e3c50a00bbb50a08bbb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338897738,
+          "timestamp_ticks": 13338885351,
+          "x": 0.010652635246515274,
+          "y": -0.002130527049303055,
+          "z": -0.00426105409860611,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 1
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d0700000011066f0f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802114b460f1b030000001a0c2cac1d4110f97ebe8c53ba3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338898182,
+          "timestamp_ticks": 13338887755,
+          "x": 9.854534149169922,
+          "y": -0.24899697303771973,
+          "z": 0.363918662071228,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d070000001100700f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802114b460f1b030000001a0c50a00bbb8c58f43b6942b73c2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338898432,
+          "timestamp_ticks": 13338887755,
+          "x": -0.002130527049303055,
+          "y": 0.007456844672560692,
+          "z": 0.022370534017682076,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d0700000011a9710f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211af4f0f1b030000001a0c14491e410f5c6bbe4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338898857,
+          "timestamp_ticks": 13338890159,
+          "x": 9.892841339111328,
+          "y": -0.2298433631658554,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d0700000011b2720f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211af4f0f1b030000001a0c7870d13b50a00b3c50a08b3a2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338899122,
+          "timestamp_ticks": 13338890159,
+          "x": 0.006391581147909164,
+          "y": 0.00852210819721222,
+          "z": 0.0010652635246515274,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d070000001178740f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021113590f1b030000001a0cf2841d410ebf57becb9dab3e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338899576,
+          "timestamp_ticks": 13338892563,
+          "x": 9.84495735168457,
+          "y": -0.2106897532939911,
+          "z": 0.33518823981285095,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d070000001186750f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021113590f1b030000001a0c7870513b7870d13b555a94bc2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338899846,
+          "timestamp_ticks": 13338892563,
+          "x": 0.003195790573954582,
+          "y": 0.006391581147909164,
+          "z": -0.018109479919075966,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d07000000110c770f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b08021177620f1b030000001a0c0ae81c41c86384be8bb6a63e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338900236,
+          "timestamp_ticks": 13338894967,
+          "x": 9.806650161743164,
+          "y": -0.2585737705230713,
+          "z": 0.3256114423274994,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d070000001147780f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b08021177620f1b030000001a0c0000008050a08b3b8c58f4bb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338900551,
+          "timestamp_ticks": 13338894967,
+          "x": -0.0,
+          "y": 0.00426105409860611,
+          "z": -0.007456844672560692,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d0700000011e5790f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080211db6b0f1b030000001a0cb85d1d41902a75be4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338900965,
+          "timestamp_ticks": 13338897371,
+          "x": 9.835380554199219,
+          "y": -0.23942017555236816,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d0700000011f37a0f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080211db6b0f1b030000001a0c50a00b3b6488ae3b50a00b3c2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338901235,
+          "timestamp_ticks": 13338897371,
+          "x": 0.002130527049303055,
+          "y": 0.005326317623257637,
+          "z": 0.00852210819721222,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d07000000118d7c0f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b0802113f750f1b030000001a0cf2841d410ebf57beca00983e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338901645,
+          "timestamp_ticks": 13338899775,
+          "x": 9.84495735168457,
+          "y": -0.2106897532939911,
+          "z": 0.2968810200691223,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d0700000011967d0f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b0802113f750f1b030000001a0c50a08bbb7870513b6488ae3b2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338901910,
+          "timestamp_ticks": 13338899775,
+          "x": -0.00426105409860611,
+          "y": 0.003195790573954582,
+          "z": 0.005326317623257637,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 2
+        }
+      ]
+    },
+    {
+      "body_hex": "10005e005e00cb1900000b7b080000000d07000000115c7f0f1b030000001a120916d3ac47de2e445811aac9a5b47653ab612205616363656c2930bfc5b200000000ba061d0a1b080311dc7d0f1b030000001a0c0ae81c4149328ebe4c6cb53e2003",
+      "decoded": [
+        {
+          "sensor_type": "accel",
+          "suid": "61ab5376b4a5c9aa58442ede47acd316",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338902364,
+          "timestamp_ticks": 13338901980,
+          "x": 9.806650161743164,
+          "y": -0.2777273952960968,
+          "z": 0.35434186458587646,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    },
+    {
+      "body_hex": "10005d005d00cb1900000b7b080000000d0700000011d3800f1b030000001a12090fa3601750de4a4511a186fc3e42ec9a1422046779726f2930bfc5b200000000ba061d0a1b080311dc7d0f1b030000001a0c787051bb6efc3f3c50a00bbb2003",
+      "decoded": [
+        {
+          "sensor_type": "gyro",
+          "suid": "149aec423efc86a1454ade501760a30f",
+          "instance_id": 2999303984,
+          "log_code": "19cb",
+          "log_timestamp_ticks": 13338902739,
+          "timestamp_ticks": 13338901980,
+          "x": -0.003195790573954582,
+          "y": 0.011717898771166801,
+          "z": -0.002130527049303055,
+          "status": 3,
+          "kind": "raw",
+          "batch_type": 3
+        }
+      ]
+    }
+  ]
+}

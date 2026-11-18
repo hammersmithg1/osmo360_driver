@@ -42,6 +42,38 @@ def _exception_chain(error):
     return result
 
 
+def _bounded_diagnostic(value):
+    """Copy primitive evidence only; never repr arbitrary producer objects."""
+    text_left, nodes_left = [2048], [96]
+    def copy(item, depth=0):
+        nodes_left[0] -= 1
+        if nodes_left[0] < 0 or depth > 4:
+            return None
+        if item is None or type(item) is bool:
+            return item
+        if type(item) is int:
+            return item if -(2**64) <= item < 2**64 else None
+        if type(item) is float:
+            return item if math.isfinite(item) else None
+        if type(item) is str:
+            limit = min(256, text_left[0])
+            text = item[:limit].encode('ascii', 'backslashreplace')[:limit].decode('ascii')
+            text_left[0] -= len(text)
+            return text
+        if type(item) in (tuple, list):
+            return [copy(row, depth + 1) for row in item[:4]]
+        if type(item) is dict:
+            result = {}
+            for index, (key, row) in enumerate(item.items()):
+                if index == 16 or nodes_left[0] <= 0:
+                    break
+                if type(key) is str:
+                    result[key[:32]] = copy(row, depth + 1)
+            return result
+        return None
+    return copy(value)
+
+
 @dataclass(frozen=True)
 class _IdleEvidence:
     verified_at: float
@@ -639,9 +671,53 @@ class USBStreamSession:
         self._primed_imu.clear()
         return preview, imu, stream
 
+    def _sleep_failure_diagnostics(self, stage, started, retained, sleep_id, submitted, error):
+        """Freeze existing host evidence; no query, task, input or cleanup."""
+        control = self.control
+        session = getattr(getattr(control, 'bootstrap', None), 'session', None)
+        operations = getattr(session, 'operations', None)
+        op = operations[-1] if type(operations) is list and operations and type(operations[-1]) is dict else {}
+        op_keys = ('command', 'task_id', 'completed', 'start_accepted', 'success', 'result',
+            'error', 'quarantined', 'quarantine_reason', 'start_attempts', 'timeout_ms')
+        status = getattr(control, 'last_status_error', None)
+        status_keys = ('error', 'error_type', 'expected_command', 'command', 'task_id',
+            'owned_task_id', 'result', 'completed', 'start_accepted', 'pending_task')
+        lease = getattr(self._preview, '_lease', None)
+        transport = getattr(self.camera, '_transport', None)
+        ack_at = getattr(lease, 'last_ack_monotonic', None)
+        now = self.clock()
+        chain, seen, current = [], set(), error
+        while current is not None and id(current) not in seen and len(chain) < 4:
+            seen.add(id(current))
+            chain.append(dict(type=type(current).__name__, args=current.args))
+            current = current.__cause__ if current.__cause__ is not None else (
+                None if current.__suppress_context__ else current.__context__)
+        value = dict(schema=1, stage=stage, at=now, elapsed_s=now - started,
+            sleep_id=sleep_id or getattr(retained, 'sleep_id', None),
+            submission_returned=submitted, errors=chain,
+            control=dict(pending_command=getattr(control, 'pending_command', None),
+                pending_task=getattr(control, 'pending_task', None),
+                unknown_task=getattr(control, '_unknown_task', None),
+                quarantined=getattr(session, 'quarantined', None),
+                owned_task_id=getattr(session, 'owned_task_id', None)),
+            lease=dict(last_ack=getattr(lease, 'last_ack', None), last_ack_at=ack_at,
+                ack_age_s=now - ack_at if type(ack_at) in (int, float) and math.isfinite(ack_at) else None,
+                stats=getattr(lease, 'stats', None)),
+            last_operation={key: op[key] for key in op_keys if key in op},
+            last_status_error={key: status[key] for key in status_keys if key in status} if type(status) is dict else None,
+            retained_work=getattr(retained, 'work', None),
+            transport=dict(read_failure_status=getattr(transport, '_read_failure_status', None),
+                device_identity=getattr(transport, '_device_identity', None),
+                disconnect_evidence=getattr(transport, '_disconnect_evidence', None)))
+        value = _bounded_diagnostic(value)
+        if len(json.dumps(value, sort_keys=True).encode('ascii')) > 8192:
+            raise ValueError('Fast Sleep diagnostic exceeds8KiB')
+        self.report['sleep_failure'] = value
+
     def _sleep_local_first(self):
         self._set_state("PREPARING_SLEEP")
         retained = None
+        stage, started, sleep_id, submitted = 'retained_assets', self.clock(), None, False
         try:
             with self.camera._control_lock:
                 if self.retain_ecm:
@@ -651,6 +727,7 @@ class USBStreamSession:
                     self.retained_factory.preload_assets(
                         self.camera, self.control, owner_receipt=self._owner_receipt()
                     )
+                    stage = 'retained_owner_snapshot'
                     current = self.control.snapshot()
                     if current["state"] != "AWAKE":
                         raise ValueError("Retained preparation requires AWAKE")
@@ -665,10 +742,15 @@ class USBStreamSession:
                         wake_id=f"{number + 1:016x}",
                         preview=self._preview,
                     )
+                    stage = 'retained_prepare'
                     retained.prepare()
+                stage = 'app_unregister'
                 before, after = self._unregister_app()
+                stage = 'local_capture_stop'
                 preview, imu, stream = self._stop_local_capture()
+                stage = 'idle_readback'
                 idle = self._idle()
+                stage = 'final_app_query'
                 after = self._app_query()
                 lease, plan = preview._lease, preview._plan
                 proof = LocalSleepEntryProof(
@@ -694,8 +776,10 @@ class USBStreamSession:
                     before,
                     after,
                 )
-                submitted = submit_local_sleep(self.control, proof)
-                sleep_id = submitted["command_id"]
+                stage = 'submit_local_sleep'
+                result = submit_local_sleep(self.control, proof)
+                submitted = True
+                sleep_id = result["command_id"]
                 self._wake_id = f"{int(sleep_id, 16) + 1:016x}"
                 if retained is not None and (retained.sleep_id, retained.wake_id) != (
                     sleep_id,
@@ -708,7 +792,9 @@ class USBStreamSession:
                     # Retire the previous cycle's cleanup proof immediately
                     # after the one new Sleep was accepted, before status wait.
                     self._prepared = self._retained_backend = retained
+                stage = 'wait_native_sleep'
                 terminal = self.control.wait(sleep_id, "SLEEP", timeout=12)
+            stage = 'publish_sleep'
             self._stable_sleep_at = self.clock()
             self.report["cycles"].append(
                 dict(
@@ -729,13 +815,19 @@ class USBStreamSession:
                 self._start_preparation(sleep_id, self._wake_id, preview)
             return deepcopy(terminal)
         except BaseException as error:
+            try:
+                self._sleep_failure_diagnostics(stage, started, retained, sleep_id, submitted, error)
+            except BaseException as diagnostic_error:
+                self.report['sleep_failure'] = dict(stage=stage, diagnostic_error_type=type(diagnostic_error).__name__[:64])
             if (
                 retained is not None
                 and getattr(self.control, "pending_command", None) == retained.sleep_id
             ):
                 # A lost input receipt is still a possibly delivered Sleep.
                 self._prepared = self._retained_backend = retained
-            self.report["errors"].append("Fast Sleep entry: " + repr(error))
+            name = type(error).__name__[:64]
+            message = error.args[0][:256] if error.args and type(error.args[0]) is str else name
+            self.report["errors"].append("Fast Sleep entry: " + name + ': ' + message)
             self._set_state("RECOVERY_REQUIRED")
             raise
 

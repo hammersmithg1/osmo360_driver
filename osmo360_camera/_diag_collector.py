@@ -21,6 +21,7 @@ import time
 from . import _usb as osmo_usb
 from ._imu_wire import pack_sample
 from ._ssc import decode_diag_packet
+from ._ssc_fast import decode_raw_xyz_packet
 
 
 BIT_REVERSE_TABLE = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
@@ -678,8 +679,9 @@ def main():
     pending_pairs, paired_samples, evicted_unpaired = {}, 0, 0
     streaming_enabled = False
     decode_samples = None
+    binary_raw = args.paired and args.udp_format == "binary" and not args.samples_jsonl
     if args.samples_jsonl or args.udp_port:
-        decode_samples = decode_diag_packet
+        decode_samples = decode_raw_xyz_packet if binary_raw else decode_diag_packet
     # Reuse the host buffer; Decoder retains packets split across USB reads.
     read_buffer = C.create_string_buffer(args.read_buffer_bytes)
     io_counts = dict(usb_reads=0, usb_bytes=0, usb_timeouts=0, last_read_status=None)
@@ -767,40 +769,52 @@ def main():
                     sample_decode_errors += 1
                     continue
                 for sample in samples:
-                    if sample["kind"] != "raw" or sample["sensor_type"] not in (
-                        "accel",
-                        "gyro",
-                    ):
-                        continue
-                    sample["host_receive_monotonic_ns"] = received_at_ns
-                    sample_counts[sample["sensor_type"]] += 1
+                    if binary_raw:
+                        sensor, tick, _, _, _, _, _ = sample
+                    else:
+                        if sample["kind"] != "raw" or sample["sensor_type"] not in (
+                            "accel", "gyro"
+                        ):
+                            continue
+                        sample["host_receive_monotonic_ns"] = received_at_ns
+                        sensor, tick = sample["sensor_type"], sample["timestamp_ticks"]
+                    sample_counts[sensor] += 1
                     output = sample
                     if args.paired:
-                        tick = sample["timestamp_ticks"]
                         pair = pending_pairs.setdefault(tick, {})
-                        pair[sample["sensor_type"]] = sample
+                        pair[sensor] = sample
                         if len(pair) < 2:
                             if len(pending_pairs) > 4096:
                                 del pending_pairs[next(iter(pending_pairs))]
                                 evicted_unpaired += 1
                             continue
                         a, g = pair["accel"], pair["gyro"]
+                        if binary_raw:
+                            _, _, ax, ay, az, astatus, asuid = a
+                            _, _, gx, gy, gz, gstatus, gsuid = g
+                        else:
+                            ax, ay, az, astatus, asuid = (
+                                a["x"], a["y"], a["z"], a["status"], a["suid"]
+                            )
+                            gx, gy, gz, gstatus, gsuid = (
+                                g["x"], g["y"], g["z"], g["status"], g["suid"]
+                            )
                         output = {
                             "sensor_type": "imu",
                             "timestamp_ticks": tick,
                             "tick_hz": 19200000,
-                            "ax": a["x"],
-                            "ay": a["y"],
-                            "az": a["z"],
-                            "gx": g["x"],
-                            "gy": g["y"],
-                            "gz": g["z"],
+                            "ax": ax,
+                            "ay": ay,
+                            "az": az,
+                            "gx": gx,
+                            "gy": gy,
+                            "gz": gz,
                             "accel_unit": "m/s^2",
                             "gyro_unit": "rad/s",
-                            "accel_status": a["status"],
-                            "gyro_status": g["status"],
-                            "accel_suid": a["suid"],
-                            "gyro_suid": g["suid"],
+                            "accel_status": astatus,
+                            "gyro_status": gstatus,
+                            "accel_suid": asuid,
+                            "gyro_suid": gsuid,
                             "host_receive_monotonic_ns": received_at_ns,
                         }
                         del pending_pairs[tick]
