@@ -22,10 +22,12 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 import json
 import math
+import platform
 from pathlib import Path
 import queue
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -45,6 +47,50 @@ _LIVE_COUNTS = {'usb_reads', 'usb_bytes', 'usb_timeouts', 'ssc_packets',
                 'accel_samples', 'gyro_samples', 'paired_samples',
                 'sample_decode_errors', 'udp_sent', 'udp_drops', 'bad_crc', 'unpaired_pending'}
 _LIVE_TIMES = {'mask_verified_ns', 'first_ssc_ns', 'first_pair_ns', 'fatal_read_ns'}
+_UDP_RECEIVE_BYTES = 4 * 1024 * 1024
+_DROP_COUNT = struct.Struct('=I')  # Linux ancillary unsigned 32-bit, native byte order.
+
+
+def _linux_socket_option(name, generic_number):
+    """Use native constants, or verified asm-generic numbers on known Linux ABIs.
+
+    Linux include/uapi/asm-generic/socket.h defines RCVBUFFORCE=33/RXQ_OVFL=40.
+    Other operating systems and Linux ABIs with different socket numbers must
+    never receive these numeric fallbacks.
+    """
+    if sys.platform != 'linux':
+        return None
+    native = getattr(socket, name, None)
+    if type(native) is int:
+        return native
+    if platform.machine().lower() in {
+        'aarch64', 'arm64', 'armv6l', 'armv7l', 'x86_64', 'amd64', 'i386', 'i686',
+    }:
+        return generic_number
+    return None
+
+
+def _kernel_drop_report(ancillary, flags, option):
+    """Read an observed RXQ_OVFL counter; absent control data is unknown, not zero.
+
+    The uint32 value describes drops since this socket's creation as observed
+    when the received datagram was queued. It can lag current losses and wraps
+    at 32 bits. Invalid/truncated control data cannot replace a known counter.
+    """
+    if flags & socket.MSG_CTRUNC:
+        return None, True
+    found, value = False, None
+    try:
+        for level, kind, data in ancillary:
+            if level != socket.SOL_SOCKET or kind != option:
+                continue
+            if found or len(data) != _DROP_COUNT.size:
+                return None, True
+            value, = _DROP_COUNT.unpack(data)
+            found = True
+    except (TypeError, ValueError, struct.error):
+        return None, True
+    return value, False
 
 
 def _collector_status(line):
@@ -186,8 +232,12 @@ class IMUStream:
     resample it. Slow consumers discard the oldest queued sample to keep
     latency bounded. ``stats['queue_drops']`` counts iterator-queue losses;
     a callback has its own bounded queue and ``callback_drops`` counter.
-    These counters cannot measure kernel UDP loss. Tick discontinuities and
-    the source collector's UDP-drop count remain separately visible.
+    Linux ``kernel_drops`` separately exposes an observed SO_RXQ_OVFL uint32
+    counter; None means no kernel report is available, rather than zero loss.
+    It can lag current losses and wraps at 32 bits. Other platforms leave it
+    unavailable. Tick discontinuities and collector send failures remain
+    separately visible. ``udp_socket`` reports the requested/effective receive
+    buffer and any option errno; no global sysctl or privileges are changed.
     ``max_native_interval_ticks`` measures the largest positive interval
     between received native timestamps, independent of host arrival timing.
     Its ``max_native_interval_ns`` conversion rounds down to whole nanoseconds;
@@ -240,6 +290,13 @@ class IMUStream:
         self._report = None
         self._process = None
         self._socket = None
+        self._rxq_option = None
+        self._socket_report = dict(
+            requested_rcvbuf_bytes=_UDP_RECEIVE_BYTES, effective_rcvbuf_bytes=None,
+            buffer_method=None, force_attempted=False, force_errno=None,
+            buffer_errno=None, readback_errno=None, rxq_overflow=False,
+            rxq_overflow_errno=None, kernel_drop_source=None, kernel_drop_counter_bits=None,
+        )
         self._queue = queue.Queue(maxsize=queue_size)
         self._callbacks = queue.Queue(maxsize=queue_size) if callback else None
         self._ready = threading.Event()
@@ -268,6 +325,9 @@ class IMUStream:
             max_native_interval_ticks=None,
             first_host_receive_monotonic_ns=None,
             last_host_receive_monotonic_ns=None,
+            kernel_drops=None,
+            kernel_drop_telemetry_errors=0,
+            truncated_datagrams=0,
         )
 
     @property
@@ -296,6 +356,7 @@ class IMUStream:
     def stats(self) -> dict:
         with self._lock:
             result = dict(self._stats)
+            result['udp_socket'] = dict(self._socket_report)
             result['collector_live'] = dict(self._collector_live) if self._collector_live else None
             result['collector_live_age_s'] = (max(0, time.monotonic() - self._collector_live_at)
                                                if self._collector_live_at is not None else None)
@@ -321,6 +382,43 @@ class IMUStream:
         result["collector_returncode"] = self._process.poll() if self._process else None
         return result
 
+    def _configure_udp_socket(self, sock):
+        report = self._socket_report
+        force = _linux_socket_option('SO_RCVBUFFORCE', 33)
+        if force is not None:
+            report['force_attempted'] = True
+            try:
+                # Same bounded 4 MiB request as before, beyond rmem_max only if
+                # the process already has CAP_NET_ADMIN. Never obtain rights.
+                sock.setsockopt(socket.SOL_SOCKET, force, _UDP_RECEIVE_BYTES)
+                report['buffer_method'] = 'SO_RCVBUFFORCE'
+            except OSError as error:
+                report['force_errno'] = error.errno
+        if report['buffer_method'] is None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _UDP_RECEIVE_BYTES)
+                report['buffer_method'] = 'SO_RCVBUF'
+            except OSError as error:
+                report['buffer_errno'] = error.errno
+                raise  # Preserve the existing required-option startup failure.
+        try:
+            # Linux includes its doubled bookkeeping allowance in this value.
+            report['effective_rcvbuf_bytes'] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        except OSError as error:
+            report['readback_errno'] = error.errno
+        overflow = _linux_socket_option('SO_RXQ_OVFL', 40)
+        if (overflow is not None and callable(getattr(sock, 'recvmsg', None))
+                and hasattr(socket, 'CMSG_SPACE') and hasattr(socket, 'MSG_CTRUNC')
+                and hasattr(socket, 'MSG_TRUNC')):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, overflow, 1)
+            except OSError as error:
+                report['rxq_overflow_errno'] = error.errno
+            else:
+                self._rxq_option = overflow
+                report.update(rxq_overflow=True, kernel_drop_source='SO_RXQ_OVFL',
+                              kernel_drop_counter_bits=32)
+
     def start(self) -> IMUStream:
         if self._closed or self._stop_requested:
             raise IMUStreamError("An IMUStream is single-use; create a new instance")
@@ -333,7 +431,7 @@ class IMUStream:
         self.report_path = prefix.with_suffix(".json")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self._configure_udp_socket(sock)
             sock.bind(("127.0.0.1", 0))
             sock.settimeout(0.1)
             self._port = sock.getsockname()[1]
@@ -445,21 +543,34 @@ class IMUStream:
             target.put_nowait(sample)  # This thread is the only producer.
 
     def _receive(self):
+        overflow = self._rxq_option
         try:
             while True:
+                drops, invalid_control, flags = None, False, 0
                 try:
-                    data = self._socket.recv(65536)
+                    if overflow is None:
+                        data = self._socket.recv(65536)
+                    else:
+                        data, ancillary, flags, _ = self._socket.recvmsg(
+                            65536, socket.CMSG_SPACE(_DROP_COUNT.size)
+                        )
+                        drops, invalid_control = _kernel_drop_report(ancillary, flags, overflow)
                 except socket.timeout:
                     if self._process.poll() is not None:
                         break
                     continue
                 try:
+                    if flags & getattr(socket, 'MSG_TRUNC', 0):
+                        raise ValueError('Truncated IMU datagram')
                     sample = IMUSample.from_datagram(data)
                 except (ValueError, TypeError, KeyError, OverflowError):
                     with self._lock:
+                        self._record_kernel_report(drops, invalid_control)
+                        self._stats['truncated_datagrams'] += bool(flags & getattr(socket, 'MSG_TRUNC', 0))
                         self._stats["malformed_datagrams"] += 1
                     continue
                 with self._lock:
+                    self._record_kernel_report(drops, invalid_control)
                     last = self._stats["last_timestamp_ticks"]
                     if last is not None:
                         delta = sample.timestamp_ticks - last
@@ -485,6 +596,12 @@ class IMUStream:
         finally:
             self._socket.close()
             self._receiver_done.set()
+
+    def _record_kernel_report(self, drops, invalid_control):
+        """Called under the existing receive-stat lock, including bad payloads."""
+        if drops is not None:
+            self._stats['kernel_drops'] = drops
+        self._stats['kernel_drop_telemetry_errors'] += invalid_control
 
     def _dispatch_callbacks(self):
         while not self._receiver_done.is_set() or not self._callbacks.empty():
