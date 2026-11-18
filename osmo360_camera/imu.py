@@ -35,7 +35,8 @@ import threading
 import time
 from typing import Callable
 
-from ._imu_wire import BINARY_PREFIX, TICK_HZ, unpack_sample
+from ._imu_queue import RecentSamples
+from ._imu_wire import BINARY_PREFIX, PACKET, TICK_HZ, unpack_sample
 
 READY_LINE = "Sensor log mask enabled; capture started"
 LIVE_PREFIX = 'OSMO_IMU_STATUS '
@@ -49,6 +50,7 @@ _LIVE_COUNTS = {'usb_reads', 'usb_bytes', 'usb_timeouts', 'ssc_packets',
 _LIVE_TIMES = {'mask_verified_ns', 'first_ssc_ns', 'first_pair_ns', 'fatal_read_ns'}
 _UDP_RECEIVE_BYTES = 4 * 1024 * 1024
 _DROP_COUNT = struct.Struct('=I')  # Linux ancillary unsigned 32-bit, native byte order.
+_MAX_BATCH_SAMPLES = 64
 
 
 def _linux_socket_option(name, generic_number):
@@ -253,6 +255,11 @@ class IMUStream:
     ``read_buffer_bytes`` controls only host USB reads: a multiple of 1024
     from 1024 through 65536. The 4096-byte default reduces host batching;
     it does not change the sensor sample rate or camera-side configuration.
+    The owned collector batches up to64 unchanged private binary samples per
+    datagram, flushing the partial batch at each USB read. Native ticks and the
+    original USB receive time are retained on every sample; no resampling or
+    timer-delayed batching occurs. Small queues cap the batch to their sample
+    capacity. Kernel overflow counters remain counts of datagrams, not samples.
     The owned collector uses a private lossless binary UDP format internally;
     standalone collector UDP and sample files retain their default JSON format.
     """
@@ -282,6 +289,7 @@ class IMUStream:
         if not all(math.isfinite(v) and v > 0 for v in (startup_timeout, stop_timeout)):
             raise ValueError("timeouts must be finite and positive")
         self.queue_size = queue_size
+        self._batch_size = min(_MAX_BATCH_SAMPLES, queue_size)
         self.read_buffer_bytes = read_buffer_bytes
         self.callback = callback
         self.report_dir = Path(report_dir) if report_dir is not None else None
@@ -296,9 +304,10 @@ class IMUStream:
             buffer_method=None, force_attempted=False, force_errno=None,
             buffer_errno=None, readback_errno=None, rxq_overflow=False,
             rxq_overflow_errno=None, kernel_drop_source=None, kernel_drop_counter_bits=None,
+            private_batch_max_samples=self._batch_size, kernel_drop_unit=None,
         )
-        self._queue = queue.Queue(maxsize=queue_size)
-        self._callbacks = queue.Queue(maxsize=queue_size) if callback else None
+        self._queue = RecentSamples(queue_size)
+        self._callbacks = RecentSamples(queue_size) if callback else None
         self._ready = threading.Event()
         self._receiver_done = threading.Event()
         self._stop_requested = False
@@ -417,7 +426,7 @@ class IMUStream:
             else:
                 self._rxq_option = overflow
                 report.update(rxq_overflow=True, kernel_drop_source='SO_RXQ_OVFL',
-                              kernel_drop_counter_bits=32)
+                              kernel_drop_counter_bits=32, kernel_drop_unit='datagrams')
 
     def start(self) -> IMUStream:
         if self._closed or self._stop_requested:
@@ -451,6 +460,8 @@ class IMUStream:
                 str(self._port),
                 "--udp-format",
                 "binary",
+                "--udp-batch-size",
+                str(self._batch_size),
                 "--read-buffer-bytes",
                 str(self.read_buffer_bytes),
                 "--no-packet-jsonl",
@@ -530,17 +541,24 @@ class IMUStream:
             self._process.wait()  # Reap even after a caller's stop timeout.
 
     def _put_recent(self, target, sample, drop_key):
-        try:
-            target.put_nowait(sample)
-        except queue.Full:
-            try:
-                target.get_nowait()
-            except queue.Empty:
-                pass  # A consumer just made space; no sample was discarded.
-            else:
-                with self._lock:
-                    self._stats[drop_key] += 1
-            target.put_nowait(sample)  # This thread is the only producer.
+        self._put_many_recent(target, (sample,), drop_key)
+
+    def _put_many_recent(self, target, samples, drop_key):
+        # Queue condition is released before the stats lock. stats() likewise
+        # releases its lock before qsize(): neither path nests these locks.
+        dropped = target.put_many_recent(samples)
+        if dropped:
+            with self._lock:
+                self._stats[drop_key] += dropped
+
+    def _samples_from_datagram(self, data):
+        if isinstance(data, (bytes, bytearray)) and data.startswith(BINARY_PREFIX):
+            if not len(data) or len(data) % PACKET.size or len(data) // PACKET.size > self._batch_size:
+                raise ValueError('Invalid owned IMU batch length')
+            # Complete validation precedes any sample/stat/queue admission.
+            return tuple(IMUSample.from_datagram(data[offset:offset + PACKET.size])
+                         for offset in range(0, len(data), PACKET.size))
+        return (IMUSample.from_datagram(data),)  # Legacy JSON remains one sample.
 
     def _receive(self):
         overflow = self._rxq_option
@@ -562,7 +580,7 @@ class IMUStream:
                 try:
                     if flags & getattr(socket, 'MSG_TRUNC', 0):
                         raise ValueError('Truncated IMU datagram')
-                    sample = IMUSample.from_datagram(data)
+                    samples = self._samples_from_datagram(data)
                 except (ValueError, TypeError, KeyError, OverflowError):
                     with self._lock:
                         self._record_kernel_report(drops, invalid_control)
@@ -572,22 +590,28 @@ class IMUStream:
                 with self._lock:
                     self._record_kernel_report(drops, invalid_control)
                     last = self._stats["last_timestamp_ticks"]
-                    if last is not None:
-                        delta = sample.timestamp_ticks - last
-                        self._stats["nonincreasing_ticks"] += delta <= 0
-                        self._stats["gaps_over_5ms"] += delta > TICK_HZ * 0.005
-                        largest = self._stats["max_native_interval_ticks"]
-                        if delta > 0 and (largest is None or delta > largest):
-                            self._stats["max_native_interval_ticks"] = delta
-                    else:
-                        self._stats["first_timestamp_ticks"] = sample.timestamp_ticks
-                        self._stats['first_host_receive_monotonic_ns'] = sample.host_receive_monotonic_ns
+                    largest = self._stats["max_native_interval_ticks"]
+                    nonincreasing, gaps = 0, 0
+                    if last is None:
+                        self._stats["first_timestamp_ticks"] = samples[0].timestamp_ticks
+                        self._stats['first_host_receive_monotonic_ns'] = samples[0].host_receive_monotonic_ns
+                    for sample in samples:
+                        if last is not None:
+                            delta = sample.timestamp_ticks - last
+                            nonincreasing += delta <= 0
+                            gaps += delta > TICK_HZ * 0.005
+                            if delta > 0 and (largest is None or delta > largest):
+                                largest = delta
+                        last = sample.timestamp_ticks
+                    self._stats['nonincreasing_ticks'] += nonincreasing
+                    self._stats['gaps_over_5ms'] += gaps
+                    self._stats['max_native_interval_ticks'] = largest
                     self._stats["last_timestamp_ticks"] = sample.timestamp_ticks
                     self._stats['last_host_receive_monotonic_ns'] = sample.host_receive_monotonic_ns
-                    self._stats["received"] += 1
-                self._put_recent(self._queue, sample, "queue_drops")
+                    self._stats["received"] += len(samples)
+                self._put_many_recent(self._queue, samples, "queue_drops")
                 if self._callbacks is not None:
-                    self._put_recent(self._callbacks, sample, "callback_drops")
+                    self._put_many_recent(self._callbacks, samples, "callback_drops")
         except OSError as error:
             self._receiver_error = str(error)
             if self._process.poll() is None and not self._stop_requested:

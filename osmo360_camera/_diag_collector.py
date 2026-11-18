@@ -19,7 +19,7 @@ import struct
 import time
 
 from . import _usb as osmo_usb
-from ._imu_wire import pack_sample
+from ._imu_wire import PACKET, pack_sample
 from ._ssc import decode_diag_packet
 from ._ssc_fast import decode_raw_xyz_packet
 
@@ -260,6 +260,41 @@ def _sample_outputs(output, *, write_json=False, udp_format=None):
         else None
     )
     return line, datagram
+
+
+class _UDPSampleBatch:
+    """One capture read's pending unchanged binary records; never a timer.
+
+    send/drop accounting remains samples. Clear the pending block before the
+    send: an interrupted/uncertain UDP send must never be replayed by finally.
+    The caller flushes the tail before this same receive() returns or raises.
+    """
+    def __init__(self, udp, address, max_samples):
+        if type(max_samples) is not int or not 1 <= max_samples <= 64:
+            raise ValueError('UDP batch must contain1..64 samples')
+        self.udp, self.address, self.max_samples = udp, address, max_samples
+        self.pending = []
+        self.sent = self.dropped = 0
+
+    def add(self, record):
+        if not isinstance(record, bytes) or len(record) != PACKET.size:
+            raise ValueError('UDP batch requires unchanged binary sample records')
+        self.pending.append(record)
+        if len(self.pending) == self.max_samples:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            return
+        count = len(self.pending)
+        payload = b''.join(self.pending)
+        self.pending.clear()
+        try:
+            self.udp.sendto(payload, self.address)
+        except (BlockingIOError, OSError):
+            self.dropped += count
+        else:
+            self.sent += count
 
 
 def config(operation, data):
@@ -624,6 +659,10 @@ def main():
         help="UDP encoding; binary is internal paired IMU (default: json)",
     )
     parser.add_argument(
+        '--udp-batch-size', type=int, default=1,
+        help='Private binary samples per datagram; flush tail at each USB read (1..64, default1)',
+    )
+    parser.add_argument(
         "--no-packet-jsonl",
         action="store_true",
         help="Не сохранять подробный журнал DIAG",
@@ -644,6 +683,10 @@ def main():
         parser.error("udp-port: 1..65535")
     if args.udp_format == "binary" and (not args.paired or args.udp_port is None):
         parser.error("binary UDP requires --paired and --udp-port")
+    if not 1 <= args.udp_batch_size <= 64:
+        parser.error('udp-batch-size:1..64')
+    if args.udp_batch_size > 1 and (args.udp_format != 'binary' or not args.paired or args.udp_port is None):
+        parser.error('Batched UDP requires binary paired samples and --udp-port')
     if not 1024 <= args.read_buffer_bytes <= 65536 or args.read_buffer_bytes % 1024:
         parser.error("read-buffer-bytes: 1024..65536, multiple of 1024")
     paths = {
@@ -667,6 +710,7 @@ def main():
         "seconds": args.seconds,
         "profile": args.profile,
         "udp_format": args.udp_format if args.udp_port is not None else None,
+        'udp_batch_size': args.udp_batch_size,
         "read_buffer_bytes": args.read_buffer_bytes,
         "requested_sensor_codes": [f"{0x1000 + n:04x}" for n in items],
         "restored": False,
@@ -744,96 +788,110 @@ def main():
         if raw:
             raw.write(data)
         decoded = list(decoder.feed(data))
-        for body in decoded:
-            opcodes[f"{body[0]:02x}"] += 1
-            log_code = None
-            if body[0] == 0x10 and len(body) >= 16:
-                log_code = struct.unpack_from("<H", body, 6)[0]
-                log_codes[f"{log_code:04x}"] += 1
-                if (log_code == 0x19CB and streaming_enabled
-                        and live.times['first_ssc_ns'] is None):
-                    live.mark('first_ssc', at_ns=received_at_ns)
-            if packets:
-                entry = {
-                    "host_monotonic_s": time.monotonic(),
-                    "opcode": body[0],
-                    "hex": body.hex(),
-                }
-                if log_code is not None:
-                    entry["log_code"] = f"{log_code:04x}"
-                packets.write(json.dumps(entry) + "\n")
-            if decode_samples and streaming_enabled:
-                try:
-                    samples = decode_samples(body)
-                except ValueError:
-                    sample_decode_errors += 1
-                    continue
-                for sample in samples:
-                    if binary_raw:
-                        sensor, tick, _, _, _, _, _ = sample
-                    else:
-                        if sample["kind"] != "raw" or sample["sensor_type"] not in (
-                            "accel", "gyro"
-                        ):
-                            continue
-                        sample["host_receive_monotonic_ns"] = received_at_ns
-                        sensor, tick = sample["sensor_type"], sample["timestamp_ticks"]
-                    sample_counts[sensor] += 1
-                    output = sample
-                    if args.paired:
-                        pair = pending_pairs.setdefault(tick, {})
-                        pair[sensor] = sample
-                        if len(pair) < 2:
-                            if len(pending_pairs) > 4096:
-                                del pending_pairs[next(iter(pending_pairs))]
-                                evicted_unpaired += 1
-                            continue
-                        a, g = pair["accel"], pair["gyro"]
+        udp_batch = (_UDPSampleBatch(udp, ('127.0.0.1', args.udp_port), args.udp_batch_size)
+                     if udp is not None and args.udp_format == 'binary' and args.udp_batch_size > 1
+                     else None)
+        try:
+            for body in decoded:
+                opcodes[f"{body[0]:02x}"] += 1
+                log_code = None
+                if body[0] == 0x10 and len(body) >= 16:
+                    log_code = struct.unpack_from("<H", body, 6)[0]
+                    log_codes[f"{log_code:04x}"] += 1
+                    if (log_code == 0x19CB and streaming_enabled
+                            and live.times['first_ssc_ns'] is None):
+                        live.mark('first_ssc', at_ns=received_at_ns)
+                if packets:
+                    entry = {
+                        "host_monotonic_s": time.monotonic(),
+                        "opcode": body[0],
+                        "hex": body.hex(),
+                    }
+                    if log_code is not None:
+                        entry["log_code"] = f"{log_code:04x}"
+                    packets.write(json.dumps(entry) + "\n")
+                if decode_samples and streaming_enabled:
+                    try:
+                        samples = decode_samples(body)
+                    except ValueError:
+                        sample_decode_errors += 1
+                        continue
+                    for sample in samples:
                         if binary_raw:
-                            _, _, ax, ay, az, astatus, asuid = a
-                            _, _, gx, gy, gz, gstatus, gsuid = g
+                            sensor, tick, _, _, _, _, _ = sample
                         else:
-                            ax, ay, az, astatus, asuid = (
-                                a["x"], a["y"], a["z"], a["status"], a["suid"]
-                            )
-                            gx, gy, gz, gstatus, gsuid = (
-                                g["x"], g["y"], g["z"], g["status"], g["suid"]
-                            )
-                        output = {
-                            "sensor_type": "imu",
-                            "timestamp_ticks": tick,
-                            "tick_hz": 19200000,
-                            "ax": ax,
-                            "ay": ay,
-                            "az": az,
-                            "gx": gx,
-                            "gy": gy,
-                            "gz": gz,
-                            "accel_unit": "m/s^2",
-                            "gyro_unit": "rad/s",
-                            "accel_status": astatus,
-                            "gyro_status": gstatus,
-                            "accel_suid": asuid,
-                            "gyro_suid": gsuid,
-                            "host_receive_monotonic_ns": received_at_ns,
-                        }
-                        del pending_pairs[tick]
-                        paired_samples += 1
-                        if paired_samples == 1:
-                            live.mark('first_pair', at_ns=received_at_ns)
-                    line, datagram = _sample_outputs(
-                        output,
-                        write_json=sample_file is not None,
-                        udp_format=args.udp_format if udp else None,
-                    )
-                    if sample_file:
-                        sample_file.write(line)
-                    if udp:
-                        try:
-                            udp.sendto(datagram, ("127.0.0.1", args.udp_port))
-                            udp_sent += 1
-                        except (BlockingIOError, OSError):
-                            udp_drops += 1
+                            if sample["kind"] != "raw" or sample["sensor_type"] not in (
+                                "accel", "gyro"
+                            ):
+                                continue
+                            sample["host_receive_monotonic_ns"] = received_at_ns
+                            sensor, tick = sample["sensor_type"], sample["timestamp_ticks"]
+                        sample_counts[sensor] += 1
+                        output = sample
+                        if args.paired:
+                            pair = pending_pairs.setdefault(tick, {})
+                            pair[sensor] = sample
+                            if len(pair) < 2:
+                                if len(pending_pairs) > 4096:
+                                    del pending_pairs[next(iter(pending_pairs))]
+                                    evicted_unpaired += 1
+                                continue
+                            a, g = pair["accel"], pair["gyro"]
+                            if binary_raw:
+                                _, _, ax, ay, az, astatus, asuid = a
+                                _, _, gx, gy, gz, gstatus, gsuid = g
+                            else:
+                                ax, ay, az, astatus, asuid = (
+                                    a["x"], a["y"], a["z"], a["status"], a["suid"]
+                                )
+                                gx, gy, gz, gstatus, gsuid = (
+                                    g["x"], g["y"], g["z"], g["status"], g["suid"]
+                                )
+                            output = {
+                                "sensor_type": "imu",
+                                "timestamp_ticks": tick,
+                                "tick_hz": 19200000,
+                                "ax": ax,
+                                "ay": ay,
+                                "az": az,
+                                "gx": gx,
+                                "gy": gy,
+                                "gz": gz,
+                                "accel_unit": "m/s^2",
+                                "gyro_unit": "rad/s",
+                                "accel_status": astatus,
+                                "gyro_status": gstatus,
+                                "accel_suid": asuid,
+                                "gyro_suid": gsuid,
+                                "host_receive_monotonic_ns": received_at_ns,
+                            }
+                            del pending_pairs[tick]
+                            paired_samples += 1
+                            if paired_samples == 1:
+                                live.mark('first_pair', at_ns=received_at_ns)
+                        line, datagram = _sample_outputs(
+                            output,
+                            write_json=sample_file is not None,
+                            udp_format=args.udp_format if udp else None,
+                        )
+                        if sample_file:
+                            sample_file.write(line)
+                        if udp:
+                            if udp_batch is not None:
+                                udp_batch.add(datagram)
+                            else:
+                                try:
+                                    udp.sendto(datagram, ("127.0.0.1", args.udp_port))
+                                    udp_sent += 1
+                                except (BlockingIOError, OSError):
+                                    udp_drops += 1
+        finally:
+            if udp_batch is not None:
+                try:
+                    udp_batch.flush()
+                finally:
+                    udp_sent += udp_batch.sent
+                    udp_drops += udp_batch.dropped
         live.progress()
         return decoded
 
