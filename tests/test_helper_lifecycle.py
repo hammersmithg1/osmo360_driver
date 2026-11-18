@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from osmo360_camera import Camera
 from osmo360_camera import _helper_lifecycle as m
+from test_helper_install import BOOT1, BOOT2
 
 
 class HelperLifecycleTests(unittest.TestCase):
@@ -39,6 +40,9 @@ class HelperLifecycleTests(unittest.TestCase):
         with patch.object(m, "install", return_value="installed") as install:
             self.assertEqual(camera.install_helpers(timeout=40), "installed")
             install.assert_called_once_with(camera, timeout=40)
+            install.reset_mock()
+            self.assertEqual(camera.install_helpers(timeout=40, previous_boot_id=BOOT1), 'installed')
+            install.assert_called_once_with(camera, timeout=40, previous_boot_id=BOOT1)
         with patch.object(m, "remove", return_value="removed") as remove:
             self.assertEqual(camera.remove_helpers(timeout=50), "removed")
             remove.assert_called_once_with(camera, timeout=50)
@@ -71,7 +75,8 @@ class HelperLifecycleTests(unittest.TestCase):
         receipt = self.receipt(
             already_installed=True,
             boot_cache=dict(
-                hydrated=True, boot_id="old-boot", profile="a" * 64, mode="bytes-only"
+                hydrated=True, boot_id="old-boot", profile="a" * 64, mode="bytes-only",
+                work='/dev/shm/osmo360-sdk-cache-' + 'a' * 12
             ),
         )
         with (
@@ -82,6 +87,54 @@ class HelperLifecycleTests(unittest.TestCase):
         self.assertTrue(result["already_installed"])
         camera.reboot.assert_not_called()
         verify.assert_not_called()
+
+    def test_public_known_previous_boot_mode_is_readonly_even_when_verification_fails(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                camera = self.camera()
+                proof = dict(boot_id=BOOT2, hydration_wait=dict(attempts=2))
+                with (patch.object(m.backend, 'package_profile', return_value=dict(manifest=dict(profile='a' * 64))),
+                      patch.object(m.backend, 'install') as install,
+                      patch.object(m.backend, 'verify_boot_cache', return_value=proof) as verify):
+                    if fails:
+                        verify.side_effect = TimeoutError('cache absent on known new boot')
+                        with self.assertRaises(m.HelperLifecycleError):
+                            m.install(camera, previous_boot_id=BOOT1)
+                    else:
+                        value = m.install(camera, previous_boot_id=BOOT1)
+                        self.assertTrue(value['verification_only'])
+                        self.assertFalse(value['reboot_attempted'])
+                        self.assertEqual((value['boot_id_before'], value['boot_id']), (BOOT1, BOOT2))
+                    install.assert_not_called()
+                    camera.reboot.assert_not_called()
+                    self.assertEqual(verify.call_args.kwargs['previous_boot_id'], BOOT1)
+
+    def test_pending_existing_cache_waits_without_reboot_but_ambiguous_absence_preserves_initial_recovery(self):
+        for pending in (True, False):
+            with self.subTest(pending=pending):
+                camera = self.camera()
+                cache = dict(hydrated=False, boot_id=BOOT1, profile='a' * 64)
+                if pending: cache.update(phase='pending', work='/dev/shm/osmo360-sdk-cache-' + 'a' * 12)
+                receipt = self.receipt(already_installed=True, boot_id=BOOT1, previous_boot_id=BOOT1, boot_cache=cache)
+                with (patch.object(m.backend, 'install', return_value=receipt),
+                      patch.object(m.backend, 'verify_boot_cache', return_value=dict(boot_id=BOOT1, hydration_wait=dict(attempts=2))) as wait,
+                      patch.object(m.backend, 'verify_installed', return_value=dict(boot_id=BOOT2)) as verify):
+                    result = m.install(camera)
+                self.assertTrue(result['already_installed'])
+                self.assertEqual(camera.reboot.call_count, 0 if pending else 1)
+                self.assertEqual(wait.call_count, 1 if pending else 0)
+                self.assertEqual(verify.call_count, 0 if pending else 1)
+
+    def test_invalid_installed_cache_is_not_rebooted_into_a_success_claim(self):
+        for cache in (dict(hydrated=True, boot_id=BOOT1, profile='a' * 64, mode='bytes-only', work='/tmp/foreign'),
+                      dict(hydrated=False, boot_id=BOOT1, profile='a' * 64, mode='bytes-only'),
+                      dict(hydrated=False, boot_id=BOOT1, profile='a' * 64, phase='pending')):
+            camera = self.camera()
+            with patch.object(m.backend, 'install', return_value=self.receipt(
+                    already_installed=True, boot_id=BOOT1, boot_cache=cache)):
+                with self.assertRaises(m.HelperLifecycleError):
+                    m.install(camera)
+            camera.reboot.assert_not_called()
 
     def test_install_rejects_capture_before_persistent_writes(self):
         camera = self.camera()

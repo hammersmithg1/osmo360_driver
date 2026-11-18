@@ -587,12 +587,30 @@ def verify_installed(
     camera, expected_profile, previous_boot_id, *, timeout=30, control=None, guard=None
 ):
     """Observe a new boot and the actual hydrate-only boot cache, without input."""
+    return verify_boot_cache(camera, expected_profile, previous_boot_id=previous_boot_id,
+        wait_for_boot_change=True, timeout=timeout, control=control, guard=guard)
+
+
+def verify_boot_cache(camera, expected_profile, *, previous_boot_id=None,
+                      current_boot_id=None, wait_for_boot_change=False,
+                      timeout=30, control=None, guard=None):
+    """Read-only hydration proof, pinned to one observed current camera boot.
+
+    A known previous boot selects verification only, never installation or a
+    power command. A pending cache on a known current boot may finish in place.
+    """
     budget = _Budget(timeout, control, guard)
-    if not _boot_id(previous_boot_id):
-        raise ValueError("Previous camera boot identity required")
+    if ((previous_boot_id is None) == (current_boot_id is None)
+            or previous_boot_id is not None and not _boot_id(previous_boot_id)
+            or current_boot_id is not None and not _boot_id(current_boot_id)):
+        raise ValueError('Exactly one valid previous/current camera boot identity required')
     package = package_profile()
     if expected_profile != package["manifest"]["profile"]:
         raise ValueError("Exact current packaged helper profile required")
+    evidence = dict(mode='after-known-reboot' if previous_boot_id else 'same-boot-pending',
+        boot_id_before=previous_boot_id or current_boot_id, boot_id_after=None,
+        attempts=0, observations=[], waited=current_boot_id is not None)
+    pinned = current_boot_id
     with camera._control_lock:
         calls = budget.calls(camera, control)
         control, deadline = calls.control, budget.deadline
@@ -603,23 +621,50 @@ def verify_installed(
             value = InstalledSources(package, timeout=remaining).status(
                 control, guard=budget.check, deadline=deadline, clock=budget.clock
             )
-            cache = value.get("boot_cache", {})
-            if (
-                value.get("boot_id") != previous_boot_id
-                and value["installed"]
-                and cache.get("hydrated") is True
-                and cache.get("boot_id") == value["boot_id"]
-                and cache.get("profile") == expected_profile
-                and cache.get("mode") == "bytes-only"
-                and cache.get("work")
-                == "/dev/shm/osmo360-sdk-cache-" + expected_profile[:12]
-            ):
-                budget.check()
-                return dict(value, autostart_hydration_verified=True)
-            if not value["installed"]:
+            if value.get('installed') is not True or value.get('profile') != expected_profile:
                 raise HelperInstallError(
                     "Installation vanished during the verified reboot", value
                 )
+            observed = value.get('boot_id')
+            if not _boot_id(observed):
+                raise HelperInstallError('Current helper boot identity is unavailable', value)
+            if observed == previous_boot_id and pinned is None and wait_for_boot_change:
+                evidence['waited'] = True
+                control.sleep(min(0.05, max(0, deadline - budget.clock())))
+                continue
+            if observed == previous_boot_id:
+                raise HelperInstallError('Camera helper boot did not change after reboot', value)
+            if pinned is None:
+                pinned = observed
+            if observed != pinned:
+                raise HelperInstallError('Camera boot changed during read-only hydration proof', value)
+            cache = value.get('boot_cache')
+            if (type(cache) is not dict or cache.get('boot_id') != pinned
+                    or cache.get('profile') != expected_profile
+                    or type(cache.get('hydrated')) is not bool):
+                raise HelperInstallError('Correlated current-boot helper cache required', value)
+            work = '/dev/shm/osmo360-sdk-cache-' + expected_profile[:12]
+            if cache.get('phase') not in (None, 'pending') or (
+                    cache.get('work') is not None and cache['work'] != work):
+                raise HelperInstallError('Unexpected helper cache phase/path', value)
+            evidence['attempts'] += 1
+            evidence['boot_id_after'] = pinned
+            evidence['observations'].append(dict(boot_id=pinned, hydrated=cache['hydrated'],
+                phase=cache.get('phase'), at=budget.clock()))
+            del evidence['observations'][:-8]
+            budget.check()
+            if cache['hydrated']:
+                if cache.get('phase') is not None or cache.get('mode') != 'bytes-only' or cache.get('work') != work:
+                    raise HelperInstallError('Canonical bytes-only boot cache required', value)
+                return dict(value, autostart_hydration_verified=True, hydration_wait=deepcopy(evidence))
+            if cache.get('mode') is not None:
+                raise HelperInstallError('Pending helper cache cannot claim a ready mode', value)
+            if (cache.get('phase') == 'pending' and cache.get('work') != work
+                    or cache.get('phase') is None and cache.get('work') is not None):
+                raise HelperInstallError('Missing/pending helper cache path is inconsistent', value)
+            if current_boot_id is not None and cache.get('phase') != 'pending':
+                raise HelperInstallError('Previously pending helper cache disappeared', value)
+            evidence['waited'] = True
             control.sleep(min(0.05, max(0, deadline - budget.clock())))
 
 

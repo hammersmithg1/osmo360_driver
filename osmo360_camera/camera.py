@@ -500,16 +500,19 @@ class Camera:
         )
         return self._usb_stream
 
-    def install_helpers(self, *, timeout=180):
+    def install_helpers(self, *, timeout=180, previous_boot_id=None):
         """Установить постоянный код и проверить автозагрузку после reboot.
 
         Вызывать один раз вне активного потока. Состояние сессии и параметры
         камеры не сохраняются в пакете; после каждого boot они создаются заново.
         Повторный вызов для проверенной установки не перезагружает камеру.
+        ``previous_boot_id`` проверяет автозагрузку после известного reboot:
+        этот режим только читает и никогда не устанавливает код/не перезагружает.
         """
         from ._helper_lifecycle import install
 
-        return install(self, timeout=timeout)
+        return install(self, timeout=timeout,
+                       **({} if previous_boot_id is None else {'previous_boot_id': previous_boot_id}))
 
     def remove_helpers(self, *, timeout=180):
         """Удалить наши компоненты и проверить штатное состояние после reboot.

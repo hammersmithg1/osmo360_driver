@@ -106,6 +106,42 @@ class RuntimeTests(unittest.TestCase):
         session.wake.assert_called_once()
         session.close.assert_not_called()
 
+    def test_explicit_reboot_clears_stale_preparation_then_only_verifies_known_new_boot(self):
+        old, new, profile = '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'a' * 64
+        owner = self.settings_owner()
+        owner.helpers_ready = False
+        owner.camera.install_helpers.return_value.update(boot_id=old, profile=profile,
+                                                        installation=dict(boot_id='older-unverified-boot'))
+        owner.prepare_helpers()
+        self.assertEqual(owner._verified_helpers, dict(boot_id=old, profile=profile))
+        owner.close_stream = Mock()
+        owner.read_settings = Mock()
+        owner.host_offset_ns = 12345
+        owner.camera.reboot = Mock()
+        owner.execute('reboot', None)
+        self.assertFalse(owner.helpers_ready)
+        self.assertFalse(owner.preparation['autostart_hydration_verified'])
+        self.assertNotIn('boot_id', owner.preparation)
+        self.assertEqual(owner.preparation['boot_id_before'], old)
+        owner.camera.install_helpers.return_value.update(boot_id=new, boot_id_before=old,
+            hydration_wait=dict(mode='after-known-reboot', attempts=2), verification_only=True)
+        owner.activate()
+        owner.camera.install_helpers.assert_called_with(timeout=180, previous_boot_id=old)
+        self.assertEqual(owner._verified_helpers['boot_id'], new)
+        self.assertEqual(owner.preparation['boot_id'], new)
+        self.assertFalse(owner.preparation['reboot_attempted'])
+        owner.camera.reboot.assert_called_once_with(timeout=90)
+
+    def test_known_reboot_verification_cannot_be_silently_skipped_by_ordinary_readiness_probe(self):
+        owner = self.settings_owner()
+        owner.helpers_ready = False
+        previous = '11111111-1111-1111-1111-111111111111'
+        owner._helpers_previous_boot_id = previous
+        owner.camera.state.side_effect = RequestTimeout('early ordinary GET')
+        owner.prepare_helpers()
+        owner.camera.install_helpers.assert_called_once_with(timeout=180, previous_boot_id=previous)
+        owner.camera.state.assert_not_called()
+
     def test_real_program_snapshot_with_unset_shutter_starts_readers(self):
         owner = self.settings_owner()
         owner.activate()

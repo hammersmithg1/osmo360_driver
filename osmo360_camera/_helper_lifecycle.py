@@ -92,8 +92,10 @@ def _reboot(camera, receipt, remaining, report):
     camera.connect(timeout=min(45, remaining()))
 
 
-def install(camera, *, timeout=180, clock=time.monotonic):
+def install(camera, *, timeout=180, previous_boot_id=None, clock=time.monotonic):
     remaining = _budget(timeout, clock)
+    if previous_boot_id is not None and not backend._boot_id(previous_boot_id):
+        raise ValueError('Verified previous helper boot identity required')
     report = dict(operation="install_helpers", installed=False, reboot_attempted=False)
     control = None
     with camera._control_lock:
@@ -102,6 +104,17 @@ def install(camera, *, timeout=180, clock=time.monotonic):
         if camera.state().recording_state != 0:
             raise RuntimeError("Installing helpers requires Record0")
         try:
+            if previous_boot_id is not None:
+                profile = backend.package_profile()['manifest']['profile']
+                report.update(verification_only=True, boot_id_before=previous_boot_id, profile=profile)
+                verified = backend.verify_boot_cache(camera, profile,
+                    previous_boot_id=previous_boot_id, timeout=remaining(), guard=remaining)
+                remaining()
+                report.update(installed=True, already_installed=True, profile=profile,
+                    autostart_hydration_verified=True, verification=verified,
+                    boot_id_before=previous_boot_id, boot_id=verified['boot_id'],
+                    hydration_wait=verified['hydration_wait'], verification_only=True)
+                return report
             receipt = backend.install(camera, timeout=remaining(), guard=remaining)
             remaining()
             control = receipt.get("_control")
@@ -109,7 +122,23 @@ def install(camera, *, timeout=180, clock=time.monotonic):
                 key: value for key, value in receipt.items() if not key.startswith("_")
             }
             report["installation"] = deepcopy(public)
+            report['already_installed'] = receipt.get('already_installed') is True
+            report['boot_id_before'] = receipt['boot_id']
             cache = receipt.get("boot_cache", {})
+            if receipt.get('already_installed') is True:
+                if (type(cache) is not dict or type(cache.get('hydrated')) is not bool
+                        or cache.get('boot_id') != receipt.get('boot_id')
+                        or cache.get('profile') != receipt.get('profile')
+                        or cache.get('phase') not in (None, 'pending')):
+                    raise RuntimeError('Installed helper cache identity is unverified; no reboot')
+                expected_work = '/dev/shm/osmo360-sdk-cache-' + receipt['profile'][:12]
+                if (cache.get('work') is not None and cache['work'] != expected_work
+                        or cache['hydrated'] and (cache.get('mode') != 'bytes-only'
+                            or cache.get('phase') is not None or cache.get('work') != expected_work)
+                        or not cache['hydrated'] and (cache.get('mode') is not None
+                            or cache.get('phase') == 'pending' and cache.get('work') != expected_work
+                            or cache.get('phase') is None and cache.get('work') is not None)):
+                    raise RuntimeError('Installed helper cache path/mode is unverified; no reboot')
             ready = (
                 receipt.get("already_installed") is True
                 and cache.get("hydrated") is True
@@ -124,7 +153,20 @@ def install(camera, *, timeout=180, clock=time.monotonic):
                     already_installed=True,
                     autostart_hydration_verified=True,
                     profile=receipt["profile"],
+                    boot_id=receipt['boot_id'],
                 )
+                return report
+            pending = (receipt.get('already_installed') is True
+                and cache.get('hydrated') is False and cache.get('phase') == 'pending'
+                and cache.get('boot_id') == receipt.get('boot_id')
+                and cache.get('profile') == receipt.get('profile'))
+            if pending:
+                verified = backend.verify_boot_cache(camera, receipt['profile'],
+                    current_boot_id=receipt['boot_id'], timeout=remaining(), control=control, guard=remaining)
+                remaining()
+                report.update(installed=True, autostart_hydration_verified=True,
+                    profile=receipt['profile'], boot_id=verified['boot_id'],
+                    verification=verified, hydration_wait=verified['hydration_wait'])
                 return report
             remaining()
             _reboot(camera, receipt, remaining, report)
@@ -141,6 +183,8 @@ def install(camera, *, timeout=180, clock=time.monotonic):
                 profile=receipt["profile"],
                 autostart_hydration_verified=True,
                 verification=verified,
+                boot_id=verified['boot_id'],
+                hydration_wait=verified.get('hydration_wait'),
             )
             return report
         except Exception as error:

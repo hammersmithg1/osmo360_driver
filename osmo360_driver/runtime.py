@@ -82,6 +82,8 @@ class OsmoCamera:
         self.command_started_at = None
         self.preparation = {}
         self.helpers_ready = False
+        self._verified_helpers = None
+        self._helpers_previous_boot_id = None
         self.state = 'disconnected'
         self.settings = {}
         self.settings_error = ''
@@ -144,29 +146,37 @@ class OsmoCamera:
         if self.helpers_ready:
             return
         self.state = 'checking_helpers'
-        try:
-            # A retained sleeping owner can answer AMT while ordinary camera
-            # services are asleep. Let usb_stream discover/wake it; do not
-            # block that SDK path behind connect(timeout=30) or an installer.
-            self.camera.state(timeout=1)
-            self.camera.system_mode(timeout=1)
-        except (RequestTimeout, CameraDisconnected):
-            return
-        except CameraReplyError as exc:
-            if exc.status in (0xE0, 0xE3):
+        previous = getattr(self, '_helpers_previous_boot_id', None)
+        if previous is None:
+            try:
+                # An existing sleeping owner can answer AMT while ordinary
+                # services sleep; let usb_stream discover/wake that owner.
+                self.camera.state(timeout=1)
+                self.camera.system_mode(timeout=1)
+            except (RequestTimeout, CameraDisconnected):
                 return
-            raise
+            except CameraReplyError as exc:
+                if exc.status in (0xE0, 0xE3):
+                    return
+                raise
+        # After our explicit reboot the operation is verify-only. Do not
+        # silently skip its required current-boot proof on an early GET.
         self.state = 'preparing_helpers'
         try:
-            report = self.camera.install_helpers(timeout=180)
+            report = self.camera.install_helpers(timeout=180,
+                **({} if previous is None else {'previous_boot_id': previous}))
         except Exception as exc:
             self.preparation = json_value(getattr(exc, 'report', {}))
             raise
         self.preparation = {key: report.get(key) for key in
-                            ('installed', 'already_installed', 'autostart_hydration_verified', 'reboot_attempted')}
+                            ('installed', 'already_installed', 'autostart_hydration_verified', 'reboot_attempted',
+                             'profile', 'boot_id_before', 'boot_id', 'hydration_wait', 'verification_only')}
         if not self.preparation['installed'] or not self.preparation['autostart_hydration_verified']:
             raise RuntimeError('SDK не подтвердил установку и автозапуск служебных скриптов Osmo')
         self.helpers_ready = True
+        if report.get('boot_id') and report.get('profile'):
+            self._verified_helpers = dict(boot_id=report['boot_id'], profile=report['profile'])
+        self._helpers_previous_boot_id = None
 
     def read_settings(self, *, strict=True):
         cam = self.camera
@@ -333,12 +343,19 @@ class OsmoCamera:
             self.state = 'sleeping'
         elif action == 'reboot':
             self.require_session_state()
+            verified_helpers = getattr(self, '_verified_helpers', None)
             if self.stream is not None and self.stream.state == 'SLEEP':
                 self.state = 'waking'
                 self.stream.wake()
             self.close_stream()
             self.connect()
             self.state = 'rebooting'
+            self.helpers_ready = False
+            self._helpers_previous_boot_id = (verified_helpers or {}).get('boot_id')
+            self.preparation = dict(installed=verified_helpers is not None,
+                already_installed=verified_helpers is not None, autostart_hydration_verified=False,
+                reboot_attempted=False, boot_id_before=self._helpers_previous_boot_id,
+                profile=(verified_helpers or {}).get('profile'))
             self.camera.reboot(timeout=90)
             self.clock = CameraClock(self.host_offset_ns)
             self.read_settings(strict=False)
