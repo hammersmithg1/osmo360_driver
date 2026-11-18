@@ -28,8 +28,8 @@ import time
 import types
 
 WORK = r'/dev/shm/osmo-retained-sleep060-([0-9a-f]{12})'
-OWNER_SHA = '9529f3ee74274b5458a4dcda670a1efc94e6c607b7e65971629d03de7058aeb8'
-SOURCES = {'prepared_preview_wake_047.py': '246c4e253c07c675f4992b6b4ec494fda3c2d973ad7ad91801134203e569d3a5',
+OWNER_SHA = '5a2199c2120a35f1b1b20bb22315dbd5b54b5e4ba89a2a9cd9f35afb77ef088e'
+SOURCES = {'prepared_preview_wake_047.py': '51f266b3382a82901469ad3f710b9a16a6c02999caa7d6b2eba73197d55a7337',
            'prepared_preview_wake_045.py': '33c8a2a1af90fe94dd7c93b58d4f15234b5c5dc0f35e088420c16c1118a654fc'}
 NAMES = {'apply.sh', 'rollback.sh', 'watchdog.sh', 'lifecycle.py', 'netdev.py', 'lease.py', 'ecm_dhcp.py'}
 FUNCTIONS = ('ffs.diag', 'ffs.bulk', 'ffs.bulk1', 'ffs.bulk5', 'ffs.bulk4', 'ecm.ecm')

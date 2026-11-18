@@ -58,8 +58,8 @@ with Camera().connect(timeout=30) as cam:
 Установка выполняется вне активного потока, при `recording_state == 0`.
 
 Если новая версия SDK требует другой helper-профиль, сначала явно выполните
-`examples/helpers.py remove`, затем `examples/helpers.py install` текущей версией
-SDK. Обе операции проверяют штатную перезагрузку камеры; работающий owner
+`examples/helpers.py remove` прежней версией SDK, затем обновите SDK и выполните
+`examples/helpers.py install`. Обе операции проверяют штатную перезагрузку камеры; работающий owner
 не заменяется на месте. Новая камера по-прежнему требует только `install`.
 
 `remove_helpers()` закрывает принадлежащие этой `Camera` потоки, удаляет наш

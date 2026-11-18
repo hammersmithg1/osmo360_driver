@@ -40,7 +40,7 @@ from .vendor.util import bind_socket
 
 HELPER = "retained_sleep_060.py"
 # The camera source is installed only after its independent source/HW review.
-HELPER_SHA = "e9d066ff0b47f509c72c0cd3a672893e51487f748645f67745fc1cdfe335546d"
+HELPER_SHA = "5ebe2cbadab062b8986654bceb9151252c90300f579f7b44372085166542b579"
 SOURCES = dict(BASE_SOURCES, **{HELPER: HELPER_SHA})
 Q = shlex.quote
 QUERY = struct.Struct("!8s16sQ")

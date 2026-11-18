@@ -23,7 +23,7 @@ from ._amt_codec import decode_reply, result_payload
 from ._usb_bootstrap import USBBootstrap, BootstrapError
 
 SOURCES = {
-    "usb_standby_owner.py": "9529f3ee74274b5458a4dcda670a1efc94e6c607b7e65971629d03de7058aeb8",
+    "usb_standby_owner.py": "5a2199c2120a35f1b1b20bb22315dbd5b54b5e4ba89a2a9cd9f35afb77ef088e",
     "gui_qs_exit_forward_probe.py": "9db827623c2e7f9767fc8a52ba5dfc601a768fafdbc1687666b1cbe7cf26e959",
 }
 SYS_SHA = "f2fc2a40b8c10b0d1a8289089bb0ab6700372fa062404f44c3dcac00ad513029"

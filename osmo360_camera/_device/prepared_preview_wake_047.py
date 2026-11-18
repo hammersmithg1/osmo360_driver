@@ -14,7 +14,7 @@ import sys
 import types
 
 BASE_SHA = '33c8a2a1af90fe94dd7c93b58d4f15234b5c5dc0f35e088420c16c1118a654fc'
-OWNER_SHA = '9529f3ee74274b5458a4dcda670a1efc94e6c607b7e65971629d03de7058aeb8'
+OWNER_SHA = '5a2199c2120a35f1b1b20bb22315dbd5b54b5e4ba89a2a9cd9f35afb77ef088e'
 WORK = r'/dev/shm/osmo-prepared-preview047-([0-9a-f]{12})'
 STANDBY_WORK = r'/dev/shm/osmo-usb-standby-([0-9a-f]{12})'
 

@@ -31,11 +31,11 @@ HOOK_SHA = '483881c9dd76d249f82fb1a7264aa0aa3249b23bf75b9a5241c797eb65a2042d'
 PARENT_SHA = '6cc12ac2c4e78c6d6d582aae49b03213c2867732b3e2703a3ec321ac9060c682'
 SYS_SHA = 'f2fc2a40b8c10b0d1a8289089bb0ab6700372fa062404f44c3dcac00ad513029'
 FILES = {
-    'usb_standby_owner.py': '9529f3ee74274b5458a4dcda670a1efc94e6c607b7e65971629d03de7058aeb8',
+    'usb_standby_owner.py': '5a2199c2120a35f1b1b20bb22315dbd5b54b5e4ba89a2a9cd9f35afb77ef088e',
     'gui_qs_exit_forward_probe.py': '9db827623c2e7f9767fc8a52ba5dfc601a768fafdbc1687666b1cbe7cf26e959',
-    'prepared_preview_wake_047.py': '246c4e253c07c675f4992b6b4ec494fda3c2d973ad7ad91801134203e569d3a5',
+    'prepared_preview_wake_047.py': '51f266b3382a82901469ad3f710b9a16a6c02999caa7d6b2eba73197d55a7337',
     'prepared_preview_wake_045.py': '33c8a2a1af90fe94dd7c93b58d4f15234b5c5dc0f35e088420c16c1118a654fc',
-    'retained_sleep_060.py': 'e9d066ff0b47f509c72c0cd3a672893e51487f748645f67745fc1cdfe335546d',
+    'retained_sleep_060.py': '5ebe2cbadab062b8986654bceb9151252c90300f579f7b44372085166542b579',
 }
 GROUPS = {'owner': tuple(FILES)[:2], 'prepared': tuple(FILES)[2:4],
           'retained': tuple(FILES)[2:]}
@@ -442,7 +442,7 @@ def stage(profile, group, destination, boot_id):
     patterns = {
         'owner': re.escape(str(RAM)) + r'/osmo-usb-standby-[0-9a-f]{12}',
         'prepared': re.escape(str(RAM)) + r'/osmo-prepared-assets-[0-9a-f]{12}',
-        'retained': re.escape(str(RAM)) + r'/osmo-usb-standby-[0-9a-f]{12}/retained-assets-e9d066ff0b47',
+        'retained': re.escape(str(RAM)) + r'/osmo-usb-standby-[0-9a-f]{12}/retained-assets-5ebe2cbadab0',
     }
     if not re.fullmatch(patterns[group], str(destination)):
         raise ValueError('Exact existing RAM destination required')

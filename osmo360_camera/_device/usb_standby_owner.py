@@ -188,7 +188,6 @@ class GuiCursor:
         return time.mktime((year, month, day, hour, minute, second, 0, 0, -1)) + millis / 1000
 
     def poll(self, after, now=None):
-        now = time.time() if now is None else now
         info, opened = self.path.stat(), os.fstat(self.fd)
         if ((info.st_dev, info.st_ino) != self.inode or (opened.st_dev, opened.st_ino) != self.inode
                 or opened.st_size < self.offset):
@@ -197,6 +196,10 @@ class GuiCursor:
         if self.bytes + count > MAX_LOG:
             raise ValueError('GUI appended read exceeds1MiB')
         data = os.pread(self.fd, count, self.offset)
+        # A writer may append between this poll's metadata reads and pread.
+        # Timestamp the completed read, so valid newly read events are not
+        # permanently discarded against an upper bound sampled too early.
+        now = time.time() if now is None else now
         self.offset += len(data)
         self.bytes += len(data)
         lines = (self.partial + data).split(b'\n')
