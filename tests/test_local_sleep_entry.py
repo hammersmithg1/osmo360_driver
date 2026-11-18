@@ -47,7 +47,7 @@ class Environment:
             pid=9876,
             _process=SimpleNamespace(pid=9876, poll=lambda: 0),
             stats={"collector_returncode": 0},
-            report={"restored": True, "errors": []},
+            report={"restored": True, "quiescent": True, "errors": []},
             _closed=True,
             _receiver_done=receiver_done,
             _threads=[SimpleNamespace(is_alive=lambda: False)],
@@ -236,6 +236,9 @@ class LocalSleepProofTests(unittest.TestCase):
             lambda env: env.imu.stats.update(collector_returncode=1),
             lambda env: env.imu.stats.update(collector_returncode=False),
             lambda env: env.imu.report.update(restored=False),
+            lambda env: env.imu.report.pop("quiescent"),
+            lambda env: env.imu.report.update(quiescent=False),
+            lambda env: env.imu.report.update(quiescent=1),
             lambda env: env.imu.report.update(errors=["mask unknown"]),
             lambda env: setattr(env.imu, "_closed", False),
             lambda env: env.imu._receiver_done.clear(),
@@ -320,7 +323,7 @@ class LocalSleepProofTests(unittest.TestCase):
         actual = IMUStream()
         actual._process = SimpleNamespace(pid=12345, poll=lambda: 0)
         actual._closed = actual._started = actual._stop_requested = True
-        actual._report = {"restored": True, "errors": []}
+        actual._report = {"restored": True, "quiescent": True, "errors": []}
         actual._receiver_done.set()
         actual._threads = [SimpleNamespace(is_alive=lambda: False)]
         actual._socket = SimpleNamespace(fileno=lambda: -1)

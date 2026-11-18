@@ -185,7 +185,7 @@ class FastSleepTests(unittest.TestCase):
             send_signal=lambda signal: None,
         )
         imu._started = True
-        imu._report = dict(restored=True, errors=[])
+        imu._report = dict(restored=True, quiescent=True, errors=[])
         imu._receiver_done.set()
         imu._socket = types.SimpleNamespace(fileno=lambda: -1)
         session._imu = env.camera._imu = imu

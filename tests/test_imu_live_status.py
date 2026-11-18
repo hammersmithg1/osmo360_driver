@@ -185,9 +185,12 @@ class LiveCollectorTests(unittest.TestCase):
         self.assertEqual(fatal['paired_samples'], 0)
         labels = [event['event'] for event in events]
         self.assertLess(labels.index('cleanup_started'), labels.index('fatal_read'))
-        self.assertEqual(result, 0)
+        # Restoring the mask on a failed reader does not prove an idle DATA
+        # channel. Preserve the mask receipt while rejecting USB handoff.
+        self.assertEqual(result, 1)
         self.assertTrue(report['restored'])
-        self.assertEqual(report['errors'], [])
+        self.assertFalse(report['quiescent'])
+        self.assertIn('Original DIAG reader failed', report['errors'][0])
         self.assertEqual(usb.operations, [4, 3, 4, 3, 3, 4])  # Existing restore retry only.
 
     def status_line(self, **changes):
@@ -225,6 +228,9 @@ class LiveCollectorTests(unittest.TestCase):
                         {'ssc_packets': 2**65}, {'fatal_read_status': 'USB error'}, {'raw_mask': 'private'}):
             with self.subTest(changes=changes):
                 self.assertIsNone(imu._collector_status(self.status_line(**changes)))
+        self.assertIsNone(imu._collector_status(self.status_line(quiescent=1)))
+        self.assertIsNotNone(imu._collector_status(self.status_line(
+            event='drain_verified', phase='cleanup', quiescent=True)))
         self.assertIsNone(imu._collector_status(imu.LIVE_PREFIX + '{broken'))
         self.assertIsNone(imu._collector_status(imu.LIVE_PREFIX + '[' + '0,' * 3000 + '0]'))
 

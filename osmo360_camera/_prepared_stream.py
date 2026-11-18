@@ -729,8 +729,8 @@ class PreparedStream:
     def abandon_local(self):
         """No D1/rollback/IP deletion; lease watchdog and role owner remain.
 
-        Mask restoration is a barrier before stopping local heartbeat. An
-        unknown mask keeps heartbeat and IP available for the collector.
+        Mask restoration and a quiet DIAG endpoint precede heartbeat stop.
+        Unknown proof keeps heartbeat and IP available for the collector.
         """
         error = None
         if self.imu is not None:
@@ -740,13 +740,14 @@ class PreparedStream:
                 proof, error = self.imu.report, failure
             code = self.imu.stats.get("collector_returncode")
             if not (
-                (proof is None and self.imu.pid is None and not self.imu_started)
+                (proof is None and self.imu.pid is None)
                 or isinstance(proof, dict)
                 and proof.get("restored") is True
+                and proof.get("quiescent") is True
                 and type(code) is int
             ):
                 raise PreparedStreamError(
-                    "IMU mask unknown; retain lease heartbeat and IP"
+                    "IMU mask or quiescence unknown; retain lease heartbeat and IP"
                 ) from error
             self.report["local_imu_stop"] = proof
         if self.preview is not None and self.preview._stream is not None:

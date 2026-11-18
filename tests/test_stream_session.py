@@ -7,6 +7,7 @@ import unittest
 
 from osmo360_camera import _app
 from osmo360_camera import _stream_session as m
+from osmo360_camera.imu import IMUStopError
 
 PRESENT = bytes.fromhex("12004400012300415050000000000002")
 ABSENT = bytes.fromhex("1200550000")
@@ -33,6 +34,7 @@ class Capture:
         self.report = dict(restored=False)
         self._stream = self
         self.pause_ok = self.mask_ok = True
+        self.quiescent = True
 
     def start(self):
         self.env.events.append(self.kind + ".start")
@@ -56,6 +58,8 @@ class Capture:
         self.report = dict(
             restored=self.mask_ok if self.kind == "imu" else True, errors=[]
         )
+        if self.kind == "imu":
+            self.report["quiescent"] = self.quiescent
         return self.report
 
 
@@ -359,6 +363,58 @@ class SessionTests(unittest.TestCase):
             self.s.close()
         self.assertFalse(self.env.control.detached)
         self.assertFalse(self.env.control.finalized)
+
+    def test_missing_or_false_quiescence_blocks_sleep_and_close_without_losing_owner(self):
+        for quiet in (None, False, 1):
+            with self.subTest(quiet=quiet):
+                env = Environment()
+                session = env.session().start()
+                imu = session._imu
+                stop = imu.stop
+
+                def unquiet_stop(**options):
+                    report = stop(**options)
+                    if quiet is None:
+                        report.pop("quiescent")
+                    else:
+                        report["quiescent"] = quiet
+                    return report
+
+                imu.stop = unquiet_stop
+                env.events.clear()
+                with self.assertRaises(m.StreamSessionError):
+                    session.sleep()
+                with self.assertRaises(m.StreamSessionError):
+                    session.close()
+                self.assertIs(session._imu, imu)
+                self.assertTrue(session.owns_camera_resources)
+                self.assertFalse(session.cleanup_safe)
+                self.assertFalse(env.control.detached)
+                self.assertFalse(env.control.finalized)
+                for forbidden in ("preview.stop", "prepared.prepare", "owner.sleep"):
+                    self.assertNotIn(forbidden, env.events)
+
+    def test_collector_drain_failure_report_is_preserved_before_close_reraises(self):
+        self.s.start()
+        imu = self.s._imu
+        imu.report = dict(restored=True, quiescent=False,
+                          drain=dict(verified=False, error='quiet deadline'),
+                          errors=['DIAG endpoint not quiescent'])
+        original = IMUStopError('DIAG endpoint not quiescent')
+
+        def fail_stop(**options):
+            raise original
+
+        imu.stop = fail_stop
+        self.env.events.clear()
+        with self.assertRaises(m.StreamSessionError) as caught:
+            self.s.close()
+        self.assertIs(caught.exception.__cause__, original)
+        self.assertEqual(self.s.report['last_imu_stop'], imu.report)
+        self.assertFalse(self.s.report['last_imu_stop']['quiescent'])
+        self.assertNotIn('preview.stop', self.env.events)
+        self.assertTrue(self.s.owns_camera_resources)
+        self.assertFalse(self.env.control.detached)
 
     def test_default_close_stable_sleep_cancels_unarmed_plan_and_detaches_without_reboot(
         self,

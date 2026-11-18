@@ -349,9 +349,15 @@ class Camera:
                 report = imu.stop(timeout=remaining())
                 if (report is None and imu.pid is not None) or (
                     report is not None
-                    and (report.get("restored") is not True or report.get("errors"))
+                    and (
+                        report.get("restored") is not True
+                        or report.get("quiescent") is not True
+                        or report.get("errors")
+                    )
                 ):
-                    raise failure("Owned IMU mask restoration was not verified")
+                    raise failure(
+                        "Owned IMU mask restoration and DIAG quiescence were not verified"
+                    )
                 self._imu = None
             # Recheck after IMU cleanup; another camera controller may have
             # started recording while the collector restored its mask.
@@ -795,7 +801,19 @@ class Camera:
                 errors.append(f"Preview: {exc}")
         if self._imu is not None:
             try:
-                self._imu.stop()
+                imu = self._imu
+                report = imu.stop()
+                if (report is None and imu.pid is not None) or (
+                    report is not None
+                    and (
+                        report.get("restored") is not True
+                        or report.get("quiescent") is not True
+                        or report.get("errors")
+                    )
+                ):
+                    raise CameraError(
+                        "Owned IMU mask restoration and DIAG quiescence were not verified"
+                    )
                 self._imu = None
             except Exception as exc:
                 errors.append(f"IMU: {exc}")

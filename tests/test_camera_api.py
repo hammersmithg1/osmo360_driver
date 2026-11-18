@@ -707,6 +707,9 @@ class CameraFacadeTests(unittest.TestCase):
 
     def test_successful_close_releases_owned_imu_before_reconnect(self):
         first, second = Mock(), Mock()
+        for imu in (first, second):
+            imu.pid = None
+            imu.stop.return_value = None
         with patch("osmo360_camera.camera.IMUStream", side_effect=[first, second]):
             camera = self.camera()
             self.assertIs(camera.imu(queue_size=10), first)
@@ -718,6 +721,18 @@ class CameraFacadeTests(unittest.TestCase):
             self.assertIs(camera.imu(), second)
             camera.close()
             second.stop.assert_called_once()
+
+    def test_close_retains_collector_when_custom_stop_only_reports_restored_mask(self):
+        for proof in ({"restored": True, "errors": []},
+                      {"restored": True, "quiescent": False, "errors": []}):
+            with self.subTest(proof=proof):
+                camera = self.camera()
+                imu = camera._imu = Mock(pid=123)
+                imu.stop.return_value = proof
+                with self.assertRaisesRegex(CameraError, "quiescence"):
+                    camera.close()
+                self.assertIs(camera._imu, imu)
+                self.assertFalse(self.fake.connected)
 
 
 if __name__ == "__main__":

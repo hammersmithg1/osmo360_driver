@@ -115,7 +115,7 @@ class IMU:
         if self.stop_error:
             raise self.stop_error
         if self.pid is not None:
-            self.report = dict(restored=True, errors=[])
+            self.report = dict(restored=True, quiescent=True, errors=[])
             self.stats["collector_returncode"] = 0
         return self.report
 
@@ -502,6 +502,41 @@ class PreparedTests(unittest.TestCase):
         self.assertIsNone(self.camera._imu)
         self.assertIsNone(self.camera._usb_preview)
         self.assertEqual(self.control.commands, [])
+
+    def test_abandon_local_never_drops_heartbeat_with_missing_or_false_quiescence(self):
+        for proof in (
+            dict(restored=True, errors=[]),
+            dict(restored=True, quiescent=False, errors=[]),
+            dict(restored=True, quiescent=1, errors=[]),
+        ):
+            with self.subTest(proof=proof):
+                self.setUp()
+                value = self.armed()
+                value.attach_data_first(native_floor_ns=0, wake_host_ns=0)
+                value.imu.stats['collector_returncode'] = 0
+                value.imu.stop = Mock(return_value=proof)
+                self.events.clear()
+                commands = list(self.control.commands)
+                with self.assertRaisesRegex(m.PreparedStreamError, 'quiescence'):
+                    value.abandon_local()
+                self.assertEqual(self.events, [])
+                self.assertEqual(self.control.commands, commands)
+                self.assertTrue(value.preview._lease.healthy)
+                self.assertFalse(value.abandoned)
+                self.assertIs(self.camera._imu, value.imu)
+                self.assertIs(self.camera._usb_preview, value.preview)
+
+    def test_failed_start_before_collector_spawn_can_abandon_unstarted_placeholder(self):
+        value = self.armed()
+        value.imu.start = Mock(side_effect=RuntimeError('no collector was spawned'))
+        with self.assertRaisesRegex(RuntimeError, 'no collector'):
+            value.attach_data_first(native_floor_ns=0, wake_host_ns=0)
+        self.assertTrue(value.imu_started)
+        self.assertIsNone(value.imu.pid)
+        self.assertIsNone(value.imu.report)
+        result = value.abandon_local()
+        self.assertTrue(result['local_abandoned'])
+        self.assertFalse(value.preview._lease.healthy)
 
     def test_camera_link_commands_create_real_hardlinks_exclusively_and_reject_symlinks_or_writable_sources(
         self,

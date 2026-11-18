@@ -24,6 +24,7 @@ def _collector_closed(imu):
         and imu.stats["collector_returncode"] == 0
         and type(report) is dict
         and report.get("restored") is True
+        and report.get("quiescent") is True
         and not report.get("errors")
         and imu._closed is True
         and imu._receiver_done.is_set()

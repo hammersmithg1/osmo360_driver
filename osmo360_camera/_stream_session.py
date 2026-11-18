@@ -455,19 +455,24 @@ class USBStreamSession:
         return (
             type(stopped) is dict
             and stopped.get("restored") is True
+            and stopped.get("quiescent") is True
             and not stopped.get("errors")
             and type(imu.stats.get("collector_returncode")) is int
             and imu.stats["collector_returncode"] == 0
         )
 
     def _stop_active(self):
-        # Keep the lease/IP alive until DIAG explicitly restores its log mask.
+        # Keep lease/IP until DIAG restores its mask and proves a quiet endpoint.
         if self._imu is not None:
-            stopped = self._imu.stop(timeout=25)
+            try:
+                stopped = self._imu.stop(timeout=25)
+            except BaseException:
+                self.report["last_imu_stop"] = deepcopy(self._imu.report)
+                raise
             self.report["last_imu_stop"] = deepcopy(stopped)
             if not self._mask_proven(self._imu, stopped):
                 raise StreamSessionError(
-                    "IMU mask/process restoration not proven; lease retained",
+                    "IMU mask/quiescence/process restoration not proven; lease retained",
                     self.report,
                 )
             ticks = self._imu.stats.get("last_timestamp_ticks")
@@ -602,11 +607,15 @@ class USBStreamSession:
             raise StreamSessionError(
                 "Exact owned active capture required for fast Sleep", self.report
             )
-        stopped = imu.stop(timeout=25)
+        try:
+            stopped = imu.stop(timeout=25)
+        except BaseException:
+            self.report["last_imu_stop"] = deepcopy(imu.report)
+            raise
         self.report["last_imu_stop"] = deepcopy(stopped)
         if not self._mask_proven(imu, stopped) or not _collector_closed(imu):
             raise StreamSessionError(
-                "Original IMU mask/collector exit not proven", self.report
+                "Original IMU mask/quiescence/collector exit not proven", self.report
             )
         tick = imu.stats.get("last_timestamp_ticks")
         if type(tick) is int and tick >= 0:

@@ -6,7 +6,7 @@ import threading
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
-from osmo360_camera.camera import CameraState
+from osmo360_camera.camera import Camera, CameraError, CameraState
 from osmo360_camera._usb_bootstrap import USBRuntime, NATIVE_LINKS, PLACEHOLDER
 from osmo360_camera.imu import IMUStopError
 from osmo360_camera.usb_preview import USBPreview, USBPreviewError
@@ -18,18 +18,20 @@ class FakeIMU:
 
     def __init__(self, events, name="live", fail=False):
         self.events, self.name, self.fail = events, name, fail
+        self.quiescent = True
 
     def stop(self):
         self.events.append("imu.stop:" + self.name)
         return dict(
-            restored=not self.fail, errors=["mask failure"] if self.fail else []
+            restored=not self.fail, quiescent=self.quiescent,
+            errors=["mask failure"] if self.fail else []
         )
 
 
 class FaultedIMU:
     pid = 123
 
-    def __init__(self, events, *, restored=True, returncode=1):
+    def __init__(self, events, *, restored=True, quiescent=True, returncode=1):
         self.events = events
         self.error = IMUStopError(
             "Collector lost USB; streaming ended with returncode=1"
@@ -37,6 +39,7 @@ class FaultedIMU:
         self.stats = {"collector_returncode": returncode}
         self.report = dict(
             restored=restored,
+            quiescent=quiescent,
             errors=["DIAG read: NO_DEVICE"],
             original_last_item=8191,
             original_mask_hex="0000",
@@ -571,6 +574,83 @@ class USBPreviewLifecycleTests(TestCase):
             self.assertIs(case.preview.stop(), report)
             self.assertEqual(case.events.count("lease.close"), 1)
             self.assertEqual(case.events.count("imu.stop:faulted"), 1)
+
+    def test_mask_only_stop_cannot_close_lease_or_rollback_and_can_finish_once_quiet(self):
+        for proof in (
+            dict(restored=True, errors=[]),
+            dict(restored=True, quiescent=False, errors=[]),
+            dict(restored=True, quiescent=1, errors=[]),
+        ):
+            with self.subTest(proof=proof), harness() as case:
+                case.preview.start()
+                imu = case.camera._imu = FakeIMU(case.events)
+                imu.stop = mock.Mock(return_value=proof)
+                with self.assertRaisesRegex(USBPreviewError, "quiescence"):
+                    case.preview.stop()
+                self.assertIs(case.camera._imu, imu)
+                self.assertIs(case.camera._usb_preview, case.preview)
+                self.assertFalse(case.preview._closed)
+                self.assertTrue(case.state.lease.healthy)
+                self.assertTrue(case.state.host_alias)
+                for forbidden in ("lease.close", "session:rollback_once", "network.cleanup"):
+                    self.assertNotIn(forbidden, case.events)
+                proof["quiescent"] = True
+                self.assertTrue(case.preview.stop()["restored"])
+                self.assertEqual(case.events.count("lease.close"), 1)
+
+    def test_restored_fault_does_not_bypass_missing_or_failed_drain_proof(self):
+        for missing, quiet in ((True, True), (False, False), (False, 1)):
+            with self.subTest(missing=missing, quiet=quiet), harness() as case:
+                case.preview.start()
+                imu = case.camera._imu = FaultedIMU(case.events, quiescent=quiet)
+                if missing:
+                    del imu.report["quiescent"]
+                with self.assertRaises(IMUStopError) as caught:
+                    case.preview.stop()
+                self.assertIs(caught.exception, imu.error)
+                self.assertIs(case.camera._imu, imu)
+                self.assertIs(case.camera._usb_preview, case.preview)
+                self.assertFalse(case.preview._closed)
+                self.assertTrue(case.state.lease.healthy)
+                self.assertTrue(case.state.host_alias)
+                for forbidden in ("lease.close", "session:rollback_once", "network.cleanup"):
+                    self.assertNotIn(forbidden, case.events)
+
+    def test_new_apply_requires_quiet_old_collector_not_only_restored_mask(self):
+        with harness() as case:
+            imu = case.camera._imu = FakeIMU(case.events, "initial")
+            imu.quiescent = False
+            with self.assertRaisesRegex(USBPreviewError, "quiescence"):
+                case.preview.start()
+            self.assertIs(case.camera._imu, imu)
+            for forbidden in ("bootstrap:apply_once", "session:rollback_once", "lease.close"):
+                self.assertNotIn(forbidden, case.events)
+
+    def test_outer_camera_close_and_context_finally_preserve_unsafe_preview_owner(self):
+        for cleanup in ("close", "context"):
+            with self.subTest(cleanup=cleanup), harness() as case:
+                case.preview.start()
+                camera = Camera(transport=case.camera._transport)
+                camera._usb_preview = case.preview
+                case.preview.camera = camera
+                imu = camera._imu = FaultedIMU(case.events, quiescent=False)
+                if cleanup == "close":
+                    with self.assertRaises(CameraError):
+                        camera.close()
+                else:
+                    original = RuntimeError("application failed")
+                    with self.assertRaises(RuntimeError) as caught:
+                        with camera:
+                            raise original
+                    self.assertIs(caught.exception, original)
+                    self.assertIsInstance(original.camera_cleanup_error, CameraError)
+                self.assertIs(camera._imu, imu)
+                self.assertIs(camera._usb_preview, case.preview)
+                self.assertFalse(case.preview._closed)
+                self.assertTrue(case.state.lease.healthy)
+                self.assertTrue(case.state.host_alias)
+                for forbidden in ("lease.close", "session:rollback_once", "network.cleanup"):
+                    self.assertNotIn(forbidden, case.events)
 
     def test_imu_fault_without_completed_mask_proof_keeps_cleanup_dependencies(self):
         for restored, returncode in ((False, 1), (None, 1), (True, None), (True, True)):

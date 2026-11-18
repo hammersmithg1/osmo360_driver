@@ -38,7 +38,8 @@ from ._imu_wire import BINARY_PREFIX, TICK_HZ, unpack_sample
 READY_LINE = "Sensor log mask enabled; capture started"
 LIVE_PREFIX = 'OSMO_IMU_STATUS '
 _LIVE_EVENTS = {'progress', 'mask_verified', 'first_ssc', 'first_pair',
-                'fatal_read', 'cleanup_started', 'collector_finished'}
+                'fatal_read', 'cleanup_started', 'drain_verified', 'drain_failed',
+                'collector_finished'}
 _LIVE_PHASES = {'starting', 'capture', 'cleanup', 'finished'}
 _LIVE_COUNTS = {'usb_reads', 'usb_bytes', 'usb_timeouts', 'ssc_packets',
                 'accel_samples', 'gyro_samples', 'paired_samples',
@@ -58,7 +59,7 @@ def _collector_status(line):
         'schema', 'event', 'phase', 'monotonic_ns', 'last_read_status',
         'fatal_read_status', 'fatal_read_phase'}
     if (type(value) is not dict or not required <= value.keys()
-            or value.keys() - required - {'restored', 'error_count'}
+            or value.keys() - required - {'restored', 'quiescent', 'error_count'}
             or type(value['schema']) is not int or value['schema'] != 1
             or type(value['event']) is not str or type(value['phase']) is not str
             or value['event'] not in _LIVE_EVENTS or value['phase'] not in _LIVE_PHASES):
@@ -79,6 +80,7 @@ def _collector_status(line):
             type(value['fatal_read_phase']) is not str or value['fatal_read_phase'] not in _LIVE_PHASES):
         return None
     if ('restored' in value and type(value['restored']) is not bool
+            or 'quiescent' in value and type(value['quiescent']) is not bool
             or 'error_count' in value and not uint(value['error_count'])):
         return None
     return value
@@ -298,6 +300,13 @@ class IMUStream:
             result['collector_live_age_s'] = (max(0, time.monotonic() - self._collector_live_at)
                                                if self._collector_live_at is not None else None)
             result['collector_events'] = [dict(event) for event in self._collector_events]
+            # stop() has already read this final host-local report. Keep its
+            # separate mask/drain proof visible even when IMUStopError stops
+            # the outer lifecycle before it can publish last_imu_stop.
+            final = self._report if self._closed else None
+            result['cleanup'] = ({key: deepcopy(final.get(key))
+                                  for key in ('restored', 'quiescent', 'drain')}
+                                 if isinstance(final, dict) else None)
         first, last = result["first_timestamp_ticks"], result["last_timestamp_ticks"]
         result["observed_rate_hz"] = (
             (result["received"] - 1) * TICK_HZ / (last - first)
@@ -544,7 +553,7 @@ class IMUStream:
         return self.read()
 
     def stop(self, timeout: float | None = None) -> dict | None:
-        """SIGINT the owned collector and verify its original mask was restored.
+        """Restore the mask, drain this DIAG reader, then release its interface.
 
         On timeout the process is deliberately left alive to finish restoring;
         call stop again to wait longer. No SIGTERM/SIGKILL escalation occurs.
@@ -585,10 +594,11 @@ class IMUStream:
             code != 0
             or not report
             or report.get("restored") is not True
+            or report.get("quiescent") is not True
             or report.get("errors")
         ):
             self._stop_error = self._failure(
-                f"DIAG restoration/clean exit not verified (returncode={code})"
+                f"DIAG restoration/quiescence/clean exit not verified (returncode={code})"
             )
             raise IMUStopError(self._stop_error)
         return report

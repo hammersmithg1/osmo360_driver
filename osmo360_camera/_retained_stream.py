@@ -755,13 +755,16 @@ class RetainedStream:
         # cleanup. An unknown reset is recovered only by explicit owner reboot.
         if self.imu is not None:
             proof = self.imu.stop()
-            if self.imu_started and (
+            if not (proof is None and self.imu.pid is None) and (
                 type(proof) is not dict
                 or proof.get("restored") is not True
+                or proof.get("quiescent") is not True
                 or proof.get("errors")
                 or not _collector_closed(self.imu)
             ):
-                raise PreparedStreamError("Unknown IMU mask; retain heartbeat and IP")
+                raise PreparedStreamError(
+                    "Unknown IMU mask or quiescence; retain heartbeat and IP"
+                )
         if self.preview is not None and self.preview._stream is not None:
             self.preview._stream.stop()
         lease = self.preview._lease if self.preview is not None else None

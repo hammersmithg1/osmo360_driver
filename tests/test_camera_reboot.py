@@ -123,7 +123,7 @@ class OwnedIMU:
         self.report = (
             report
             if report is not None
-            else ({"restored": True, "errors": []} if started else None)
+            else ({"restored": True, "quiescent": True, "errors": []} if started else None)
         )
         self.error = error
         self.calls = 0
@@ -264,6 +264,20 @@ class CameraRebootTests(unittest.TestCase):
         self.camera.reboot(timeout=3)
         self.assertIsNone(self.camera._imu)
         self.assert_sent_once()
+
+    def test_reboot_rejects_mask_only_or_false_quiescence_without_power_command(self):
+        for proof in (
+            {"restored": True, "errors": []},
+            {"restored": True, "quiescent": False, "errors": []},
+            {"restored": True, "quiescent": 1, "errors": []},
+        ):
+            with self.subTest(proof=proof):
+                imu = self.camera._imu = OwnedIMU(self.transport.operations, report=proof)
+                with self.assertRaises(RebootError) as caught:
+                    self.camera.reboot(timeout=3)
+                self.assertEqual(caught.exception.stage, "imu_stop")
+                self.assertIs(self.camera._imu, imu)
+                self.assertEqual(self.transport.power_requests, [])
 
     def test_idle_is_rechecked_after_imu_cleanup(self):
         self.camera._imu = OwnedIMU(self.transport.operations)

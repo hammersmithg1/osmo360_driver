@@ -10,6 +10,7 @@ from collections import Counter
 import ctypes as C
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import signal
@@ -26,6 +27,108 @@ BIT_REVERSE_TABLE = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
 HDLC_ESCAPE = re.compile(rb"\x7d(.)", re.DOTALL)
 UNESCAPED_BYTES = tuple(bytes([i ^ 0x20]) for i in range(256))
 LIVE_PREFIX = 'OSMO_IMU_STATUS '
+
+
+def _drain_until_quiet(receive, snapshot, *, timeout=3.0, quiet=0.30,
+                       clock=time.monotonic):
+    """Observe the SAME DIAG reader idle before releasing its USB interface.
+
+    LOG_CONFIG ACK/GET proves a local mask, not completion of already queued
+    camera USB writes. Keep consuming those writes with the existing reader.
+    Two empty USB timeouts spanning ``quiet`` seconds are the bounded host
+    barrier; this does not claim a remote DSP ACK or inspect native memory.
+    A restored nonzero mask may keep producing traffic and fail this barrier.
+    """
+    if (type(timeout) not in (int, float) or not math.isfinite(timeout)
+            or type(quiet) not in (int, float) or not math.isfinite(quiet)
+            or not 0 < quiet < timeout):
+        raise ValueError('Finite0<quiet<timeout required for DIAG drain')
+    began = clock()
+    deadline, last_data = began + timeout, began
+    initial = dict(snapshot())
+    previous = initial
+    evidence = dict(verified=False, timeout_s=timeout, required_quiet_s=quiet,
+                    elapsed_s=0.0, quiet_s=0.0, reads=0, bytes=0, timeouts=0,
+                    consecutive_empty_timeouts=0, pending_fragment_bytes=0,
+                    last_read_status=None)
+    try:
+        while clock() < deadline:
+            receive()  # One existing150ms bulk read; never SET/open/rebind.
+            now = clock()
+            current = dict(snapshot())
+            count = current['usb_reads'] - previous['usb_reads']
+            size = current['usb_bytes'] - previous['usb_bytes']
+            timeouts = current['usb_timeouts'] - previous['usb_timeouts']
+            status = current['last_read_status']
+            fragment = current['pending_fragment_bytes']
+            if (count != 1 or size < 0 or timeouts not in (0, 1)
+                    or status not in (0, -7)
+                    or type(fragment) is not int or fragment < 0):
+                raise RuntimeError('DIAG drain reader/counters changed')
+            evidence['reads'] += count
+            evidence['bytes'] += size
+            evidence['timeouts'] += timeouts
+            evidence['pending_fragment_bytes'] = fragment
+            evidence['last_read_status'] = status
+            if size:
+                last_data = now
+            if status == -7 and size == 0:
+                evidence['consecutive_empty_timeouts'] += 1
+            else:
+                evidence['consecutive_empty_timeouts'] = 0
+            evidence['elapsed_s'] = max(0, now - began)
+            evidence['quiet_s'] = max(0, now - last_data)
+            previous = current
+            if now >= deadline:
+                break  # A late idle observation cannot authorize handoff.
+            if (evidence['consecutive_empty_timeouts'] >= 2
+                    and evidence['quiet_s'] >= quiet and fragment == 0):
+                evidence['verified'] = True
+                return evidence
+        evidence['error'] = 'DIAG did not become quiescent before the drain deadline'
+    except BaseException as error:
+        # A second signal/USB failure must not turn mask restoration into a
+        # successful handoff. Preserve evidence while outer finally releases
+        # local handles; the session retains its lease/USB owner on failure.
+        evidence['elapsed_s'] = max(0, clock() - began)
+        evidence['error'] = type(error).__name__ + ': ' + str(error)
+        try:
+            current = snapshot()
+            evidence.update(reads=max(0, current['usb_reads'] - initial['usb_reads']),
+                            bytes=max(0, current['usb_bytes'] - initial['usb_bytes']),
+                            timeouts=max(0, current['usb_timeouts'] - initial['usb_timeouts']),
+                            last_read_status=current['last_read_status'],
+                            pending_fragment_bytes=current['pending_fragment_bytes'])
+        except Exception:
+            pass  # The original read/diagnostic failure remains authoritative.
+    return evidence
+
+
+def _drain_restored_reader(report, receive, snapshot, *, original_mask,
+                           fatal_read_status=None, clock=time.monotonic):
+    """Keep mask restoration and same-generation USB quiescence distinct."""
+    report['quiescent'] = False
+    if report.get('restored') is not True:
+        report['drain'] = dict(verified=False, skipped='Original mask not restored')
+        return
+    if fatal_read_status is not None:
+        report['drain'] = dict(verified=False, skipped='Original DIAG reader failed',
+                               fatal_read_status=fatal_read_status)
+    else:
+        report['drain'] = _drain_until_quiet(receive, snapshot, clock=clock)
+        report['quiescent'] = report['drain']['verified'] is True
+    if any(original_mask):
+        # A sparse pre-existing log can be silent for this whole observation
+        # and resume after the reader closes. Restore it unchanged, but never
+        # interpret that short interval as permission for a USB transition.
+        report['quiescent'] = False
+        report['drain']['handoff_blocked_reason'] = (
+            'Original equipment1 DIAG mask has enabled logs; '
+            'observed quiet cannot exclude later traffic')
+    if not report['quiescent']:
+        report['errors'].append('DIAG USB handoff blocked: ' + str(
+            report['drain'].get('handoff_blocked_reason')
+            or report['drain'].get('error') or report['drain'].get('skipped')))
 
 
 class _LiveStatus:
@@ -566,6 +669,8 @@ def main():
         "read_buffer_bytes": args.read_buffer_bytes,
         "requested_sensor_codes": [f"{0x1000 + n:04x}" for n in items],
         "restored": False,
+        "quiescent": False,
+        "drain": None,
         "errors": [],
     }
     raw, packets, sample_file, udp = None, None, None, None
@@ -820,9 +925,22 @@ def main():
                     rebind_guard, old_last, old_mask, owned_mask
                 )
 
-            _restore_original_mask(
-                report, request, old_last, old_mask, rebind=restore_rebound
+            try:
+                _restore_original_mask(
+                    report, request, old_last, old_mask, rebind=restore_rebound
+                )
+            except BaseException as error:
+                report['errors'].append('Original mask cleanup interrupted: '
+                                        + type(error).__name__ + ': ' + str(error))
+            _drain_restored_reader(
+                report, receive,
+                lambda: dict(io_counts, pending_fragment_bytes=len(decoder.buffer)),
+                original_mask=old_mask,
+                fatal_read_status=fatal_read_status,
+                clock=time.monotonic,
             )
+            live.mark('drain_verified' if report['quiescent'] else 'drain_failed',
+                      quiescent=report['quiescent'])
             if fatal_read_status is not None:
                 report["fatal_read_status"] = fatal_read_status
         if claimed:
@@ -856,7 +974,8 @@ def main():
             samples_jsonl=str(args.samples_jsonl) if args.samples_jsonl else None,
         )
         live.phase = 'finished'
-        live.mark('collector_finished', restored=bool(report['restored']), error_count=len(report['errors']))
+        live.mark('collector_finished', restored=bool(report['restored']),
+                  quiescent=bool(report['quiescent']), error_count=len(report['errors']))
         report.update(collector_live=live.latest, collector_events=live.events,
                       live_output_failed=live.output_failed)
         paths["json"].write_text(json.dumps(report, indent=2) + "\n")
@@ -865,7 +984,8 @@ def main():
             {k: v for k, v in report.items() if k != "original_mask_hex"}, indent=2
         )
     )
-    return int(bool(report["errors"]) or attempted and not report["restored"])
+    return int(bool(report["errors"]) or attempted and (
+        report["restored"] is not True or report["quiescent"] is not True))
 
 
 if __name__ == "__main__":

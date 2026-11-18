@@ -81,34 +81,40 @@ class USBPreview:
                     raise
                 # An exited collector may have restored its original mask on
                 # a replacement USB handle while still reporting the stream
-                # failure. A running collector or an unverified mask cannot
-                # release the lease that it may still need for restoration.
+                # failure. Mask restoration alone is not a quiet endpoint:
+                # verified drain and collector exit must precede lease CLOSE.
                 try:
                     report = imu.report
                     returncode = imu.stats.get("collector_returncode")
                 except Exception as proof_error:
                     self.report["imu_stop_proof_error"] = str(proof_error)
                     raise error from proof_error
+                self.report["imu_stop"] = report
+                self.report["imu_collector_returncode"] = returncode
                 if (
                     type(returncode) is not int
                     or not isinstance(report, dict)
                     or report.get("restored") is not True
+                    or report.get("quiescent") is not True
                 ):
                     raise
-                self.report["imu_stop"] = report
-                self.report["imu_collector_returncode"] = returncode
                 self.report["imu_stop_error"] = type(error).__name__ + ": " + str(error)
                 self.report["errors"].append("IMU: " + self.report["imu_stop_error"])
                 self.camera._imu = None
                 return error
+            self.report["imu_stop"] = report
             if (report is None and imu.pid is not None) or (
                 report is not None
-                and (report.get("restored") is not True or report.get("errors"))
+                and (
+                    report.get("restored") is not True
+                    or report.get("quiescent") is not True
+                    or report.get("errors")
+                )
             ):
                 raise USBPreviewError(
-                    "Owned IMU mask restoration was not verified", self.report
+                    "Owned IMU mask restoration and DIAG quiescence were not verified",
+                    self.report,
                 )
-            self.report["imu_stop"] = report
             self.camera._imu = None
 
     def _cleanup_host_network(self, primary_error=None):
@@ -312,7 +318,7 @@ class USBPreview:
                         self.report["video"] = dict(self._stream.stats)
                     except Exception as error:
                         errors.append("Video statistics: " + str(error))
-            # Heartbeats stay alive until the collector has restored its mask.
+            # Keep heartbeats until mask restoration and endpoint drain are proven.
             if self._scheduled:
                 imu_error = self._stop_owned_imu(allow_restored_fault=True)
                 check()  # Keep heartbeat/IP if no budget remains before close.

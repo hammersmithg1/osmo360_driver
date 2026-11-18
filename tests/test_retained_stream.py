@@ -215,6 +215,37 @@ class RetainedTests(unittest.TestCase):
         self.assertEqual(value.sequence, 44)
         self.assertIs(self.camera._usb_preview, self.old)
 
+    def test_abandon_keeps_heartbeat_when_mask_is_restored_but_drain_is_unproven(self):
+        for proof in (
+            dict(restored=True, errors=[]),
+            dict(restored=True, quiescent=False, errors=[]),
+            dict(restored=True, quiescent=1, errors=[]),
+        ):
+            with self.subTest(proof=proof):
+                self.setUp()
+                value = self.backend().prepare()
+                imu = value.imu = types.SimpleNamespace(pid=321, stop=Mock(return_value=proof))
+                value.imu_started = True
+                value.preview = types.SimpleNamespace(_stream=Mock(), _lease=Mock())
+                self.camera._imu, self.camera._usb_preview = imu, value.preview
+                with patch.object(m, '_collector_closed', return_value=True):
+                    with self.assertRaisesRegex(m.PreparedStreamError, 'quiescence'):
+                        value.abandon_local()
+                value.preview._stream.stop.assert_not_called()
+                value.preview._lease.stop.assert_not_called()
+                self.old._lease.stop.assert_not_called()
+                self.assertFalse(value.abandoned)
+                self.assertIs(self.camera._imu, imu)
+                self.assertIs(self.camera._usb_preview, value.preview)
+
+    def test_abandon_allows_attempted_start_that_never_created_a_collector(self):
+        value = self.backend().prepare()
+        value.imu = types.SimpleNamespace(pid=None, stop=Mock(return_value=None))
+        value.imu_started = True
+        result = value.abandon_local()
+        self.assertTrue(result['local_only'])
+        self.old._lease.stop.assert_called_once_with(close_camera=False)
+
     def test_receipt_is_strict_and_bound_to_original_plan_owner_and_fresh_challenge(
         self,
     ):

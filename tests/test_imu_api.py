@@ -79,7 +79,8 @@ class FakeCollector:
 
     next_pid = 10000
 
-    def __init__(self, command, *, ready=True, finish_on_signal=True, restored=True):
+    def __init__(self, command, *, ready=True, finish_on_signal=True, restored=True,
+                 quiescent=True):
         self.command = command
         self.prefix = Path(command[command.index("--prefix") + 1])
         self.port = int(command[command.index("--udp-port") + 1])
@@ -88,6 +89,7 @@ class FakeCollector:
         self.done = threading.Event()
         self.finish_on_signal = finish_on_signal
         self.restored = restored
+        self.quiescent = quiescent
         self.returncode = None
         FakeCollector.next_pid += 1
         self.pid = FakeCollector.next_pid
@@ -110,6 +112,7 @@ class FakeCollector:
     def finish(self, code=0, errors=None):
         report = dict(
             restored=self.restored,
+            quiescent=self.quiescent,
             enabled_mask_verified=True,
             errors=errors or [],
             udp_drops=0,
@@ -266,6 +269,7 @@ class IMUAdapterTests(unittest.TestCase):
             self.assertEqual(sample.to_dict()["gyro_unit"], "rad/s")
         self.assertEqual(self.collectors[-1].signals, [signal.SIGINT])
         self.assertTrue(stream.report["restored"])
+        self.assertTrue(stream.report["quiescent"])
         self.assertEqual(stream.stop(), stream.report)
 
     def test_host_read_buffer_boundaries_and_invalid_values(self):
@@ -410,6 +414,30 @@ class IMUAdapterTests(unittest.TestCase):
         self.assertFalse(stream.report["restored"])
         with self.assertRaises(IMUStopError):
             stream.stop()  # Idempotence must not turn a failed restore into success.
+
+    def test_restored_mask_without_strict_quiescence_is_a_stop_error(self):
+        for proof in (False, None, 1):
+            with self.subTest(proof=proof):
+                self.fake_options['quiescent'] = proof
+                stream = self.stream().start()
+                with self.assertRaisesRegex(IMUStopError, 'quiescence'):
+                    stream.stop()
+                self.assertTrue(stream.report['restored'])
+                self.assertIs(stream.report['quiescent'], proof)
+                self.assertEqual(stream.stats['cleanup'], dict(
+                    restored=True, quiescent=proof, drain=None))
+                with self.assertRaises(IMUStopError):
+                    stream.stop()  # Retrying cannot erase a failed barrier.
+
+    def test_missing_quiescence_receipt_cannot_authorize_handoff(self):
+        stream = self.stream().start()
+        collector = self.collectors[-1]
+        collector.finish()
+        report = json.loads(stream.report_path.read_text())
+        del report['quiescent']
+        stream.report_path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(IMUStopError, 'quiescence'):
+            stream.stop()
 
     def test_unexpected_collector_exit_is_not_a_clean_iterator_end(self):
         stream = self.stream().start()
