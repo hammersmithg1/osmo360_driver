@@ -9,6 +9,7 @@ from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import wraps
 import json
 import math
 import threading
@@ -72,6 +73,15 @@ def _bounded_diagnostic(value):
             return result
         return None
     return copy(value)
+
+
+def _lifecycle(method):
+    """All public lifecycle paths take L before the short data lock C."""
+    @wraps(method)
+    def call(self, *args, **options):
+        with self._lifecycle_lock:
+            return method(self, *args, **options)
+    return call
 
 
 @dataclass(frozen=True)
@@ -149,6 +159,10 @@ class USBStreamSession:
         self._prepare_done.set()
         self._prepare_abandoned = threading.Event()
         self._prepare_ready_callback = None
+        # Lifecycle/proof serialization must not block active data readers.
+        # Background Sleep preparation uses C only for its final commit and
+        # deliberately never takes L, so joining it while holding L is safe.
+        self._lifecycle_lock = threading.RLock()
         self._lock = threading.RLock()
         self._state = "NEW"
         self._preview = self._imu = self._prepared = None
@@ -213,6 +227,7 @@ class USBStreamSession:
             service=deepcopy(self.control.service),
         )
 
+    @_lifecycle
     def start(self):
         with self._lock:
             if self._state != "NEW":
@@ -288,6 +303,7 @@ class USBStreamSession:
                 self._set_state("RECOVERY_REQUIRED")
                 raise
 
+    @_lifecycle
     def attach_sleep(self, prepared, *, native_floor_ns, snapshot):
         """Adopt a RO-verified existing Sleep using memory validation only.
 
@@ -530,33 +546,77 @@ class USBStreamSession:
         self._primed_video.clear()
         self._primed_imu.clear()
 
+    def _proof_identity(self):
+        camera, control = self.camera, self.control
+        references = (camera, control, camera._control_lock, camera._transport,
+            self._preview, self._imu, self._prepared, self._wake_thread,
+            getattr(camera, '_usb_preview', None), getattr(camera, '_imu', None),
+            getattr(control, 'lock', None))
+        return references, (self._state, self._wake_id, self._late_verified, self._owner_receipt())
+
+    def _same_proof_identity(self, identity):
+        try:
+            references, values = self._proof_identity()
+            return all(current is old for current, old in zip(references, identity[0])) and values == identity[1]
+        except Exception:
+            return False
+
+    def _proof_generation(self, camera, control):
+        transport = camera._transport
+        bootstrap = getattr(control, 'bootstrap', None)
+        bound = getattr(bootstrap, 'transport', None)
+        if bound is not None and bound is not transport:
+            raise StreamSessionError('Control proof transport ownership changed', self.report)
+        native = getattr(transport, '_device_identity', None)
+        location = (native.get('bus'), native.get('address')) if type(native) is dict else (None, None)
+        return (transport, getattr(transport, '_thread', None), bound), location + (getattr(transport, 'connected', None),)
+
+    @_lifecycle
     def verify_control(self, *, timeout=20):
         self._wait_preparation(timeout=timeout)
         with self._lock:
+            if self._state in ('NEW', 'DETACHED', 'RECOVERY_PENDING'):
+                raise StreamSessionError('Control proof requires an owned camera session', self.report)
             if self._late_verified:
                 return self.control.last
-            if self._wake_thread is not None:
-                self._wake_thread.join(timeout)
-                if self._wake_thread.is_alive():
-                    raise StandbyUncertain(
-                        "Wake submission still active; no new diagnostic START",
-                        command_id=self._wake_id,
-                    )
-            # The reconnect callback is READ-ONLY and caller-owned. It must not
-            # start a diagnostic task to escape the old session's quarantine.
-            if self.reconnect_control is not None:
-                self.control.bind_bootstrap(self.reconnect_control(self.camera))
-            value = self.control.wait(self._wake_id, "AWAKE", timeout=timeout)
+            identity = self._proof_identity()
+            camera, control, wake_id = self.camera, self.control, self._wake_id
+            wake_thread, reconnect = self._wake_thread, self.reconnect_control
+        # L serializes every lifecycle operation, while C stays available to
+        # borrow/commit video and IMU throughout a slow C1 generation proof.
+        if wake_thread is not None:
+            wake_thread.join(timeout)
+            if wake_thread.is_alive():
+                raise StandbyUncertain(
+                    "Wake submission still active; no new diagnostic START",
+                    command_id=wake_id,
+                )
+        if reconnect is not None:
+            control.bind_bootstrap(reconnect(camera))
+        with self._lock:
+            if not self._same_proof_identity(identity):
+                raise StreamSessionError('Session identity changed during control proof', self.report)
+            generation = self._proof_generation(camera, control)
+        value = control.wait(wake_id, "AWAKE", timeout=timeout)
+        verified = deepcopy(value)
+        with self._lock:
+            current = self._proof_generation(camera, control)
+            if (not self._same_proof_identity(identity)
+                    or any(before is not after for before, after in zip(generation[0], current[0]))
+                    or generation[1] != current[1] or current[1][2] is False):
+                raise StreamSessionError('Session/control generation changed before proof commit', self.report)
             self._late_verified = True
-            self.report["late_control_proof"] = deepcopy(value)
+            self.report["late_control_proof"] = verified
             return value
 
+    @_lifecycle
     def sleep(self):
         self._wait_preparation(timeout=90)
         with self._lock:
             if self._state != "AWAKE":
                 raise StreamSessionError("Sleep requires AWAKE", self.report)
-            self.verify_control()
+        self.verify_control()
+        with self._lock:
             if self.fast_sleep:
                 return self._sleep_local_first()
             self._set_state("PREPARING_SLEEP")
@@ -1012,6 +1072,7 @@ class USBStreamSession:
             # the transition's primary failure during postmortem capture.
             prepared.report["freshness_snapshot_error"] = repr(error)[:240]
 
+    @_lifecycle
     def wake(self, *, timeout=45):
         if (
             type(timeout) not in (int, float)
@@ -1147,6 +1208,7 @@ class USBStreamSession:
                 self._set_state("RECOVERY_REQUIRED")
                 raise
 
+    @_lifecycle
     def close(self):
         with self._lock:
             if (
@@ -1187,6 +1249,17 @@ class USBStreamSession:
                     self.report,
                 )
         self._wait_preparation(timeout=90)
+        verification_error = None
+        with self._lock:
+            if self._state == 'DETACHED':
+                return deepcopy(self.report)
+            needs_verification = (self._preview is not None or self._imu is not None
+                or self._prepared is not None and self._prepared.lease_proven)
+        if needs_verification:
+            try:
+                self.verify_control()
+            except BaseException as error:
+                verification_error = error
         with self._lock:
             if self._state == "DETACHED":
                 return deepcopy(self.report)
@@ -1194,7 +1267,7 @@ class USBStreamSession:
             try:
                 if self._preview is not None or self._imu is not None:
                     try:
-                        self.verify_control()
+                        if verification_error is not None: raise verification_error
                     except BaseException:
                         if self._prepared is None:
                             raise
@@ -1208,7 +1281,7 @@ class USBStreamSession:
                 elif self._prepared is not None:
                     if self._prepared.lease_proven:
                         try:
-                            self.verify_control()
+                            if verification_error is not None: raise verification_error
                         except BaseException:
                             self.report["deferred_local_cleanup"] = (
                                 self._prepared.abandon_local()
@@ -1238,6 +1311,7 @@ class USBStreamSession:
             self._set_state("DETACHED")
             return deepcopy(self.report)
 
+    @_lifecycle
     def recover(self):
         """Explicit recovery request; does not claim reboot/restoration completed."""
         self._wait_preparation(timeout=90, allow_error=True)
