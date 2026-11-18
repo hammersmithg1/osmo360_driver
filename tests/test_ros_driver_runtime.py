@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from osmo360_camera import controls
 from osmo360_camera.transport import CameraDisconnected, RequestTimeout
 from osmo360_camera._standby_control import StandbyUncertain
+from osmo360_camera._stream_session import StreamSessionError
 from osmo360_driver.clock import CameraClock
 from osmo360_driver.runtime import OsmoCamera, json_value, validate_settings
 
@@ -412,6 +413,136 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(owner.status()['stats'], report)
             self.assertIn('preview failed', owner.status()['error'])
         finally:
+            owner.close()
+
+    def test_usb_loss_and_failed_cleanup_keep_final_sdk_report_and_ownership(self):
+        final = dict(state='RECOVERY_REQUIRED', cleanup_deferred=True, last_imu_stop=dict(
+            restored=False, quiescent=False, errors=['DIAG read: LIBUSB_ERROR_NO_DEVICE',
+                                                      'rebind restore: KeyboardInterrupt']))
+        error = StreamSessionError('Session retains ownership after deferred cleanup', final)
+        error.__cause__ = RuntimeError('DIAG mask restoration not proven')
+
+        class Session:
+            state = 'AWAKE'
+            @property
+            def stats(self):
+                return dict(state=self.state, preview=dict(healthy=self.state == 'AWAKE'),
+                    imu=dict(received=1200217, collector_live=dict(fatal_read_status=-4),
+                             cleanup=None if self.state == 'AWAKE' else dict(restored=False, quiescent=False)),
+                    report=dict(state='AWAKE', errors=[]))
+            def close(self):
+                self.state = 'RECOVERY_REQUIRED'
+                raise error
+
+        owner = OsmoCamera()
+        owner.stream, owner.camera = Session(), SimpleNamespace(close=Mock())
+        session, camera = owner.stream, owner.camera
+        try:
+            owner.failed(RuntimeError('Osmo 360 не передаёт IMU более 3 секунд'))
+            deadline = time.monotonic() + 2
+            while owner.status()['state'] != 'error' and time.monotonic() < deadline:
+                time.sleep(.005)
+            status = owner.status()
+            self.assertEqual(status['state'], 'error')
+            self.assertFalse(status['enabled'])
+            self.assertIn('LIBUSB_ERROR_NO_DEVICE', status['error'])
+            self.assertIn('cleanup: Session retains ownership', status['error'])
+            stats = status['stats']
+            self.assertEqual(stats['state'], 'RECOVERY_REQUIRED')
+            self.assertFalse(stats['preview']['healthy'])
+            self.assertEqual(stats['report'], final)
+            self.assertEqual(stats['imu']['cleanup'], dict(restored=False, quiescent=False))
+            self.assertIn('3 секунд', stats['failure']['capture']['causes'][0]['message'])
+            self.assertEqual(stats['failure']['close'][1]['message'], 'DIAG mask restoration not proven')
+            self.assertIs(owner.stream, session)
+            camera.close.assert_not_called()
+            # The published report is copied, so later mutation cannot erase it.
+            final['last_imu_stop']['errors'].clear()
+            self.assertEqual(len(stats['report']['last_imu_stop']['errors']), 2)
+        finally:
+            # Drop the test doubles without attempting any further lifecycle.
+            owner.stream = owner.camera = None
+            owner.close()
+
+    def test_failed_close_preserves_original_error_even_if_diagnostic_getters_fail(self):
+        report = dict(state='RECOVERY_REQUIRED', last_imu_stop=dict(restored=False, quiescent=False))
+        error = StreamSessionError('original cleanup failure', report)
+        for fails_before_close in (False, True):
+            with self.subTest(fails_before_close=fails_before_close):
+                class Session:
+                    closed = False
+                    @property
+                    def stats(self):
+                        if self.closed or fails_before_close:
+                            raise error if fails_before_close else RuntimeError('stats unavailable')
+                        return dict(state='AWAKE', imu=dict(received=99))
+                    @property
+                    def state(self):
+                        raise RuntimeError('state unavailable')
+                    def close(self):
+                        self.closed = True
+                        raise error
+                owner = OsmoCamera()
+                session = owner.stream = Session()
+                owner.camera = SimpleNamespace(close=Mock())
+                camera = owner.camera
+                try:
+                    with self.assertRaises(StreamSessionError) as caught:
+                        owner.close_stream()
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(session.closed, not fails_before_close)
+                    self.assertEqual(owner.capture_stats['report'], report)
+                    self.assertEqual(owner.capture_stats['state'], 'RECOVERY_REQUIRED')
+                    self.assertIn('stats_error', owner.capture_stats)
+                    self.assertIn('state_error', owner.capture_stats)
+                    camera.close.assert_not_called()
+                    self.assertIs(owner.stream, session)
+                finally:
+                    owner.stream = owner.camera = None
+                    owner.close()
+
+    def test_stale_collector_failure_does_not_relabel_current_timeout_as_usb_loss(self):
+        for current_stats_unavailable in (False, True):
+            with self.subTest(current_stats_unavailable=current_stats_unavailable):
+                owner = OsmoCamera()
+                # Stop only the control worker so the assertion sees the
+                # reader's failure before asynchronous cleanup; no USB opened.
+                owner.close()
+                owner.capture_stats = dict(imu=dict(collector_live=dict(fatal_read_status=-4)))
+                if current_stats_unavailable:
+                    class Session:
+                        state = 'AWAKE'
+                        @property
+                        def stats(self):
+                            raise RuntimeError('current stats unavailable')
+                    owner.stream = Session()
+                else:
+                    owner.stream = SimpleNamespace(state='AWAKE', stats=dict(
+                        imu=dict(collector_live=dict(fatal_read_status=None)),
+                        report=dict(last_imu_stop=dict(fatal_read_status=-4))))
+                message = 'Osmo 360 не передаёт IMU более 3 секунд'
+                owner.failed(RuntimeError(message))
+                self.assertEqual(owner.capture_error, message)
+                self.assertEqual(owner.capture_stats['failure']['capture']['message'], message)
+                self.assertEqual('stats_error' in owner.capture_stats, current_stats_unavailable)
+                self.assertTrue(owner.reader_stop.is_set())
+                self.assertFalse(owner.enabled)
+
+    def test_new_command_failure_refreshes_stats_after_an_earlier_failed_close(self):
+        owner = OsmoCamera()
+        owner.capture_stats = dict(failure=dict(close=[dict(message='old cleanup failure')]))
+        owner._close_failure_sequence = 1
+        owner.stream = SimpleNamespace(stats=dict(state='RECOVERY_REQUIRED', current=True))
+        owner.execute = Mock(side_effect=RuntimeError('new command failure'))
+        try:
+            owner.command('refresh')
+            deadline = time.monotonic() + 2
+            while owner.status()['busy'] and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(owner.status()['stats'], owner.stream.stats)
+            self.assertEqual(owner.status()['error'], 'new command failure')
+        finally:
+            owner.stream = None
             owner.close()
 
     def test_settings_are_validated_before_camera_is_touched(self):

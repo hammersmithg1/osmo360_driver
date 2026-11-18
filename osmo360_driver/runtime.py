@@ -31,6 +31,31 @@ def json_value(value):
     return value
 
 
+def error_chain(error):
+    """Bounded diagnostic causes; never replace the exception being reported."""
+    result, seen = [], set()
+    while error is not None and id(error) not in seen and len(result) < 8:
+        seen.add(id(error))
+        try:
+            message = str(error)[:1000]
+        except Exception:
+            message = type(error).__name__
+        result.append(dict(type=type(error).__name__, message=message))
+        error = error.__cause__ if error.__cause__ is not None else (
+            None if error.__suppress_context__ else error.__context__)
+    return result
+
+
+def usb_capture_error(stats):
+    if 'stats_error' in stats:
+        return None  # Cached counters cannot prove the current USB failure.
+    imu = stats.get('imu') or {}
+    current = imu.get('collector_live') if isinstance(imu, dict) else None
+    if isinstance(current, dict) and current.get('fatal_read_status') == -4:
+        return 'USB-соединение с Osmo потеряно (LIBUSB_ERROR_NO_DEVICE)'
+    return None
+
+
 def validate_settings(value):
     if not isinstance(value, dict) or not value:
         raise ValueError('Нужен непустой объект настроек Osmo 360')
@@ -79,6 +104,8 @@ class OsmoCamera:
         self.imu_at = None
         self.enabled = False
         self.busy = self.error = self.capture_error = ''
+        self._capture_failure = None
+        self._close_failure_sequence = 0
         self.command_started_at = None
         self.preparation = {}
         self.helpers_ready = False
@@ -251,6 +278,7 @@ class OsmoCamera:
     def start_readers(self):
         self.reader_stop.clear()
         self.capture_error = ''
+        self._capture_failure = None
         self.clock = CameraClock(self.host_offset_ns)
         self.frame_times = []
         self.imu_at = None
@@ -263,15 +291,53 @@ class OsmoCamera:
             reader.start()
 
     def close_stream(self):
-        self.stop_readers()
+        try:
+            self.stop_readers()
+            if self.stream is not None:
+                report = self.stream.close()
+        except Exception as error:
+            # stop_readers captured pre-close AWAKE state. Freeze the actual
+            # failed cleanup and final collector cause instead, including a
+            # failure reading those pre-close stats before cleanup can begin.
+            current = self.failure_stats(error)
+            current['failure'] = dict(capture=getattr(self, '_capture_failure', None),
+                                      close=error_chain(error))
+            self.capture_stats = current
+            self._close_failure_sequence = getattr(self, '_close_failure_sequence', 0) + 1
+            raise
         if self.stream is not None:
-            report = self.stream.close()
             # Preserve the last data counters alongside the verified cleanup
             # result, including the collector's final DIAG/transport report.
             self.capture_stats = dict(self.capture_stats, state=self.stream.state, report=json_value(report))
+            if getattr(self, '_capture_failure', None) is not None:
+                self.capture_stats['failure'] = dict(capture=self._capture_failure)
             # Camera.close clears SDK ownership only after verified cleanup.
             self.camera.close()
             self.stream = None
+
+    def failure_stats(self, error=None):
+        """Only existing SDK/local reports; no query, reconnect or lifecycle."""
+        current = dict(getattr(self, 'capture_stats', {}))
+        if self.stream is not None:
+            try:
+                value = json_value(self.stream.stats)
+                if isinstance(value, dict):
+                    current = value
+            except Exception as diagnostic_error:
+                current['stats_error'] = error_chain(diagnostic_error)
+        report = getattr(error, 'report', None)
+        if isinstance(report, dict):
+            current['report'] = json_value(report)
+        try:
+            state = getattr(self.stream, 'state', None)
+        except Exception as diagnostic_error:
+            current['state_error'] = error_chain(diagnostic_error)
+            state = None
+        if isinstance(state, str):
+            current['state'] = state
+        elif isinstance(report, dict) and isinstance(report.get('state'), str):
+            current['state'] = report['state']
+        return current
 
     def activate(self):
         self.require_session_state()
@@ -387,6 +453,7 @@ class OsmoCamera:
                             self.error += '; cleanup: ' + str(exc)
                         self.state = 'error'
                     continue
+                close_failure_sequence = self._close_failure_sequence
                 try:
                     self.execute(action, settings)
                 except Exception as exc:
@@ -394,7 +461,7 @@ class OsmoCamera:
                     cause = getattr(exc, 'last_error', None) or exc.__cause__
                     if cause is not None and str(cause) not in self.error:
                         self.error += ': ' + str(cause)
-                    if self.stream is not None:
+                    if self.stream is not None and self._close_failure_sequence == close_failure_sequence:
                         try:
                             self.capture_stats = json_value(self.stream.stats)
                         except Exception:
@@ -415,7 +482,11 @@ class OsmoCamera:
                 self.on_error(self.error)
 
     def failed(self, error):
-        self.capture_error = str(error)
+        current = self.failure_stats()
+        self.capture_error = usb_capture_error(current) or str(error)
+        self._capture_failure = dict(message=self.capture_error, causes=error_chain(error))
+        current['failure'] = dict(capture=self._capture_failure)
+        self.capture_stats = current
         self.reader_stop.set()
         self.enabled = False
         self.on_error(self.capture_error)
