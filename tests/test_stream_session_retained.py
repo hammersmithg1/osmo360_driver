@@ -16,8 +16,11 @@ class Retained(Prepared):
         super().__init__(env, **options)
         self.sleep_id, self.wake_id = options["sleep_id"], options["wake_id"]
         self.arm_attempted = False
+        self.attach_attempted = False
         self.arm_error = None
         self.old_preview = options["preview"]
+        self.camera, self.control = env.camera, env.control
+        self.owner_receipt = options['owner_receipt']
 
     def prepare(self):
         self.env.events.append("retained.prepare")
@@ -82,7 +85,10 @@ class RetainedSessionTests(unittest.TestCase):
 
         env.camera.usb_preview, env.camera.imu = preview, imu
         env.control.lock, env.control.clock = env.camera._control_lock, env.clock
-        env.control.bootstrap = types.SimpleNamespace(transport=env.camera._transport)
+        env.control.bootstrap = types.SimpleNamespace(transport=env.camera._transport,
+            session=types.SimpleNamespace(quarantined=False))
+        env.control.pending_command = env.control.pending_task = None
+        env.control._unknown_task = False
         env.control.resolve_pending = lambda: env.events.append("resolve_pending")
         env.control._submit = lambda action, proof: env.control._submit_sleep(proof)
 
@@ -180,6 +186,112 @@ class RetainedSessionTests(unittest.TestCase):
         self.assertEqual(options['native_floor_ns'], baseline + 12_000_000_000)
         self.assertEqual(backend.arm_deadline, 15)
         self.assertEqual(env.events.count('owner.wake'), 1)
+
+    def unarmed_failure(self):
+        env, session, old, factory, prepared = self.setup_session()
+        session.sleep()
+        backend = session._prepared
+        def fail_before_arm(**options):
+            raise ValueError('fresh Sleep observation did not settle')
+        backend.arm_watcher = fail_before_arm
+        with self.assertRaises(ValueError):
+            session.wake(timeout=5)
+        self.assertEqual(session.state, 'RECOVERY_REQUIRED')
+        self.assertIsNotNone(session._unarmed_wake_failure)
+        self.assertFalse(backend.arm_attempted)
+        self.assertFalse(backend.possible_future_apply)
+        self.assertNotIn('owner.wake', env.events)
+        return env, session, old, backend
+
+    def test_close_of_proven_unarmed_wake_failure_publishes_normal_resume_without_any_key(self):
+        env, session, old, backend = self.unarmed_failure()
+        old.release.set()
+        session._prepare_ready_callback = lambda *args, **options: env.events.append('publish.READY') or dict(schema=1)
+        observe = Mock(wraps=env.control.wait_sleep_snapshot)
+        env.control.wait_sleep_snapshot = observe
+        result = session.close()
+        self.assertEqual(session.state, 'DETACHED')
+        self.assertEqual(result['unarmed_wake_cleanup']['verified_sleep_id'], backend.sleep_id)
+        self.assertTrue(all(call.kwargs['deadline'] == 90 for call in observe.call_args_list))
+        self.assertEqual(env.events.count('publish.READY'), 1)
+        self.assertNotIn('owner.wake', env.events)
+        self.assertFalse(backend.arm_attempted)
+        self.assertFalse(backend.possible_future_apply)
+        self.assertIsNone(session._unarmed_wake_failure)
+        self.assertTrue(any(error.startswith('Wake:') for error in result['errors']))
+
+    def test_generic_recovery_state_without_new_prearm_provenance_is_never_prepared(self):
+        env, session, old, factory, prepared = self.setup_session()
+        session.sleep()
+        session._set_state('RECOVERY_REQUIRED')
+        with self.assertRaises(m.StreamSessionError):
+            session.close()
+        self.assertIsNone(session._unarmed_wake_failure)
+        self.assertNotIn('prepared.after_sleep', env.events)
+        self.assertNotIn('owner.wake', env.events)
+        old._lease.stop.assert_not_called()
+
+    def test_unarmed_cleanup_rejects_changed_owner_or_new_unknown_task_without_preparation(self):
+        for change in ('owner', 'pending', 'unknown', 'quarantine', 'arm', 'attach', 'missing_session', 'missing_unknown'):
+            with self.subTest(change=change):
+                env, session, old, backend = self.unarmed_failure()
+                if change == 'owner': env.control.owner = dict(pid=999, start='1')
+                elif change == 'pending': env.control.pending_command = backend.wake_id
+                elif change == 'unknown': env.control._unknown_task = True
+                elif change == 'quarantine':
+                    env.control.bootstrap.session = types.SimpleNamespace(quarantined=True)
+                elif change == 'arm': backend.arm_attempted = True
+                elif change == 'attach': backend.attach_attempted = True
+                elif change == 'missing_session': del env.control.bootstrap.session
+                else: del env.control._unknown_task
+                with self.assertRaises(m.StreamSessionError):
+                    session.close()
+                self.assertEqual(session.state, 'RECOVERY_REQUIRED')
+                self.assertNotIn('prepared.after_sleep', env.events)
+                self.assertNotIn('owner.wake', env.events)
+                old._lease.stop.assert_not_called()
+
+    def test_unarmed_cleanup_requires_fresh_same_sleep_receipt_after_observation(self):
+        env, session, old, backend = self.unarmed_failure()
+        env.control.wait_sleep_snapshot = Mock(return_value=dict(state='SLEEP',
+            command_id=backend.sleep_id, last_result=dict(changed=True)))
+        with self.assertRaises(m.StreamSessionError):
+            session.close()
+        self.assertEqual(session.state, 'RECOVERY_REQUIRED')
+        self.assertNotIn('prepared.after_sleep', env.events)
+        old._lease.stop.assert_not_called()
+
+    def test_unarmed_cleanup_observation_and_worker_share_one_original_preparation_deadline(self):
+        env, session, old, backend = self.unarmed_failure()
+        env.clock.sleep(10)
+        old.release.set()
+        observe = env.control.wait_sleep_snapshot
+        first = [True]
+        def slow_observation(*args, **options):
+            self.assertEqual(options['deadline'], 100)
+            if first[0]:
+                first[0] = False
+                env.clock.sleep(80)
+            return observe(*args, **options)
+        env.control.wait_sleep_snapshot = slow_observation
+        factory = session.prepared_factory
+        def late_candidate(*args, **options):
+            candidate = factory(*args, **options)
+            def late(*, guard, deadline):
+                self.assertEqual(deadline, 100)
+                env.clock.sleep(11)
+                guard()
+            candidate.prepare_after_sleep = late
+            return candidate
+        session.prepared_factory = late_candidate
+        publish = Mock()
+        session._prepare_ready_callback = publish
+        with self.assertRaises(m.StreamSessionError):
+            session.close()
+        self.assertEqual(session.state, 'RECOVERY_REQUIRED')
+        self.assertEqual(env.clock(), 101)
+        publish.assert_not_called()
+        self.assertNotIn('owner.wake', env.events)
 
     def test_stable_sleep_close_prepares_schema_one_ready_without_holding_core_lock_while_joining(
         self,

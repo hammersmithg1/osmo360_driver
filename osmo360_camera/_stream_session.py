@@ -154,6 +154,7 @@ class USBStreamSession:
         self.fast_sleep = fast_sleep
         self.retain_ecm, self.retained_factory = retain_ecm, retained_factory
         self._retained_backend = None
+        self._unarmed_wake_failure = None
         self._prepare_thread = self._prepare_generation = self._prepare_error = None
         self._prepare_done = threading.Event()
         self._prepare_done.set()
@@ -892,7 +893,7 @@ class USBStreamSession:
             self._set_state("RECOVERY_REQUIRED")
             raise
 
-    def _start_preparation(self, sleep_id, wake_id, preview):
+    def _start_preparation(self, sleep_id, wake_id, preview, *, deadline=None):
         """Caller holds the core lock; joining always happens outside it."""
         self._prepare_generation, self._prepare_error = sleep_id, None
         self._prepare_done.clear()
@@ -901,6 +902,7 @@ class USBStreamSession:
         self._prepare_thread = threading.Thread(
             target=self._prepare_while_sleeping,
             args=(sleep_id, wake_id, preview),
+            kwargs=dict(deadline=deadline),
             name="osmo-sleep-prepare",
             daemon=False,
         )
@@ -916,11 +918,11 @@ class USBStreamSession:
                 self._prepare_done.set()
             raise
 
-    def _prepare_while_sleeping(self, sleep_id, wake_id, old_preview):
+    def _prepare_while_sleeping(self, sleep_id, wake_id, old_preview, *, deadline=None):
         """One finite preparation; never acquires the wrapper lifecycle lock."""
         candidate = publication = error = None
         started = self.clock()
-        deadline = started + 90
+        deadline = started + 90 if deadline is None else min(deadline, started + 90)
         phases = {}
 
         @contextmanager
@@ -1098,6 +1100,7 @@ class USBStreamSession:
                     "Wake requires a prepared stable Sleep", self.report
                 )
             self._set_state("WAKING")
+            self._unarmed_wake_failure = None
             began = self.clock()
             deadline = began + timeout
             startup = dict(timeout_s=timeout, stages=[])
@@ -1110,9 +1113,11 @@ class USBStreamSession:
                     elapsed_s=self.clock() - began,
                 ))
 
+            arm_returned = False
             try:
                 stage("watcher_arm_started")
                 self._prepared.arm_watcher(deadline=deadline)
+                arm_returned = True
                 stage("watcher_armed")
                 if self.clock() >= deadline:
                     raise TimeoutError('Wake deadline after watcher arm; no new input')
@@ -1196,6 +1201,17 @@ class USBStreamSession:
                 self._set_state("AWAKE")
                 return self
             except BaseException as error:
+                if not arm_returned and self._unarmed_retained_wake():
+                    completed = deepcopy(getattr(self.control, 'last', None))
+                    if (type(completed) is dict and completed.get('state') == 'SLEEP'
+                            and completed.get('command_id') == self._prepared.sleep_id):
+                        # This provenance is created only by this failed call,
+                        # before native arm or the current Wake worker existed.
+                        self._unarmed_wake_failure = dict(
+                            backend=self._prepared, preview=self._preview, imu=self._imu,
+                            wake_thread=self._wake_thread, owner=self._owner_receipt(),
+                            sleep_id=self._prepared.sleep_id, wake_id=self._wake_id,
+                            completed=completed)
                 startup["failed_after"] = startup["stages"][-1]["stage"] if startup["stages"] else None
                 stage("failed")
                 self._wake_freshness_diagnostics()
@@ -1212,8 +1228,37 @@ class USBStreamSession:
                 self._set_state("RECOVERY_REQUIRED")
                 raise
 
+    def _unarmed_retained_wake(self):
+        retained = self._retained_backend
+        session = getattr(getattr(self.control, 'bootstrap', None), 'session', None)
+        missing = object()
+        return (self.retain_ecm and retained is not None and retained is self._prepared
+            and retained.camera is self.camera and retained.control is self.control
+            and retained.owner_receipt == self._owner_receipt()
+            and retained.old_preview is self._preview
+            and getattr(retained, 'arm_attempted', None) is False
+            and getattr(retained, 'possible_future_apply', None) is False
+            and getattr(retained, 'lease_proven', None) is False
+            and getattr(retained, 'attach_attempted', None) is False
+            and (self._wake_thread is None or not self._wake_thread.is_alive())
+            and getattr(self.control, 'pending_command', missing) is None
+            and getattr(self.control, 'pending_task', missing) is None
+            and getattr(self.control, '_unknown_task', None) is False
+            and getattr(session, 'quarantined', None) is False)
+
+    def _same_unarmed_wake_failure(self, provenance):
+        return (self._unarmed_retained_wake()
+            and provenance is self._unarmed_wake_failure
+            and provenance['backend'] is self._prepared
+            and provenance['preview'] is self._preview and provenance['imu'] is self._imu
+            and provenance['wake_thread'] is self._wake_thread
+            and provenance['owner'] == self._owner_receipt()
+            and provenance['sleep_id'] == self._prepared.sleep_id
+            and provenance['wake_id'] == self._wake_id == self._prepared.wake_id)
+
     @_lifecycle
     def close(self):
+        preparation_deadline = self.clock() + 90
         with self._lock:
             if (
                 self.retain_ecm
@@ -1234,6 +1279,22 @@ class USBStreamSession:
                     "Unknown retained transition; explicit recovery required",
                     self.report,
                 )
+            provenance = self._unarmed_wake_failure
+            if self._state == 'RECOVERY_REQUIRED' and provenance is not None:
+                if not self._same_unarmed_wake_failure(provenance):
+                    raise StreamSessionError('Pre-arm cleanup ownership changed; no implicit preparation', self.report)
+                observed = self.control.wait_sleep_snapshot(provenance['sleep_id'],
+                    deadline=preparation_deadline,
+                    report=self.report.setdefault('unarmed_wake_cleanup', {}))
+                if (not self._same_unarmed_wake_failure(provenance)
+                        or self.clock() >= preparation_deadline
+                        or observed.get('state') != 'SLEEP'
+                        or observed.get('command_id') != provenance['sleep_id']
+                        or observed.get('last_result') != provenance['completed'].get('last_result')):
+                    raise StreamSessionError('Original completed Sleep not re-proven; no implicit preparation', self.report)
+                self._unarmed_wake_failure = None
+                self._set_state('SLEEP')
+                self.report['unarmed_wake_cleanup']['verified_sleep_id'] = provenance['sleep_id']
             retained = self._retained_backend
             if (
                 retained is not None
@@ -1244,7 +1305,8 @@ class USBStreamSession:
                 # restore native5 and stage its unused plan before detaching.
                 if self._prepare_generation != retained.sleep_id:
                     self._start_preparation(
-                        retained.sleep_id, retained.wake_id, self._preview
+                        retained.sleep_id, retained.wake_id, self._preview,
+                        deadline=preparation_deadline,
                     )
             elif retained is not None and not retained.lease_proven:
                 self.report["cleanup_deferred"] = True
@@ -1252,7 +1314,7 @@ class USBStreamSession:
                     "Retained reset is uncertain; explicit recovery required",
                     self.report,
                 )
-        self._wait_preparation(timeout=90)
+        self._wait_preparation(timeout=max(0, preparation_deadline - self.clock()))
         verification_error = None
         with self._lock:
             if self._state == 'DETACHED':
