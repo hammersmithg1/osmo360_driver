@@ -206,6 +206,7 @@ class USBStreamSession:
                 preview=deepcopy(self._preview.stats) if self._preview else None,
                 imu=deepcopy(self._imu.stats) if self._imu else None,
                 control_verified=self._late_verified,
+                control=getattr(self.control, 'status_diagnostics', None),
                 report=deepcopy(self.report),
             )
 

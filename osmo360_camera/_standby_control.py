@@ -21,6 +21,7 @@ from . import _app
 from ._amt import D1Session
 from ._amt_codec import decode_reply, result_payload
 from ._usb_bootstrap import USBBootstrap, BootstrapError
+from .transport import CameraDisconnected
 
 SOURCES = {
     "usb_standby_owner.py": "5a2199c2120a35f1b1b20bb22315dbd5b54b5e4ba89a2a9cd9f35afb77ef088e",
@@ -278,9 +279,12 @@ class StandbyControl:
         existing=None,
         adapter_factory=None,
         source_stager=None,
+        readonly_reconnect=None,
     ):
         if source_stager is not None and not callable(source_stager):
             raise TypeError("Optional source stager must be callable")
+        if readonly_reconnect is not None and not callable(readonly_reconnect):
+            raise TypeError('Optional read-only reconnect must be callable')
         self.bootstrap = bootstrap
         self._check_bootstrap(bootstrap)
         self.sources, self.lock, self.clock, self.sleep = (
@@ -290,6 +294,9 @@ class StandbyControl:
             sleep,
         )
         self.source_stager = source_stager
+        self.readonly_reconnect = readonly_reconnect
+        self.status_reconnect_attempts = self.status_reconnect_successes = 0
+        self._status_reconnect_events = []
         self._adapter_factory = adapter_factory or (
             lambda transport: USBBootstrap(
                 transport, session=D1Session(transport, reuse_owned_id=True)
@@ -365,9 +372,22 @@ class StandbyControl:
         with self.lock:
             return self._resolve_pending(timeout=timeout)
 
-    def _resolve_pending(self, *, timeout=5):
+    @property
+    def status_diagnostics(self):
+        # Diagnostic snapshots never take the control lock from a data reader.
+        # Rows contain primitives and fixed-key dicts; append/update is under U.
+        return dict(reconnect_attempts=self.status_reconnect_attempts,
+            reconnect_successes=self.status_reconnect_successes,
+            reconnect_events=[dict(row,
+                generation=dict(row['generation']) if type(row['generation']) is dict else None,
+                result_proof=dict(row['result_proof']) if type(row['result_proof']) is dict else None)
+                for row in self._status_reconnect_events[-8:]])
+
+    def _resolve_pending(self, *, timeout=5, deadline=None):
         if not _finite(timeout) or not 0 < timeout <= 10:
             raise ValueError("Finite0<RESULT timeout<=10 required")
+        if deadline is not None and not _finite(deadline):
+            raise ValueError('Finite absolute RESULT deadline required')
         self._remember_quarantine()
         if self._unknown_task:
             raise StandbyUncertain(
@@ -375,7 +395,7 @@ class StandbyControl:
             )
         if self.pending_task is None:
             return
-        deadline = self.clock() + timeout
+        deadline = self.clock() + timeout if deadline is None else min(deadline, self.clock() + timeout)
         while True:
             if self.clock() >= deadline:
                 raise StandbyUncertain("Prior RESULT deadline; no new diagnostic START")
@@ -396,9 +416,11 @@ class StandbyControl:
             ):
                 # A fresh adapter is permitted only after the old task is
                 # terminal/missing. It still uses the caller's existing handle.
+                proof = dict(task_id=self.pending_task, status=result.status, result=result.result,
+                    terminal_or_missing=True)
                 self.bootstrap = self._adapter_factory(self.bootstrap.transport)
                 self.pending_task = None
-                return
+                return proof
             if result.status or self.clock() >= deadline:
                 raise StandbyUncertain(
                     "Prior diagnostic task remains unknown/running; no START"
@@ -547,6 +569,67 @@ class StandbyControl:
                     "Read-only terminal RESULT arrived after retry deadline"
                 )
             return True
+
+    def _resume_status_reader(self, error, command, identifier, target, deadline, detail):
+        """Resolve this accepted RO task before another status START is legal."""
+        old = self.bootstrap
+        session = old.session
+        operations = getattr(session, 'operations', None)
+        op = operations[-1] if type(operations) is list and operations and type(operations[-1]) is dict else {}
+        task = getattr(session, 'owned_task_id', None)
+        self._remember_quarantine()
+        status = getattr(old.transport, 'read_failure_status', None)
+        if (not isinstance(error, CameraDisconnected) or self.readonly_reconnect is None
+                or target != 'SLEEP' or self.pending_command != identifier or self._unknown_task
+                or type(task) is not int or not 1 <= task <= 0xFFFFFFFF or self.pending_task != task
+                or op.get('command') != command or op.get('task_id') != task
+                or op.get('start_accepted') is not True or session.quarantined is not True
+                or getattr(old.transport, 'connected', None) is not False
+                or type(status) is not int or status >= 0 or status == -7):
+            return False
+        owned = (self.work, self.nonce, deepcopy(self.owner), deepcopy(self.service), self.pending_command)
+        before = getattr(old.transport, '_thread', None)
+        row = dict(task_id=task, command_id=identifier, deadline=deadline,
+            at=self.clock(), reader_changed=False, generation=None, result_proof=None,
+            resumed=False, command_proven=False, error_type=None)
+        self.status_reconnect_attempts += 1
+        self._status_reconnect_events.append(row)
+        self._status_reconnect_events[:] = self._status_reconnect_events[-8:]
+        detail['readonly_reconnect'] = row
+        try:
+            if self.clock() >= deadline:
+                raise StandbyUncertain('Status reconnect deadline; no input retry', command_id=identifier)
+            adapter = self.readonly_reconnect(deadline=deadline)
+            self._check_bootstrap(adapter)
+            if adapter.transport is not old.transport:
+                raise StandbyUncertain('Read-only reconnect changed owned transport', command_id=identifier)
+            self.bind_bootstrap(adapter)  # Records the old quarantine; never clears it.
+            transport = self.bootstrap.transport
+            reader = getattr(transport, '_thread', None)
+            if (self.clock() >= deadline or transport is not old.transport
+                    or reader is None or reader is before or not transport.connected
+                    or self.bootstrap.session is session or session.quarantined is not True
+                    or self.pending_task != task or self._unknown_task
+                    or owned != (self.work, self.nonce, self.owner, self.service, self.pending_command)):
+                raise StandbyUncertain('Owned fresh reader/task proof changed; no START', command_id=identifier)
+            native = getattr(transport, '_device_identity', None)
+            row['reader_changed'] = True
+            row['generation'] = dict(bus=_diagnostic_scalar(native.get('bus')),
+                address=_diagnostic_scalar(native.get('address')),
+                reader_native_id=_diagnostic_scalar(getattr(reader, 'native_id', None))) if type(native) is dict else None
+            proof = self._resolve_pending(timeout=min(5, deadline - self.clock()), deadline=deadline)
+            row['result_proof'] = proof
+            if (self.clock() >= deadline or type(proof) is not dict
+                    or proof.get('task_id') != task or proof.get('terminal_or_missing') is not True
+                    or self.pending_task is not None or self._unknown_task):
+                raise StandbyUncertain('Original status task was not resolved before deadline', command_id=identifier)
+            row['resumed'] = True
+            self.status_reconnect_successes += 1
+            return True
+        except BaseException as failure:
+            row['error_type'] = type(failure).__name__[:64]
+            self._attach_status_detail(failure, detail)
+            raise
 
     def _script(self):
         return Q(self.work + "/usb_standby_owner.py")
@@ -755,6 +838,9 @@ class StandbyControl:
                 except BaseException as error:
                     command = "python3 " + self._script() + " status"
                     detail = self._status_error_detail(error, command)
+                    if self._resume_status_reader(error, command, identifier, target, deadline, detail):
+                        self._attach_status_detail(error, detail)
+                        continue
                     if not isinstance(error, BootstrapError):
                         raise
                     try:
@@ -778,6 +864,9 @@ class StandbyControl:
                         command_id=identifier,
                     )
                 if value.get("command_id") == identifier and value["state"] == target:
+                    for row in self._status_reconnect_events:
+                        if row['command_id'] == identifier and row['resumed']:
+                            row['command_proven'] = True
                     return value
                 if self.clock() >= deadline:
                     raise StandbyUncertain(

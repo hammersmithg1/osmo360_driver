@@ -145,6 +145,8 @@ class DefaultsTests(unittest.TestCase):
             set(session.prepared_factory.source_provider()), set(m.WATCHER_SOURCES)
         )
         self.assertIs(session.reconnect_control.__self__, manager)
+        self.assertIs(session.control.readonly_reconnect.func.__self__, manager)
+        self.assertEqual(session.control.readonly_reconnect.args, (self.env.camera,))
 
     def test_fast_sleep_is_explicit_bool_opt_in_before_device_or_adapter_work(self):
         for invalid in (1, None, "yes"):
@@ -381,6 +383,48 @@ class DefaultsTests(unittest.TestCase):
         self.assertIs(result, session.control.bootstrap)
         self.assertEqual(self.env.events, ["open", "missing.RESULT.ready"])
         self.assertEqual(session.control.pending_task, 37)
+
+    def test_readonly_reconnect_uses_original_absolute_budget_without_resolving_task(self):
+        session, manager = self.opened()
+        session.idle_probe(self.env.camera)
+        session.control.bootstrap.session.quarantined = True
+        self.env.transport.connected = False
+        self.env.clock.now = 8
+        self.env.events.clear()
+        with patch.object(m, 'wait_amt_ready', side_effect=self.env.ready) as ready:
+            result = session.control.readonly_reconnect(deadline=12)
+        self.assertIs(result, session.control.bootstrap)
+        self.assertEqual(ready.call_args.kwargs['timeout'], 4)
+        self.assertEqual(self.env.events, ['open', 'missing.RESULT.ready'])
+        self.assertEqual(session.control.pending_task, 37)
+        self.assertEqual(self.env.clock.now, 8)
+
+    def test_readonly_reconnect_rejects_late_readiness_under_original_deadline(self):
+        session, manager = self.opened()
+        session.idle_probe(self.env.camera)
+        session.control.bootstrap.session.quarantined = True
+        self.env.transport.connected = False
+        self.env.clock.now = 8
+        self.env.events.clear()
+        def late(transport, **options):
+            self.assertEqual(options['timeout'], 4)
+            self.env.events.append('late.missing.RESULT')
+            self.env.clock.now = 12.01
+            return dict(ready=True)
+        with patch.object(m, 'wait_amt_ready', side_effect=late):
+            with self.assertRaises(m.RequestTimeout):
+                session.control.readonly_reconnect(deadline=12)
+        self.assertFalse(manager.amt_ready)
+        self.assertEqual(session.control.pending_task, 37)
+        self.assertEqual(self.env.events, ['open', 'late.missing.RESULT'])
+
+    def test_readonly_reconnect_invalid_or_expired_absolute_budget_never_opens(self):
+        session, _ = self.build()
+        for deadline in (True, float('nan'), float('inf'), '12', 0, -1):
+            with self.subTest(deadline=deadline):
+                with self.assertRaises((ValueError, m.RequestTimeout)):
+                    session.control.readonly_reconnect(deadline=deadline)
+        self.assertEqual(self.env.events, [])
 
     def test_only_activation_e3_is_retried_and_exact60_bytes_raw1_required(self):
         session, manager = self.opened()

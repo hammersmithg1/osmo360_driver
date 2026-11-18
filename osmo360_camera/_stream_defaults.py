@@ -112,11 +112,16 @@ class _ControlGeneration:
             self._remaining(deadline)
         return self.control.bootstrap
 
-    def reconnect(self, camera):
+    def reconnect(self, camera, *, deadline=None):
         """Only open + missing-task RESULT probes; no state/START/QS/mode SET."""
         if camera is not self.camera:
             raise ValueError("Reconnect callback belongs to another Camera")
-        deadline = self.clock() + min(20, self.timeout)
+        if deadline is None:
+            deadline = self.clock() + min(20, self.timeout)
+        elif type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError('Read-only reconnect requires a finite absolute deadline')
+        else:
+            deadline = min(deadline, self.clock() + min(20, self.timeout))
         with camera._control_lock:
             while True:
                 try:
@@ -352,6 +357,7 @@ def build_stream_session(
         source_stager=InstalledSources(),
     )
     manager = _ControlGeneration(camera, control, timeout)
+    control.readonly_reconnect = partial(manager.reconnect, camera)
     if bootstrap is not None:
         # The resume path already completed RO AMT readiness/discovery on this
         # exact reader. Retain that task session instead of silently replacing it.
