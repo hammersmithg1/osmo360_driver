@@ -451,12 +451,28 @@ class USBStreamSession:
         )
         return _app.decode_query_reply(reply.payload)
 
-    def _unregister_app(self):
+    def _unregister_app(self, *, allow_absent=False):
+        if allow_absent and self.camera._usb_preview is not self._preview:
+            raise ValueError('Owned camera preview changed; no APP unregister')
         stream = self._preview._stream
-        if not stream.pause(timeout=3, keep_answer_requests=True):
+        # Normal close can follow a producer error. A dead worker plus its
+        # closed datalink socket proves no further APP DATA without pausing a
+        # stream that has already terminated. Sleep retains its stricter live
+        # pause barrier.
+        thread, link = getattr(stream, '_thread', None), getattr(stream, '_link', None)
+        closed_video = (allow_absent and thread is not None and link is not None
+                        and thread.is_alive() is False and link.stopped.is_set() is True
+                        and link._sock.fileno() == -1)
+        if not closed_video and not stream.pause(timeout=3, keep_answer_requests=True):
             stream.resume(trigger_encoder=False)
             raise ValueError("Preview activity did not quiesce; no unregister/Sleep")
         before = self._app_query()
+        if allow_absent and before.all_apps_absent:
+            self.report.setdefault('app_teardown', []).append(dict(
+                attempts=0, already_absent=True, before=before.raw.hex(), after=before.raw.hex()))
+            return before, before
+        if allow_absent and (before.count != 1 or len(before.own_records) != 1):
+            raise ValueError('Close requires exactly one own APP and no foreign registration')
         if len(before.own_records) != 1:
             raise ValueError("Exactly one present own APP metadata record required")
         transport = self.camera._transport
@@ -497,6 +513,8 @@ class USBStreamSession:
                 )
             row["after"] = after.raw.hex()
             if not after.own_records:
+                if allow_absent and not after.all_apps_absent:
+                    raise ValueError('Foreign APP appeared during owned teardown; no further unregister')
                 return before, after
             self._sleep(min(0.05, max(0, deadline - self.clock())))
 
@@ -1343,6 +1361,8 @@ class USBStreamSession:
                         )
                         self._preview = self._imu = None
                         raise
+                    if self._state == 'AWAKE' and self._preview is not None:
+                        self._unregister_app(allow_absent=True)
                     self._stop_active()
                 elif self._prepared is not None:
                     if self._prepared.lease_proven:

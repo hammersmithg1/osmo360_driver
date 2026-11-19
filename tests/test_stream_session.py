@@ -187,6 +187,7 @@ class Prepared:
             ]
         )
         self.fresh_video, self.fresh_imu = self.preview.items[-1], self.imu.items[-1]
+        self.env.camera._usb_preview = self.preview
         return self.preview, self.imu
 
     def stop(self):
@@ -225,13 +226,17 @@ class Environment:
             self.present = False
 
         transport.request, transport._write = request, write
+        def preview(**options):
+            value = Capture(self, "preview")
+            self.camera._usb_preview = value
+            return value
         self.camera = types.SimpleNamespace(
             _control_lock=threading.RLock(),
             _transport=transport,
             _imu=None,
             _usb_preview=None,
             connect=lambda: self.events.append("camera.connect"),
-            usb_preview=lambda **options: Capture(self, "preview"),
+            usb_preview=preview,
             imu=lambda **options: Capture(self, "imu"),
         )
         self.control = Control(self)
