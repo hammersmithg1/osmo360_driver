@@ -99,6 +99,9 @@ class OsmoCamera:
         self._power_lease = None
         self._power_rebind_allowed = False
         self._close_power_error = None
+        self._shutdown_attempted = self._shutdown_prepared = False
+        self.shutdown = dict(state='idle', ready=False, error='')
+        self.policy_change = dict(state='idle', policy=None, error='')
         self.power = dict(requested=usb_charging, state='unmanaged' if usb_charging is None else 'unprepared',
                           ready=usb_charging is None, error='', physical_proof='unknown',
                           policy_readback_is_cache=True)
@@ -144,15 +147,25 @@ class OsmoCamera:
         self.worker.start()
 
     def command(self, action, settings=None):
-        if action not in ('start', 'stop', 'sleep', 'wake', 'reboot', 'configure', 'refresh', 'prepare_power'):
+        if action not in ('start', 'stop', 'sleep', 'wake', 'reboot', 'configure', 'refresh', 'prepare_power',
+                          'charging_policy', 'prepare_shutdown'):
             raise ValueError('Неизвестная команда Osmo 360')
         if action == 'configure':
             settings = validate_settings(settings)
+        if action == 'charging_policy':
+            if (type(settings) is not dict or set(settings) != {'policy'}
+                    or settings['policy'] not in ('keep', 'disable')):
+                raise ValueError('Политика зарядки должна быть keep или disable')
+            settings = dict(settings)
         with self.control_lock, self.condition:
             if self.stopping.is_set():
                 raise ValueError('Драйвер закрывается')
             if self.busy:
                 raise ValueError('Дождись завершения команды Osmo 360: ' + self.busy)
+            if self._shutdown_attempted:
+                if action == 'prepare_shutdown' and self._shutdown_prepared:
+                    return self.status()
+                raise ValueError('Камера завершает работу; новые команды запрещены')
             self.busy, self.error = action, ''
             self.command_started_at = time.monotonic()
             self.commands.put_nowait((action, settings))
@@ -168,6 +181,8 @@ class OsmoCamera:
                         command_elapsed_s=round(now - self.command_started_at, 1) if self.busy and self.command_started_at is not None else None,
                         preparation=dict(self.preparation),
                         power=json_value(self.power),
+                        shutdown=json_value(getattr(self, 'shutdown', dict(state='idle', ready=False, error=''))),
+                        charging_policy=json_value(getattr(self, 'policy_change', dict(state='idle', policy=None, error=''))),
                         frame_age_s=age, capture_fps=round(fps, 1) if age is not None and age < 2 else 0,
                         frames=self.frames, imu_samples=self.imu_samples,
                         timestamp_missing_frames=self.timestamp_missing_frames,
@@ -187,8 +202,8 @@ class OsmoCamera:
                 return None
             return self.sequence, self.frame
 
-    def hold_power(self, state='preparing'):
-        if getattr(self, 'usb_charging', None) is None:
+    def hold_power(self, state='preparing', *, force=False):
+        if getattr(self, 'usb_charging', None) is None and not force:
             return
         # Publish the closed gate before synchronously releasing the webcam.
         # A parent timer must not reopen it while the callback/SET is running.
@@ -273,6 +288,95 @@ class OsmoCamera:
         except Exception as error:
             detail = getattr(error, 'report', None) or self.power
             self.power = dict(detail, requested=self.usb_charging, ready=False, error=str(error))
+            raise
+
+    def change_charging_policy(self, settings):
+        self.require_session_state()
+        policy = settings['policy']
+        requested = False if policy == 'disable' else None
+        self.policy_change = dict(state='applying', policy=policy, error='')
+        restart = self.enabled
+        sleeping = self.stream is not None and self.stream.state == 'SLEEP'
+        try:
+            self.hold_power('changing_policy', force=True)
+            self.close_stream()
+            self.restore_power()
+            old_lease = self._power_lease
+            if (old_lease is not None and old_lease.receipt is not None
+                    and (self.power.get('ok') is not True or self.power.get('state') != 'restored')):
+                raise USBChargingError('Original charging policy restoration was not verified', self.power)
+            # Retire the old receipt only after its exact original was restored.
+            self._power_lease = None
+            self.usb_charging = requested
+            self.power = dict(requested=requested, state='unmanaged' if requested is None else 'unprepared',
+                              ready=requested is None, error='', physical_proof='unknown', policy_readback_is_cache=True)
+            self.prepare_power(verified_rebind=True)
+            if restart:
+                self.activate()
+            else:
+                self.state = 'sleeping' if sleeping else ('idle' if self.camera and self.camera.connected else 'disconnected')
+            self.policy_change = dict(state='applied', policy=policy, error='')
+        except Exception as error:
+            self.policy_change = dict(state='error', policy=policy, error=str(error))
+            self.power = dict(self.power, ready=False, error=str(error))
+            raise
+
+    def prepare_shutdown(self):
+        if self._shutdown_prepared:
+            return dict(self.shutdown)
+        if self._shutdown_attempted:
+            raise RuntimeError('Camera shutdown already failed; no input replay')
+        self._shutdown_attempted = True
+        self.shutdown = dict(state='preparing', ready=False, error='')
+        try:
+            self.hold_power('shutting_down', force=True)
+            self.stop_readers()
+            expected = None
+            if self.stream is not None:
+                self.require_session_state()
+                if self.stream.state == 'AWAKE':
+                    expected = self.stream.sleep()
+                else:
+                    control = self.stream._core.control
+                    expected = control.wait_sleep_snapshot(control.last['command_id'], deadline=time.monotonic()+20)
+                if type(expected) is not dict or expected.get('state') != 'SLEEP':
+                    raise RuntimeError('SDK did not prove native Sleep before shutdown cleanup')
+                self.close_stream()
+            elif attached_camera_count() == 0:
+                lease = self._power_lease
+                if lease is not None and (lease.receipt is not None or getattr(lease, 'uncertain', False)):
+                    raise USBChargingError('Absent camera still owns an unrestored charging receipt', self.power)
+                self.shutdown = dict(state='absent', ready=True, complete_usb_inventory=True,
+                                     local_control_closed=True)
+                if self.camera is not None:
+                    self.camera.close()
+                self._shutdown_prepared = True
+                self.state = 'shutdown_ready'
+                return dict(self.shutdown)
+            self.restore_power()
+            lease = self._power_lease
+            if (lease is not None and lease.receipt is not None
+                    and (self.power.get('ok') is not True or self.power.get('state') != 'restored')):
+                raise USBChargingError('Original charging policy restoration was not verified', self.power)
+            # Final Sleep observation uses a new diagnostic controller. Once
+            # the original is restored, retain its evidence but retire its
+            # mutator so an unknown final task cannot trigger a restore replay.
+            self.shutdown['charging_restore'] = json_value(self.power)
+            self._power_lease = None
+            if self.camera is None:
+                self.camera = self.camera_factory()
+            proof = self.camera.prepare_shutdown(expected_sleep=expected,
+                expected_boot_id=self.preparation.get('boot_id'), timeout=90)
+            if (type(proof) is not dict or proof.get('ready') is not True
+                    or proof.get('local_control_closed') is not True):
+                raise RuntimeError('Camera shutdown proof or local USB close is incomplete')
+            self.shutdown = dict(self.shutdown, **proof)
+            self._shutdown_prepared = True
+            self.power = dict(self.power, ready=False)
+            self.state = 'shutdown_ready'
+            return dict(self.shutdown)
+        except Exception as error:
+            self.shutdown = dict(self.shutdown, state='error', ready=False, error=str(error))
             raise
 
     def connect(self, *, wait_ready=True):
@@ -529,7 +633,11 @@ class OsmoCamera:
             self.state = 'idle'
 
     def execute(self, action, settings):
-        if action == 'prepare_power':
+        if action == 'prepare_shutdown':
+            self.prepare_shutdown()
+        elif action == 'charging_policy':
+            self.change_charging_policy(settings)
+        elif action == 'prepare_power':
             self.prepare_power()
         elif action in ('start', 'wake'):
             self.activate()
@@ -619,33 +727,37 @@ class OsmoCamera:
                         self.busy = ''
                         self.command_started_at = None
         finally:
-            cleanup_error = None
+            if not getattr(self, '_shutdown_prepared', False):
+                self._final_cleanup()
+
+    def _final_cleanup(self):
+        cleanup_error = None
+        try:
             try:
-                try:
-                    self.close_stream()
-                    self.restore_power()
-                except Exception as exc:
+                self.close_stream()
+                self.restore_power()
+            except Exception as exc:
+                cleanup_error = exc
+        finally:
+            # Public Camera.close retains uncertain stream ownership while
+            # safely retiring local USB control. A deferred stream cleanup
+            # must not leave its libusb reader alive at interpreter shutdown.
+            try:
+                if self.camera is not None:
+                    self.camera.close()
+            except Exception as exc:
+                if cleanup_error is None:
                     cleanup_error = exc
-            finally:
-                # Public Camera.close retains uncertain stream ownership while
-                # safely retiring local USB control. A deferred stream cleanup
-                # must not leave its libusb reader alive at interpreter shutdown.
-                try:
-                    if self.camera is not None:
-                        self.camera.close()
-                except Exception as exc:
-                    if cleanup_error is None:
-                        cleanup_error = exc
-                    elif hasattr(cleanup_error, 'add_note'):
-                        cleanup_error.add_note('Local Camera close: ' + error_chain(exc)[0]['message'])
-            if cleanup_error is not None:
-                self.error = str(cleanup_error)
-                if (self.usb_charging is not None and self._power_lease is not None
-                        and (self._power_lease.receipt is not None or getattr(self._power_lease, 'uncertain', False))):
-                    self._close_power_error = cleanup_error
-                    self.power = dict(self.power, ready=False, state='unknown',
-                                      error='Original charging policy restore is incomplete: ' + str(cleanup_error))
-                self.on_error(self.error)
+                elif hasattr(cleanup_error, 'add_note'):
+                    cleanup_error.add_note('Local Camera close: ' + error_chain(exc)[0]['message'])
+        if cleanup_error is not None:
+            self.error = str(cleanup_error)
+            if (self.usb_charging is not None and self._power_lease is not None
+                    and (self._power_lease.receipt is not None or getattr(self._power_lease, 'uncertain', False))):
+                self._close_power_error = cleanup_error
+                self.power = dict(self.power, ready=False, state='unknown',
+                                  error='Original charging policy restore is incomplete: ' + str(cleanup_error))
+            self.on_error(self.error)
 
     def failed(self, error):
         current = self.failure_stats()

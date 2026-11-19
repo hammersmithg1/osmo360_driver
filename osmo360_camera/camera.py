@@ -749,6 +749,13 @@ class Camera:
         self._record_owned = False
         return state
 
+    @_serialized
+    def prepare_shutdown(self, *, expected_sleep=None, expected_boot_id=None, timeout=90):
+        """Verify closed native USB/Sleep, close local control, never power off the host."""
+        from ._shutdown import prepare_shutdown
+        return prepare_shutdown(self, expected_sleep=expected_sleep,
+                                expected_boot_id=expected_boot_id, timeout=timeout)
+
     def close(self):
         # Session lifecycle takes its own lock before using camera control.
         # Do not hold the control lock while asking it to close: a concurrent

@@ -302,6 +302,24 @@ again uses `wake()`. Complete cleanup happens on driver shutdown, configuration
 or reboot. Status includes the actual startup phase, command elapsed time and
 the installation/autostart proof returned by the SDK.
 
+Embedded applications can change the charging policy on the same owner with
+`owner.command('charging_policy', {'policy': 'keep'})` or `disable`.
+The serialized worker closes capture, restores the previous charging lease,
+prepares the new policy, and restarts capture if it was running. Wait for
+`busy` to clear and check the error and power proof before saving a preference.
+`keep` preserves the current camera charging policy; it does not force charging on.
+
+Before shutting down the host, call `owner.command('prepare_shutdown')` and wait
+for `owner.status()['shutdown']['ready']`. This finishes capture cleanup,
+restores the original charging policy and verifies the exact current native
+Sleep, closed transition guards and next-start resume metadata. Subsequent
+`owner.close()` releases local resources without waking the camera. The SDK
+does not power off the host; the application should do that only after the
+proof is ready. Missing/unknown USB or diagnostic outcomes fail this operation
+without replaying a sleep input. The lower-level `Camera.prepare_shutdown()`
+requires closed capture owners and can prepare an idle camera without starting
+video or IMU.
+
 Video and IMU readers start as soon as the SDK supplies a healthy stream,
 before optional settings queries. A failed GET clears the settings snapshot
 and appears in `settings_error` with the affected field; it does not stop
