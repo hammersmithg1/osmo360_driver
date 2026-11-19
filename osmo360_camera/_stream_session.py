@@ -1093,6 +1093,27 @@ class USBStreamSession:
             # the transition's primary failure during postmortem capture.
             prepared.report["freshness_snapshot_error"] = repr(error)[:240]
 
+    def _wake_control_diagnostics(self):
+        """Existing controller/task evidence only; no join, reconnect or query."""
+        control = self.control
+        session = getattr(getattr(control, 'bootstrap', None), 'session', None)
+        operations = getattr(session, 'operations', None)
+        last = operations[-1] if type(operations) is list and operations and type(operations[-1]) is dict else {}
+        keys = ('command', 'task_id', 'completed', 'start_accepted', 'success', 'result',
+                'error', 'quarantined', 'quarantine_reason', 'start_attempts', 'timeout_ms')
+        outcome = self._wake_outcome
+        error = outcome.get('error')
+        return _bounded_diagnostic(dict(
+            pending_command=getattr(control, 'pending_command', None),
+            pending_task=getattr(control, 'pending_task', None),
+            unknown_task=getattr(control, '_unknown_task', None),
+            quarantined=getattr(session, 'quarantined', None),
+            owned_task_id=getattr(session, 'owned_task_id', None),
+            wake_thread_alive=self._wake_thread is not None and self._wake_thread.is_alive(),
+            wake_submission=outcome.get('submission'),
+            wake_error=dict(type=type(error).__name__, args=error.args) if error is not None else None,
+            last_operation={key: last[key] for key in keys if key in last}))
+
     @_lifecycle
     def wake(self, *, timeout=45):
         if (
@@ -1241,6 +1262,10 @@ class USBStreamSession:
                 self.report["wake_failure"] = dict(
                     errors=_exception_chain(error), prepared=prepared
                 )
+                try:
+                    self.report['wake_failure']['control'] = self._wake_control_diagnostics()
+                except BaseException as diagnostic:
+                    self.report['wake_failure']['control_diagnostics_error'] = type(diagnostic).__name__[:128]
                 if self.report["cycles"]:
                     self.report["cycles"][-1]["prepared"] = deepcopy(prepared)
                 self._set_state("RECOVERY_REQUIRED")

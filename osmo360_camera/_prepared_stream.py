@@ -632,11 +632,13 @@ class PreparedStream:
             return value
 
         try:
+            self.report['attach_phase'] = 'host_network'
             guard = self.network.wait_ready(
                 self.baseline, self.runtime.host_addr, timeout=remaining()
             )
             remaining()
             self.preview.report["network"] = guard
+            self.report['attach_phase'] = 'lease_start'
             lease = self.preview._lease = self.lease_factory(
                 dict(self.plan["lease"], interface=guard["ncm_interface"])
             )
@@ -648,6 +650,7 @@ class PreparedStream:
             self.lease_proven, self.possible_future_apply = True, False
             self.report["lease_ack"] = deepcopy(lease.last_ack)
             remaining()  # A late ACK is still executed-plan cleanup evidence.
+            self.report['attach_phase'] = 'adopt_capture'
             if self.camera._imu is not None or self.camera._usb_preview is not None:
                 raise PreparedStreamError(
                     "Another producer acquired camera ownership during Wake"
@@ -662,13 +665,22 @@ class PreparedStream:
                 local_address=self.plan["lease"]["host_ip"],
                 interface=guard["ncm_interface"],
             )
+            self.report['attach_phase'] = 'video_start'
             stream.start()
             self.imu_started = True  # Partial startup must still restore mask.
+            self.report['attach_phase'] = 'imu_start'
             self.imu.start()
             remaining()
             self.report.update(data_started=True, media_ready_proven=False)
             return self.preview, self.imu
         except BaseException as error:
+            # A host-only snapshot, not proof that a native apply did not run.
+            # Reading/copying evidence must never replace the original failure.
+            try:
+                self.report['attach_failure'] = dict(phase=self.report.get('attach_phase'),
+                    network=deepcopy(getattr(self.network, 'report', None)))
+            except BaseException as diagnostic:
+                self.report['attach_diagnostics_error'] = type(diagnostic).__name__[:128]
             self.report["errors"].append(type(error).__name__ + ": " + str(error))
             if not self.lease_proven:
                 self.report["recovery_required"] = True
