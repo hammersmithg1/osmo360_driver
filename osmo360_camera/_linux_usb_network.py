@@ -43,6 +43,15 @@ class _MutationTargetVanished(LinuxUSBNetworkError):
     pass
 
 
+class _NetdevIdentityReadError(OSError):
+    """An observed EINVAL from one explicitly identified netdev attribute."""
+
+    def __init__(self, path, attribute, error):
+        # read(2) errors can omit filename after a successful open(2).
+        super().__init__(error.errno, error.strerror, str(path))
+        self.attribute = attribute
+
+
 @dataclass(frozen=True)
 class Identity:
     name: str
@@ -96,6 +105,30 @@ class LinuxUSBNetworkGuard:
         value = path.stat()
         return value.st_dev, value.st_ino
 
+    def _read_netdev_identity(self, entry, attribute):
+        if attribute not in ("address", "ifindex"):
+            raise ValueError("Only netdev address/ifindex identity reads are allowed")
+        path = entry / attribute
+        try:
+            return path.read_text()
+        except OSError as error:
+            if error.errno != errno.EINVAL:
+                raise
+            observations = self.report.setdefault(
+                "identity_read_errors", dict(count=0, errors=[])
+            )
+            observations["count"] += 1
+            if len(observations["errors"]) < 8:
+                observations["errors"].append(
+                    dict(errno=error.errno, path=str(path), attribute=attribute,
+                         preownership=self.identity is None)
+                )
+            # Linux net/core/net-sysfs.c netdev_show()/address_show() return
+            # EINVAL after NETREG_REGISTERED, even while sysfs still exists:
+            # https://github.com/torvalds/linux/blob/v6.8/net/core/net-sysfs.c
+            # This identifies the failed read; it never proves NIC absence.
+            raise _NetdevIdentityReadError(path, attribute, error) from error
+
     def _identity(self, name, mac):
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", name):
             raise LinuxUSBNetworkError("Unsafe interface name")
@@ -104,9 +137,9 @@ class LinuxUSBNetworkGuard:
         root = self.physical_root.resolve(strict=True)
         if not net.is_relative_to(root):
             raise LinuxUSBNetworkError("Network device is outside physical sysfs")
-        if (entry / "address").read_text().strip().lower() != mac:
+        if self._read_netdev_identity(entry, "address").strip().lower() != mac:
             raise LinuxUSBNetworkError("USB host MAC changed")
-        index = int((entry / "ifindex").read_text())
+        index = int(self._read_netdev_identity(entry, "ifindex"))
         if index <= 0:
             raise LinuxUSBNetworkError("Invalid interface index")
         device = (entry / "device").resolve(strict=True)
@@ -505,6 +538,29 @@ class LinuxUSBNetworkGuard:
                         )
                     try:
                         identity = self._identity(name, host_mac.lower())
+                    except _NetdevIdentityReadError as error:
+                        # No candidate has been adopted and no scoped write
+                        # has been attempted. Discard this ip/sysfs view only
+                        # during a reset, under its ORIGINAL absolute budget.
+                        if (self._reset_origin is None or self._reset_deadline is None
+                                or self.identity is not None or self.attempts
+                                or self.report["events"] or self.up_intent
+                                or self.add_rejected or self.cleaned):
+                            raise
+                        self.report["initial_identity_einval_retries"] = (
+                            self.report.get("initial_identity_einval_retries", 0) + 1
+                        )
+                        remaining = min(deadline, self._reset_deadline) - self.clock()
+                        if remaining <= 0:
+                            raise LinuxUSBNetworkError(
+                                "Initial reset USB identity did not settle before deadline"
+                            ) from error
+                        self.sleep(min(0.1, remaining))
+                        if self.clock() >= min(deadline, self._reset_deadline):
+                            raise LinuxUSBNetworkError(
+                                "Initial reset USB identity did not settle before deadline"
+                            ) from error
+                        continue
                     except FileNotFoundError as error:
                         # udev may rename usb0 after the ip snapshot. Nothing
                         # is owned yet: retry discovery, never a pinned write.

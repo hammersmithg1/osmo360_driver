@@ -51,6 +51,32 @@ def _finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def _attachment_error(error):
+    """Bounded exception provenance without frame locals or further I/O."""
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen and len(chain) < 4:
+        seen.add(id(error))
+        frames, tb = [], error.__traceback__
+        while tb is not None:
+            frames.append(dict(
+                filename=tb.tb_frame.f_code.co_filename[:512],
+                line=tb.tb_lineno,
+                function=tb.tb_frame.f_code.co_name[:128],
+            ))
+            frames = frames[-8:]
+            tb = tb.tb_next
+        row = dict(type=type(error).__name__[:128],
+                   message=str(error)[:1024], traceback=frames)
+        if isinstance(error, OSError):
+            row.update(errno=error.errno,
+                       filename=str(error.filename)[:512] if error.filename is not None else None)
+        chain.append(row)
+        error = error.__cause__ or (
+            error.__context__ if not error.__suppress_context__ else None
+        )
+    return chain
+
+
 def completion_ticket(lease_nonce, helper_nonce, wake_id):
     return hashlib.sha256(
         bytes.fromhex(lease_nonce)
@@ -560,6 +586,7 @@ class RetainedStream:
         try:
             while True:
                 remaining()
+                self.report["attach_phase"] = "old_index_absent"
                 absent, _ = self.network._old_index_absent(self.network.identity, deadline=deadline)
                 if absent:
                     self._stop_provisional()
@@ -567,6 +594,7 @@ class RetainedStream:
                         sock.close()
                         sock = None
                     try:
+                        self.report["attach_phase"] = "rebind"
                         self.network, ready = self.network.rebind_after_usb_reset(
                             timeout=remaining()
                         )
@@ -581,13 +609,18 @@ class RetainedStream:
                         deepcopy(ready)
                     )
                     try:
+                        self.report["attach_phase"] = "provisional"
                         self._start_provisional(ready, remaining)
                     except (OSError, PreviewLeaseError):
+                        self.report["attach_phase"] = "provisional_old_index_absent"
                         if self.network._old_index_absent(self.network.identity, deadline=deadline)[0]:
                             self._stop_provisional()
                             continue
+                        self.report["attach_phase"] = "provisional"
                         raise
+                    self.report["attach_phase"] = "socket_create"
                     sock = self.socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+                    self.report["attach_phase"] = "socket_bind"
                     bind_socket(
                         sock, self.plan["lease"]["host_ip"], ready["ncm_interface"]
                     )
@@ -595,6 +628,7 @@ class RetainedStream:
                     self.sleep(min(0.02, remaining()))
                     continue
                 challenge = secrets.randbits(64)
+                self.report["attach_phase"] = "completion_poll"
                 sock.settimeout(min(0.05, remaining()))
                 try:
                     sock.sendto(
@@ -620,10 +654,12 @@ class RetainedStream:
                     )
                 except (ValueError, TypeError, KeyError):
                     continue
+                self.report["attach_phase"] = "final_old_index_absent"
                 if self.network._old_index_absent(self.network.identity, deadline=deadline)[0]:
                     continue
                 # Recheck the pinned generation and all original host state;
                 # the receipt can never authorize alias/route drift.
+                self.report["attach_phase"] = "final_proof"
                 snapshot, state = self.network._snapshot()
                 current = self.network._current((snapshot, state))
                 self.network._unchanged_other_state(state)
@@ -665,8 +701,10 @@ class RetainedStream:
             return value
 
         try:
+            self.report["attach_phase"] = "completion"
             ready = self._completion(remaining, deadline=deadline)
             remaining()
+            self.report["attach_phase"] = "preview_create"
             fresh = self.preview = self.preview_factory(
                 self.camera,
                 decode=self.decode,
@@ -684,6 +722,7 @@ class RetainedStream:
                 raise PreparedStreamError("Final generation has no owned provisional lease")
             fresh._lease = lease
             before = lease._sequence
+            self.report["attach_phase"] = "final_lease_renew"
             ack = lease.renew()
             if (not lease.healthy or not ack or ack["sequence"] <= before
                     or self.network._old_index_absent(self.network.identity, deadline=deadline)[0]):
@@ -701,6 +740,7 @@ class RetainedStream:
             self.report["lease_ack"] = deepcopy(lease.last_ack)
             # A late ACK still proves the original plan for normal cleanup.
             remaining()
+            self.report["attach_phase"] = "adopt_preview"
             if (
                 self.camera._imu is not None
                 or self.camera._usb_preview is not self.old_preview
@@ -716,8 +756,10 @@ class RetainedStream:
                 network=deepcopy(ready),
                 work_dir=self.plan["work_dir"],
             )
+            self.report["attach_phase"] = "imu_create"
             self.imu = self.imu_factory(**self.imu_options)
             self.camera._imu = self.imu
+            self.report["attach_phase"] = "video_create"
             stream = fresh._stream = self.video_factory(
                 decode=self.decode,
                 queue_size=self.queue_size,
@@ -725,6 +767,7 @@ class RetainedStream:
                 local_address=config["host_ip"],
                 interface=ready["ncm_interface"],
             )
+            self.report["attach_phase"] = "video_start"
             stream.start()
             remaining()
             self.report.update(
@@ -732,13 +775,31 @@ class RetainedStream:
             )
             return fresh, self.imu
         except BaseException as error:
+            # Failed rebind candidates remain in the old guard's report. Freeze
+            # them before local cleanup or a later inspection changes it.
+            # Diagnostics are best effort: neither an injected guard nor an
+            # exception's formatting may replace the original control failure.
+            try:
+                failure = dict(phase=self.report.get("attach_phase"),
+                               errors=_attachment_error(error))
+                try:
+                    failure["network"] = deepcopy(getattr(self.network, "report", None))
+                except BaseException as diagnostic:
+                    failure["network_error"] = type(diagnostic).__name__[:128]
+                self.report["attach_failure"] = failure
+            except BaseException as diagnostic:
+                self.report["attach_diagnostics_error"] = type(diagnostic).__name__[:128]
             try:
                 self._stop_provisional()
             except Exception as cleanup:
                 self.report["provisional_stop_error"] = repr(cleanup)
                 if hasattr(error, "add_note"):
                     error.add_note("Provisional local stop: " + repr(cleanup))
-            self.report["errors"].append(repr(error))
+            try:
+                description = repr(error)[:1024]
+            except BaseException:
+                description = type(error).__name__[:128]
+            self.report["errors"].append(description)
             if not self.lease_proven:
                 self.report["recovery_required"] = True
                 raise UnknownFutureApply(

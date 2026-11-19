@@ -619,18 +619,32 @@ class OsmoCamera:
                         self.busy = ''
                         self.command_started_at = None
         finally:
+            cleanup_error = None
             try:
-                self.close_stream()
-                self.restore_power()
-                if self.camera is not None:
-                    self.camera.close()
-            except Exception as exc:
-                self.error = str(exc)
+                try:
+                    self.close_stream()
+                    self.restore_power()
+                except Exception as exc:
+                    cleanup_error = exc
+            finally:
+                # Public Camera.close retains uncertain stream ownership while
+                # safely retiring local USB control. A deferred stream cleanup
+                # must not leave its libusb reader alive at interpreter shutdown.
+                try:
+                    if self.camera is not None:
+                        self.camera.close()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    elif hasattr(cleanup_error, 'add_note'):
+                        cleanup_error.add_note('Local Camera close: ' + error_chain(exc)[0]['message'])
+            if cleanup_error is not None:
+                self.error = str(cleanup_error)
                 if (self.usb_charging is not None and self._power_lease is not None
                         and (self._power_lease.receipt is not None or getattr(self._power_lease, 'uncertain', False))):
-                    self._close_power_error = exc
+                    self._close_power_error = cleanup_error
                     self.power = dict(self.power, ready=False, state='unknown',
-                                      error='Original charging policy restore is incomplete: ' + str(exc))
+                                      error='Original charging policy restore is incomplete: ' + str(cleanup_error))
                 self.on_error(self.error)
 
     def failed(self, error):
