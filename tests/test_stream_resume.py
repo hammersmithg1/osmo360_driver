@@ -118,7 +118,7 @@ class ResumeTests(unittest.TestCase):
         stream = self.wrapper()
         self.assertEqual(self.events, [])
         with patch.object(
-            m, "_discover", side_effect=lambda c: self.events.append("discover") or None
+            m, "_discover", side_effect=lambda c, **_: self.events.append("discover") or None
         ):
             self.assertIs(stream.start(), stream)
         self.assertEqual(self.events, ["connect", "RO.ready", "discover", "core.start"])

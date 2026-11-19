@@ -49,6 +49,7 @@ class RuntimeTests(unittest.TestCase):
         owner.power = dict(requested=None, state='unmanaged', ready=True, error='')
         owner._power_lease = None
         owner._power_rebind_allowed = False
+        owner.host_offset_ns = 0
         getters = {
             'exposure_mode': controls.decode_exposure_mode, 'iso': controls.decode_iso,
             'white_balance': controls.decode_white_balance, 'shutter': controls.decode_shutter,
@@ -57,9 +58,9 @@ class RuntimeTests(unittest.TestCase):
         methods = {('shutter_setting' if key == 'shutter' else key): Mock(side_effect=lambda key=key, decode=decode: decode(bytes.fromhex(native[key])))
                    for key, decode in getters.items()}
         owner.camera = SimpleNamespace(connected=True, usb_stream=Mock(return_value=Mock(state='AWAKE')),
-            state=Mock(), system_mode=Mock(), install_helpers=Mock(return_value={
-                'installed': True, 'already_installed': True, 'autostart_hydration_verified': True,
-                'reboot_attempted': False}), **methods)
+            state=Mock(), system_mode=Mock(), prepare_stream=Mock(return_value={
+                'ready': True, 'mode': 'helpers', 'installed': True, 'already_installed': True,
+                'autostart_hydration_verified': True, 'reboot_attempted': False}), **methods)
         owner.camera.usb_stream.return_value.verify_control.return_value = {'state': 'AWAKE'}
         owner.stream, owner.enabled, owner.settings = None, False, {}
         owner.helpers_ready, owner.preparation = True, {}
@@ -73,7 +74,9 @@ class RuntimeTests(unittest.TestCase):
         owner.camera.state.side_effect = RequestTimeout('ordinary services are asleep')
         owner.activate()
         owner.camera.connect.assert_called_once_with(timeout=None)
-        owner.camera.install_helpers.assert_not_called()
+        owner.camera.prepare_stream.assert_called_once_with(timeout=180)
+        owner.camera.state.assert_not_called()
+        owner.camera.system_mode.assert_not_called()
         owner.stream.start.assert_called_once_with()
         owner.start_readers.assert_called_once_with()
 
@@ -81,12 +84,12 @@ class RuntimeTests(unittest.TestCase):
         owner = self.settings_owner()
         owner.helpers_ready = False
         owner.activate()
-        owner.camera.install_helpers.assert_called_once_with(timeout=180)
+        owner.camera.prepare_stream.assert_called_once_with(timeout=180)
         self.assertTrue(owner.preparation['already_installed'])
         self.assertTrue(owner.helpers_ready)
         owner = self.settings_owner()
         owner.helpers_ready = False
-        owner.camera.install_helpers.return_value = {'installed': True, 'autostart_hydration_verified': False}
+        owner.camera.prepare_stream.return_value = {'ready': False, 'installed': True, 'autostart_hydration_verified': False}
         with self.assertRaisesRegex(RuntimeError, 'автозапуск'):
             owner.activate()
         owner.camera.usb_stream.assert_not_called()
@@ -105,7 +108,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(owner.enabled)
         owner.activate()
         owner.camera.usb_stream.assert_called_once()
-        owner.camera.install_helpers.assert_called_once()
+        owner.camera.prepare_stream.assert_called_once()
         session.start.assert_called_once()
         session.sleep.assert_called_once()
         session.wake.assert_called_once()
@@ -115,7 +118,7 @@ class RuntimeTests(unittest.TestCase):
         old, new, profile = '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'a' * 64
         owner = self.settings_owner()
         owner.helpers_ready = False
-        owner.camera.install_helpers.return_value.update(boot_id=old, profile=profile,
+        owner.camera.prepare_stream.return_value.update(boot_id=old, profile=profile,
                                                         installation=dict(boot_id='older-unverified-boot'))
         owner.prepare_helpers()
         self.assertEqual(owner._verified_helpers, dict(boot_id=old, profile=profile))
@@ -128,10 +131,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(owner.preparation['autostart_hydration_verified'])
         self.assertNotIn('boot_id', owner.preparation)
         self.assertEqual(owner.preparation['boot_id_before'], old)
-        owner.camera.install_helpers.return_value.update(boot_id=new, boot_id_before=old,
+        owner.camera.prepare_stream.return_value.update(boot_id=new, boot_id_before=old,
             hydration_wait=dict(mode='after-known-reboot', attempts=2), verification_only=True)
         owner.activate()
-        owner.camera.install_helpers.assert_called_with(timeout=180, previous_boot_id=old)
+        owner.camera.prepare_stream.assert_called_with(timeout=180, previous_boot_id=old)
         self.assertEqual(owner._verified_helpers['boot_id'], new)
         self.assertEqual(owner.preparation['boot_id'], new)
         self.assertFalse(owner.preparation['reboot_attempted'])
@@ -144,7 +147,7 @@ class RuntimeTests(unittest.TestCase):
         owner._helpers_previous_boot_id = previous
         owner.camera.state.side_effect = RequestTimeout('early ordinary GET')
         owner.prepare_helpers()
-        owner.camera.install_helpers.assert_called_once_with(timeout=180, previous_boot_id=previous)
+        owner.camera.prepare_stream.assert_called_once_with(timeout=180, previous_boot_id=previous)
         owner.camera.state.assert_not_called()
 
     def test_real_program_snapshot_with_unset_shutter_starts_readers(self):
@@ -405,7 +408,8 @@ class RuntimeTests(unittest.TestCase):
     def test_failed_start_retains_sdk_report_for_diagnosis(self):
         report = {'report': {'state': 'RECOVERY_REQUIRED', 'errors': ['initial preview failed']}}
         session = SimpleNamespace(start=Mock(side_effect=RuntimeError('preview failed')), stats=report, close=Mock())
-        camera = SimpleNamespace(connected=True, state=Mock(side_effect=RequestTimeout('sleeping')),
+        camera = SimpleNamespace(connected=True,
+                                 prepare_stream=Mock(return_value=dict(ready=True, mode='retained_owner')),
                                  usb_stream=Mock(return_value=session), close=Mock())
         owner = OsmoCamera(camera_factory=lambda: camera)
         try:

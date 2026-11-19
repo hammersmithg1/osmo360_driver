@@ -28,6 +28,8 @@ from ._helper_install import InstalledSources
 from ._stream_session import USBStreamSession, _IdleEvidence
 from ._usb_bootstrap import USBBootstrap
 from .imu import IMUStream
+from .usb_preview import USBPreview
+from .video import VideoStream
 from .transport import USBError, CameraDisconnected, RequestTimeout
 
 DEVICE = Path(__file__).with_name("_device")
@@ -218,9 +220,20 @@ class _ControlGeneration:
             return _IdleEvidence(self.clock(), state.recording_state, activation, True)
 
 
+def _capture_factories(on_access_unit):
+    """Bind the raw admission callback to every initial/wake video producer."""
+    if on_access_unit is None:
+        return {}
+    if not callable(on_access_unit):
+        raise ValueError("on_access_unit must be callable or None")
+    return dict(preview_factory=partial(USBPreview, on_access_unit=on_access_unit),
+                video_factory=partial(VideoStream, on_access_unit=on_access_unit))
+
+
 class _PreparedFactory:
-    def __init__(self, source_provider, *, decode, queue_size, imu_options):
+    def __init__(self, source_provider, *, decode, queue_size, imu_options, on_access_unit=None):
         self.source_provider = source_provider
+        self.capture_factories = _capture_factories(on_access_unit)
         self.decode, self.queue_size, self.imu_options = (
             decode,
             queue_size,
@@ -254,12 +267,14 @@ class _PreparedFactory:
             decode=self.decode,
             queue_size=self.queue_size,
             imu_options=self.imu_options,
+            **self.capture_factories,
         )
 
 
 class _RetainedFactory:
-    def __init__(self, source_provider, *, decode, queue_size, imu_options):
+    def __init__(self, source_provider, *, decode, queue_size, imu_options, on_access_unit=None):
         self.source_provider = source_provider
+        self.capture_factories = _capture_factories(on_access_unit)
         self.decode, self.queue_size, self.imu_options = (
             decode,
             queue_size,
@@ -292,6 +307,7 @@ class _RetainedFactory:
             decode=self.decode,
             queue_size=self.queue_size,
             imu_options=self.imu_options,
+            **self.capture_factories,
         )
 
 
@@ -306,6 +322,7 @@ def build_stream_session(
     bootstrap=None,
     fast_sleep=False,
     retain_ecm=False,
+    on_access_unit=None,
 ):
     """Pure host assembly. Actual device work begins in session.start()."""
     if (
@@ -326,6 +343,7 @@ def build_stream_session(
         raise ValueError("timeout must be finite and positive")
     if imu_options is not None and type(imu_options) is not dict:
         raise TypeError("imu_options must be a dictionary or None")
+    _capture_factories(on_access_unit)  # Validate before opening any device.
     options = dict(read_buffer_bytes=65536, queue_size=16384)
     options.update(imu_options or {})
     for key in ("startup_timeout", "stop_timeout"):
@@ -367,6 +385,7 @@ def build_stream_session(
         decode=decode,
         queue_size=queue_size,
         imu_options=options,
+        on_access_unit=on_access_unit,
     )
     retained = (
         _RetainedFactory(
@@ -374,6 +393,7 @@ def build_stream_session(
             decode=decode,
             queue_size=queue_size,
             imu_options=options,
+            on_access_unit=on_access_unit,
         )
         if retain_ecm
         else None
@@ -384,7 +404,8 @@ def build_stream_session(
         prepared_factory=prepared,
         idle_probe=manager.idle,
         reconnect_control=manager.reconnect,
-        preview_options=dict(decode=decode, queue_size=queue_size, timeout=timeout),
+        preview_options=dict(decode=decode, queue_size=queue_size, timeout=timeout,
+                             **({"on_access_unit": on_access_unit} if on_access_unit else {})),
         imu_options=options,
         fast_sleep=fast_sleep,
         retain_ecm=retain_ecm,

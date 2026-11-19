@@ -232,7 +232,7 @@ class USBChargingLease:
             # idle proof; a missing/awake/unknown owner never authorizes SET.
             from ._stream_resume import _discover, _status_at
             self._guard(deadline)
-            work = _discover(self.control)
+            work = _discover(self.control, deadline=deadline, clock=self.clock)
             if work is None:
                 raise USBChargingError('C1 unavailable without a verified native Sleep owner', self._report)
             snapshot = _status_at(self.control, work, deadline=deadline)

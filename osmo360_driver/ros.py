@@ -20,7 +20,7 @@ from sensor_msgs.msg import CompressedImage, Imu
 from std_msgs.msg import String, UInt64MultiArray
 
 from .acquisition import (
-    IMU_TOPICS, VIDEO_TOPICS, imu_acquisition, video_acquisition,
+    IMU_TOPICS, VIDEO_TOPICS, imu_acquisition, video_acquisition, raw_video_acquisition,
     materialize_acquisition, set_header, compressed_image as _compressed_image,
 )
 from .topics import TOPICS
@@ -32,9 +32,11 @@ def compressed_image(data, stamp_ns, frame_id, format='jpeg'):
 
 class OsmoTopics:
     def __init__(self, node, sink=None, *, has_sink_consumers=None, batch_sink=None,
-                 acquisition_sink=None):
+                 acquisition_sink=None, raw_video_archive=False):
         self.sink, self.batch_sink = sink, batch_sink
         self.acquisition_sink = acquisition_sink
+        self.raw_video_archive = raw_video_archive
+        self.raw_sequence = 0
         # Recording demand is checked for each sample, independently of ROS
         # discovery. A newly started recording must not wait for the timer.
         self.has_sink_consumers = has_sink_consumers or (
@@ -81,6 +83,12 @@ class OsmoTopics:
             raise ValueError('video_unstamped requires a missing native timestamp')
         self._video(frame, jpeg, stamp_ns, valid_native=False)
 
+    def video_raw(self, frame, stamp_ns):
+        """Fast producer callback: immutable queue admission only, no ROS/JPEG."""
+        if self.acquisition_sink is not None and self.has_sink_consumers():
+            self.acquisition_sink('osmo360', raw_video_acquisition(frame, stamp_ns, self.raw_sequence))
+        self.raw_sequence += 1
+
     def video_lazy(self, frame, jpeg_factory, stamp_ns):
         """Acquire this frame now; encode full JPEG only for current demand.
 
@@ -94,6 +102,8 @@ class OsmoTopics:
         subscribers = self._subscribed_topics
         sink_active = any(callback is not None for callback in (
             self.sink, self.batch_sink, self.acquisition_sink)) and self.has_sink_consumers()
+        if self.raw_video_archive:
+            sink_active = False  # The raw producer owns archival delivery.
         selected = VIDEO_TOPICS.intersection(subscribers)
         if not valid_native:
             selected = selected - {'/osmo360/image/compressed'}

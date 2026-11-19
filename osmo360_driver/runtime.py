@@ -18,6 +18,7 @@ from osmo360_camera.transport import CameraDisconnected, RequestTimeout
 from .clock import CameraClock
 from .jpeg import PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_QUALITY, PreviewEncoder
 from osmo360_camera._usb_charging import USBChargingError, attached_camera_count
+from osmo360_camera._standby_control import ExternallySleepingOwnerError
 
 
 def _ignore_video(*_):
@@ -62,6 +63,34 @@ def usb_capture_error(stats):
     return None
 
 
+def _external_sleep_before_charging_set(lease, error):
+    """Only a typed external Sleep before any charging SET permits startup.
+
+    A generic charging timeout, an original receipt, a staging intent or an
+    unknown diagnostic task must keep the original lease/error untouched.
+    """
+    if (getattr(lease, 'receipt', False) is not None
+            or getattr(lease, 'uncertain', None) is not False
+            or getattr(lease, 'stage_attempted', None) is not False
+            or getattr(lease, 'staged', None) is not False):
+        return False
+    control = getattr(lease, 'control', None)
+    session = getattr(getattr(control, 'bootstrap', None), 'session', None)
+    if (getattr(control, 'pending_command', False) is not None
+            or getattr(control, 'pending_task', False) is not None
+            or getattr(control, '_unknown_task', None) is not False
+            or getattr(session, 'quarantined', None) is not False):
+        return False
+    seen = set()
+    while error is not None and id(error) not in seen and len(seen) < 8:
+        seen.add(id(error))
+        if isinstance(error, ExternallySleepingOwnerError):
+            return True
+        error = error.__cause__ if error.__cause__ is not None else (
+            None if error.__suppress_context__ else error.__context__)
+    return False
+
+
 def validate_settings(value):
     if not isinstance(value, dict) or not value:
         raise ValueError('Нужен непустой объект настроек Osmo 360')
@@ -89,7 +118,7 @@ def validate_settings(value):
 class OsmoCamera:
     def __init__(self, on_video=None, on_imu=None, on_error=None, *, on_unstamped_video=None,
                  on_video_lazy=None, camera_factory=Camera, host_offset_ns=None,
-                 usb_charging=None, before_power_restore=None):
+                 usb_charging=None, before_power_restore=None, on_video_raw=None):
         if usb_charging is not None and type(usb_charging) is not bool:
             raise ValueError('usb_charging must be bool or None')
         if before_power_restore is not None and not callable(before_power_restore):
@@ -109,6 +138,10 @@ class OsmoCamera:
         # (frame, full_jpeg_factory, stamp). Call the factory synchronously only
         # if an archival/ROS consumer needs the unchanged full-resolution JPEG.
         self.on_video_lazy = on_video_lazy
+        self.on_video_raw = on_video_raw
+        from .capture_archive import ArchiveVideo
+        self.archive = ArchiveVideo(on_video_raw) if on_video_raw is not None else None
+        self.raw_at = None
         self.on_video = on_video or _ignore_video
         self.on_imu = on_imu or (lambda *_: None)
         self.on_error = on_error or (lambda *_: None)
@@ -171,6 +204,16 @@ class OsmoCamera:
             self.commands.put_nowait((action, settings))
         return self.status()
 
+    def prepare(self, *, timeout=240, cancelled=None):
+        """Bounded SDK-owned preparation for clients which need a ready gate."""
+        from .commands import prepare
+        return prepare(self, timeout=timeout, cancelled=cancelled)
+
+    def start(self, *, timeout=240, cancelled=None):
+        """Wait for this owner's start and fresh video/IMU, without replay."""
+        from .commands import start
+        return start(self, timeout=timeout, cancelled=cancelled)
+
     def status(self):
         with self.condition:
             now = time.monotonic()
@@ -192,6 +235,9 @@ class OsmoCamera:
                                  'jpeg_quality': PREVIEW_QUALITY},
                         projection='dual_fisheye', settings=dict(self.settings), settings_error=self.settings_error,
                         clock=self.clock.status(), calibration=self.calibration,
+                        archive_format='h264_annex_b' if self.archive is not None else 'jpeg_h264_legacy',
+                        archive=self.archive.status() if self.archive is not None else None,
+                        raw_video_age_s=now - self.raw_at if self.raw_at else None,
                         stats=self.capture_stats)
 
     def latest(self, after=-1, timeout=0):
@@ -234,8 +280,20 @@ class OsmoCamera:
             self.connect(wait_ready=False)
             if self._power_lease is None:
                 self._power_lease = self.camera.usb_charging(self.usb_charging)
-            self.power = self._power_lease.prepare(
-                verified_rebind=verified_rebind or self._power_rebind_allowed)
+            try:
+                self.power = self._power_lease.prepare(
+                    verified_rebind=verified_rebind or self._power_rebind_allowed)
+            except USBChargingError as error:
+                if self.stream is not None or not _external_sleep_before_charging_set(self._power_lease, error):
+                    raise
+                # A manual button Sleep after a host crash can precede this
+                # process's charging gate. No charging SET/staging was attempted:
+                # let the SDK recover the exact owner, then prepare this same
+                # pristine lease once on the verified connection. Never recurse
+                # into prepare_power or retry an uncertain charging operation.
+                self.helpers_ready = False
+                self.prepare_helpers()
+                self.power = self._power_lease.prepare(verified_rebind=True)
             self._power_rebind_allowed = False
             if self.power.get('ready') is not True:
                 raise USBChargingError('USB battery charging policy is not ready', self.power)
@@ -392,31 +450,17 @@ class OsmoCamera:
             return
         self.state = 'checking_helpers'
         previous = getattr(self, '_helpers_previous_boot_id', None)
-        if previous is None:
-            try:
-                # An existing sleeping owner can answer AMT while ordinary
-                # services sleep; let usb_stream discover/wake that owner.
-                self.camera.state(timeout=1)
-                self.camera.system_mode(timeout=1)
-            except (RequestTimeout, CameraDisconnected):
-                return
-            except CameraReplyError as exc:
-                if exc.status in (0xE0, 0xE3):
-                    return
-                raise
-        # After our explicit reboot the operation is verify-only. Do not
-        # silently skip its required current-boot proof on an early GET.
-        self.state = 'preparing_helpers'
         try:
-            report = self.camera.install_helpers(timeout=180,
+            report = self.camera.prepare_stream(timeout=180,
                 **({} if previous is None else {'previous_boot_id': previous}))
         except Exception as exc:
             self.preparation = json_value(getattr(exc, 'report', {}))
             raise
         self.preparation = {key: report.get(key) for key in
                             ('installed', 'already_installed', 'autostart_hydration_verified', 'reboot_attempted',
-                             'profile', 'boot_id_before', 'boot_id', 'hydration_wait', 'verification_only')}
-        if not self.preparation['installed'] or not self.preparation['autostart_hydration_verified']:
+                             'profile', 'boot_id_before', 'boot_id', 'hydration_wait', 'verification_only',
+                             'mode', 'retained_owner', 'install_skipped', 'video_mode', 'recovery')}
+        if report.get('ready') is not True:
             raise RuntimeError('SDK не подтвердил установку и автозапуск служебных скриптов Osmo')
         self.helpers_ready = True
         if report.get('boot_id') and report.get('profile'):
@@ -497,7 +541,6 @@ class OsmoCamera:
         self.reader_stop.clear()
         self.capture_error = ''
         self._capture_failure = None
-        self.clock = CameraClock(self.host_offset_ns)
         self.frame_times = []
         self.imu_at = None
         self.stats_at = 0
@@ -565,6 +608,12 @@ class OsmoCamera:
         # The resumable SDK owns readiness, standby discovery and wake.
         if self.enabled:
             return
+        # Raw acquisition can start inside SDK start()/wake(), before the
+        # Python reader threads exist. Its clock/GOP must already be current.
+        self.clock = CameraClock(self.host_offset_ns)
+        archive = getattr(self, 'archive', None)
+        if archive is not None:
+            archive.reset()
         if self.stream is None:
             self.prepare_power()
             self.connect(wait_ready=False)
@@ -573,8 +622,10 @@ class OsmoCamera:
                 self.prepare_power(verified_rebind=True)
             self.hold_power('usb_transition')
             self.state = 'starting'
+            raw_options = ({'on_access_unit': self.raw_video}
+                           if getattr(self, 'on_video_raw', None) is not None else {})
             self.stream = self.camera.usb_stream(fast_sleep=True, retain_ecm=True, queue_size=8,
-                                                 imu_options={'queue_size': 32768})
+                                                 imu_options={'queue_size': 32768}, **raw_options)
             self.stream.start()
         elif self.stream.state == 'SLEEP':
             self.hold_power('usb_transition')
@@ -769,6 +820,67 @@ class OsmoCamera:
         self.enabled = False
         self.on_error(self.capture_error)
 
+    def configure_raw_archive(self, callback):
+        """Install a recorder adapter before opening this owner's capture epoch.
+
+        Useful when a launcher prepares the USB owner before constructing ROS.
+        An active or retained stream keeps its callback contract until closed.
+        """
+        if not callable(callback):
+            raise ValueError('Raw archive callback must be callable')
+        with self.control_lock, self.condition:
+            if self.enabled or self.stream is not None or self.busy:
+                raise ValueError('Configure raw archive before starting capture')
+            from .capture_archive import ArchiveVideo
+            self.on_video_raw = callback
+            self.archive = ArchiveVideo(callback)
+            self.raw_at = None
+
+    def request_video_keyframe(self):
+        """Request a fresh IDR on the active network preview, without USB SETs."""
+        camera = self.camera
+        if camera is None:
+            raise ValueError('Camera is not connected')
+        return camera.request_video_keyframe()
+
+    def begin_archive(self, *, timeout=5):
+        """Prime a raw recorder with bounded IDR preroll, then follow live AUs.
+
+        The caller opens its bounded queue admission BEFORE calling this method,
+        and closes admission only AFTER end_archive(). Preroll keeps original
+        capture timestamps and can therefore precede the record button press.
+        """
+        if self.archive is None or not self.enabled:
+            raise ValueError('Raw archive requires an enabled raw callback stream')
+        return self.archive.begin(self.request_video_keyframe, timeout=timeout)
+
+    def end_archive(self):
+        return self.archive.end() if self.archive is not None else None
+
+    def raw_video(self, frame):
+        """Network producer callback: clock mapping and bounded raw admission."""
+        if frame.timestamp_ns is not None:
+            stamp = self.clock.map_unordered(frame.timestamp_ns, frame.host_receive_monotonic_ns)
+        else:
+            stamp = frame.host_receive_monotonic_ns + self.host_offset_ns
+            self.timestamp_missing_frames += 1
+        self.raw_at = time.monotonic()
+        try:
+            self.archive.append(frame, stamp)
+        except Exception as error:
+            # This runs on the network producer. Do not read lifecycle/USB
+            # stats here: start() may still be waiting for its first picture.
+            self.capture_error = str(error)
+            self._capture_failure = dict(message=self.capture_error, causes=error_chain(error))
+            self.capture_stats = dict(self.capture_stats, failure=dict(capture=self._capture_failure))
+            self.reader_stop.set()
+            self.enabled = False
+            try:
+                self.on_error(self.capture_error)
+            except Exception as callback_error:
+                error.add_note('Capture failure notification: ' + str(callback_error))
+            raise
+
     def video_loop(self):
         try:
             preview_encoder = PreviewEncoder()
@@ -777,7 +889,8 @@ class OsmoCamera:
                 try:
                     frame = self.stream.read_video(timeout=0.2)
                 except TimeoutError:
-                    if time.monotonic() - last > 5:
+                    raw_recent = self.archive is not None and self.raw_at is not None and time.monotonic() - self.raw_at < 5
+                    if time.monotonic() - last > 5 and not raw_recent:
                         raise RuntimeError('Osmo 360 не передаёт видео более 5 секунд')
                     continue
                 native_timestamp = frame.timestamp_ns is not None
@@ -789,9 +902,11 @@ class OsmoCamera:
                     # live viewing. Arrival time is tagged by the separate sink;
                     # it must never enter the synchronized image topic.
                     stamp = frame.host_receive_monotonic_ns + self.host_offset_ns
-                    self.timestamp_missing_frames += 1
+                    if self.archive is None:
+                        self.timestamp_missing_frames += 1
                 jpegs = preview_encoder.for_frame(frame)
-                # Before web consumers; raw_h264 is preserved by the recorder.
+                # Legacy archival/ROS demand stays before web consumers. A raw
+                # recorder has already received this AU on the producer path.
                 if self.on_video_lazy is not None:
                     self.on_video_lazy(frame, jpegs.full, stamp)
                 else:

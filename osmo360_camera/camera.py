@@ -482,6 +482,7 @@ class Camera:
         timeout=60,
         fast_sleep=False,
         retain_ecm=False,
+        on_access_unit=None,
     ):
         """Контекст USB-видео + raw IMU с методами ``sleep()`` / ``wake()``.
 
@@ -509,8 +510,27 @@ class Camera:
             timeout=timeout,
             fast_sleep=fast_sleep,
             retain_ecm=retain_ecm,
+            **({"on_access_unit": on_access_unit} if on_access_unit is not None else {}),
         )
         return self._usb_stream
+
+    @_serialized
+    def ensure_video_mode(self, *, guard=None):
+        """Select verified 360 video only while Record0 and capture is closed.
+
+        This can change the shooting profile from photo to panoramic video.
+        It never stops a native recording or changes a retained stream's ISP.
+        """
+        from ._video_mode import ensure_video_mode
+        return ensure_video_mode(self, guard=guard)
+
+    def request_video_keyframe(self):
+        """Request an IDR from the active network encoder; no USB role change."""
+        preview = self._usb_preview
+        stream = getattr(preview, '_stream', None) if preview is not None else None
+        if stream is None:
+            raise CameraError('A running USB preview is required for a keyframe request')
+        return stream.request_keyframe()
 
     def install_helpers(self, *, timeout=180, previous_boot_id=None):
         """Установить постоянный код и проверить автозагрузку после reboot.
@@ -525,6 +545,20 @@ class Camera:
 
         return install(self, timeout=timeout,
                        **({} if previous_boot_id is None else {'previous_boot_id': previous_boot_id}))
+
+    @_serialized
+    def prepare_stream(self, *, timeout=180, previous_boot_id=None):
+        """Prepare startup without mistaking native Sleep for a broken camera.
+
+        Resolve read-only control and discover a source-verified retained
+        owner before helper installation. Stable retained owners are resumed
+        by usb_stream.start(); no ordinary GET, install or reboot is attempted
+        while they own the camera. Unknown tasks/foreign owners fail closed.
+        """
+        from ._startup import StreamStartup
+        if getattr(self, '_stream_startup', None) is None:
+            self._stream_startup = StreamStartup(self)
+        return self._stream_startup.prepare(timeout=timeout, previous_boot_id=previous_boot_id)
 
     def remove_helpers(self, *, timeout=180):
         """Удалить наши компоненты и проверить штатное состояние после reboot.
@@ -546,7 +580,12 @@ class Camera:
         *,
         allow_missing_previous=False,
         equivalent=None,
+        guard=None,
     ):
+        if guard is not None:
+            if not callable(guard):
+                raise TypeError("Setting delivery guard must be callable or None")
+            guard()
         matches = equivalent or (lambda actual, expected: actual == expected)
         previous = None
         try:
@@ -555,6 +594,11 @@ class Camera:
             if not allow_missing_previous or exc.status != 0xDF:
                 raise
         encoded = encoder(value)  # validate before any camera write
+        # Previous-value GET/encoding can consume the caller's remaining
+        # startup budget. Check outside the attempted transaction: expiration
+        # here sent no SET and must never trigger a rollback SET.
+        if guard is not None:
+            guard()
         actual = None
         attempted = False
         try:
@@ -608,7 +652,7 @@ class Camera:
             replace(self.video_format(), frame_rate=int(value))
         )
 
-    def set_mode_profile(self, value: c.ModeProfileSetting | c.ModeProfile):
+    def set_mode_profile(self, value: c.ModeProfileSetting | c.ModeProfile, *, guard=None):
         if isinstance(value, c.ModeProfile):
             value = c.ModeProfileSetting(int(value))
         return self._apply(
@@ -616,10 +660,11 @@ class Camera:
             value,
             self.mode_profile,
             c.encode_mode_profile,
+            guard=guard,
         )
 
     @_serialized
-    def set_lens_mode(self, value: c.LensMode) -> c.LensMode:
+    def set_lens_mode(self, value: c.LensMode, *, guard=None) -> c.LensMode:
         """Switch Single Lens / panoramic mode while the camera is Record0.
 
         The camera automatically changes its shooting profile on this switch.
@@ -632,10 +677,17 @@ class Camera:
         """
         if not isinstance(value, c.LensMode):
             raise TypeError("Нужен LensMode.SINGLE_LENS или LensMode.PANORAMIC")
-        if self.state().recording_state != 0:
+        if guard is not None:
+            if not callable(guard):
+                raise TypeError("Setting delivery guard must be callable or None")
+            guard()
+        state = self.state()
+        if guard is not None:
+            guard()
+        if state.recording_state != 0:
             raise CameraError("Переключение объективов требует Record0")
         return self._apply(
-            c.CameraCommand.PARAM_OPTION, value, self.lens_mode, c.encode_lens_mode
+            c.CameraCommand.PARAM_OPTION, value, self.lens_mode, c.encode_lens_mode, guard=guard
         )
 
     def set_exposure_mode(self, value: c.ExposureModeSetting):

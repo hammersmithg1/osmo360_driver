@@ -39,7 +39,7 @@ def _fresh_boot(control, remaining):
     program = ("import os,json;p=" + repr(output) + ";f=open(p,'x');"
                "v=dict(b=open('/proc/sys/kernel/random/boot_id').read().strip(),"
                "i=list(os.fstat(f.fileno())[1:3]));json.dump(v,f);f.close()")
-    control._run(_command(program), timeout_ms=min(5000, int(remaining()*1000)))
+    _guarded_run(control, _command(program), remaining)
     value = _json(control.bootstrap.pull_bytes(output, max_bytes=1024, timeout=min(10, remaining())))
     if (type(value) is not dict or set(value) != {'b', 'i'}
             or not isinstance(value['b'], str)
@@ -49,8 +49,17 @@ def _fresh_boot(control, remaining):
         raise ValueError('Fresh camera boot/inode receipt required')
     unlink = ("import os;p=" + repr(output) + "\nif list(os.stat(p)[1:3])!="
               + repr(value['i']) + ":raise ValueError('Export changed')\nos.unlink(p)")
-    control._run(_command(unlink), timeout_ms=min(5000, int(remaining()*1000)))
+    _guarded_run(control, _command(unlink), remaining)
     return value['b']
+
+
+def _guarded_run(control, command, remaining):
+    budget = remaining()
+    if budget < .1:
+        raise TimeoutError('Insufficient shutdown diagnostic task budget')
+    result = control._run(command, timeout_ms=min(5000, int(budget*1000)), pre_send=remaining)
+    remaining()
+    return result
 
 
 def _guard_cancelled(control, work, identifier, remaining):
@@ -60,7 +69,7 @@ def _guard_cancelled(control, work, identifier, remaining):
                'if not(m.correlated(g,c,dict(command_id=i,action="sleep")) and g.get("cancelled") is True'
                ' and all(g["closed"][k]["closed_verified_ebadf"] is True for k in ("alarm90","alarm240"))):'
                'raise ValueError("Guard not closed")')
-    control._run(_command(program, work=work), timeout_ms=min(5000, int(remaining()*1000)))
+    _guarded_run(control, _command(program, work=work), remaining)
 
 
 def _apps_absent(camera, remaining):
@@ -126,7 +135,7 @@ def prepare_shutdown(camera, *, expected_sleep=None, expected_boot_id=None, time
         boot = _fresh_boot(control, remaining)
         if expected_boot_id is not None and boot != expected_boot_id:
             raise RuntimeError('Camera boot changed before shutdown')
-        work = _discover(control)
+        work = _discover(control, deadline=deadline)
         remaining()
         current = _status_at(control, work, deadline=deadline) if work is not None else None
         if current is not None:

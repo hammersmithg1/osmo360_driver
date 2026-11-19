@@ -32,7 +32,8 @@ class USBPreview:
     """
 
     def __init__(
-        self, camera, *, decode=True, queue_size=1, timeout=60, network_guard=None
+        self, camera, *, decode=True, queue_size=1, timeout=60, network_guard=None,
+        on_access_unit=None
     ):
         if (
             type(timeout) not in (int, float)
@@ -46,6 +47,9 @@ class USBPreview:
             or not 1 <= queue_size <= 256
         ):
             raise ValueError("decode must be bool; queue_size must be1..256")
+        if on_access_unit is not None and not callable(on_access_unit):
+            raise ValueError("on_access_unit must be callable or None")
+        self.on_access_unit = on_access_unit
         self.camera, self.decode, self.queue_size = camera, decode, queue_size
         self.timeout = timeout
         self.network = (
@@ -226,6 +230,7 @@ class USBPreview:
                         host=self._plan["lease"]["camera_ip"],
                         local_address=self._plan["lease"]["host_ip"],
                         interface=guard["ncm_interface"],
+                        **({"on_access_unit": self.on_access_unit} if self.on_access_unit else {}),
                     )
                     self._stream.start()
                     while self._stream.stats["published_frames"] == 0:

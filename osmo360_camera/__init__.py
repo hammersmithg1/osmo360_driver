@@ -34,9 +34,11 @@ from .usb_preview import USBPreview, USBPreviewError
 from ._stream_session import StreamSessionError
 from ._helper_lifecycle import HelperLifecycleError
 from ._helper_install import HelperInstallError
+from ._startup import StartupError
 from ._usb_charging import USBChargingLease, USBChargingError
 
 __all__ = [
+    "StartupError",
     "Camera",
     "CameraState",
     "CameraError",

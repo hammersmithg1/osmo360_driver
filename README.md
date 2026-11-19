@@ -14,8 +14,10 @@ Raspberry Pi 5 / Ubuntu ARM64. Быстрый сон с сохранением U
 Камера должна быть включена, с аккумулятором, в режиме **360° → Видео**,
 без записи. Оставьте включённой настройку длительного сна без полного
 выключения. Закройте DJI Mimo. При выборе USB-режима используйте «Только зарядка».
-Для Pi нужен **активный USB-хаб с отдельным питанием** и кабель с линиями данных:
-прямое подключение на проверенном стенде вызывало перегрузку питания USB.
+Для Pi нужен кабель с линиями данных и питание, рассчитанное на всю нагрузку.
+При недостаточном USB-бюджете используйте активный хаб с отдельным питанием.
+Наличие PD-профиля и отсутствие просадок нужно проверять для конкретной схемы:
+SDK не увеличивает доступный ток и не устраняет плохие контакты.
 
 Нужны Python 3.10+, libusb и, на Linux, `iproute2`. Декодирование кадров
 требует PyAV/NumPy; проверены Python 3.12 / PyAV 11 и Python 3.12+ / PyAV 19.
@@ -351,12 +353,14 @@ an unknown pending camera operation. Restarting the Pi is not required.
 
 Standard compressed-image consumers should use the JPEG topic. The `h264` topic
 is an original-video archive channel; it needs an H.264 decoder, not compressed_image_transport.
-JPEG images, their native timing and IMU are the primary input for ROS/SLAM.
-A recording may join the H.264 stream between random-access pictures, so its
+The default ROS adapter exposes independent JPEG images for ROS/SLAM.
+The raw-archive mode described below instead records original H.264 and IMU,
+and constructs playback images later. With the legacy callback path,
+a recording may join the H.264 stream between random-access pictures, so its
 raw access units can depend on parameter sets and reference pictures sent
 before the recording started. Standalone decoding of such an archive is not
-verified by this adapter. The rover integration builds session playback from
-the independent JPEG images.
+verified by the legacy adapter. Use `begin_archive()` below for an IDR boundary
+and preserved codec headers when recording H.264.
 
 SDK video frames can lack native timestamps after missing/unsupported SEI.
 These pictures remain visible in the live preview, and their original H.264 AUs
@@ -389,8 +393,10 @@ The rover UI blocks all changes during a recording session.
 `CameraClock` fixes the host-monotonic→Unix mapping, then anchors one shared
 native→Unix offset at the first received sample. An embedding host can pass
 `host_offset_ns` to share the exact same host clock base with another camera. Video and IMU retain their
-native intervals. Start/wake/reboot creates a new epoch; clock reversal stops
-the stream. This is arrival-based initial alignment, **not calibrated hardware
+native intervals. Start/wake/reboot creates a new epoch; clock reversal in
+ordered IMU/decoded samples stops the stream. Encoded H.264 access units may
+arrive in B-frame decode order; `map_unordered()` preserves their original PTS,
+arrival order and shared offset instead of inventing monotonic PTS. This is arrival-based initial alignment, **not calibrated hardware
 synchronization**. Native timestamps, receive times and clock mapping remain
 available for offline temporal calibration. The exact relation between the
 video exposure clock and SSC timestamps must be verified for SLAM.
@@ -412,11 +418,137 @@ automatic reboot/retry of an uncertain USB owner.
 The live JPEG returned by `OsmoCamera.latest()` is a 1024×512, quality-75
 preview. `status()['mode']` still describes the 2048×1024 capture; `preview`
 reports the viewing settings separately. The standard ROS image topic and
-recording sink retain the original full-resolution quality-92 JPEG path.
+legacy recording sink retain the original full-resolution quality-92 JPEG path.
 The ROS nodes use `on_video_lazy=topics.video_lazy`: its synchronous callback
 requests full JPEG encoding only when a recorder or ROS image subscriber needs
 it. Raw H.264-only subscribers do not require that conversion. Legacy
 `on_video(frame, jpeg_bytes, stamp)` callbacks still receive full JPEGs.
+
+### Локальная запись без зависимости от превью
+
+`OsmoCamera(on_video_raw=callback)` включает отдельный raw-тракт. Callback
+получает `(frame, mapped_stamp_ns)` после разбора метаданных AU, **до декодера,
+JPEG и очереди превью**. `frame.image` здесь `None`; исходные Annex-B байты,
+нативное время, время приёма и SEI сохранены. Callback должен лишь быстро
+положить неизменяемые данные в ограниченную очередь. Файловая запись,
+кодирование JPEG и конструирование ROS-сообщений выполняются вне него.
+Переполнение очереди записи должно явно останавливать сессию с ошибкой;
+бесконечная очередь и молчаливое отбрасывание не являются lossless-режимом.
+
+Для запуска после создания ROS-узла вызовите
+`owner.configure_raw_archive(topics.video_raw)` **до открытия capture**,
+а `OsmoTopics(..., acquisition_sink=enqueue, raw_video_archive=True)` исключит
+повторную запись JPEG из preview-callback. Очередь получает компактный DTO:
+
+```python
+('video_raw', mapped_unix_ns, native_ns_or_none, host_receive_monotonic_ns,
+ sequence, raw_h264_bytes, metadata_json)
+```
+
+`materialize_acquisition()` преобразует его в три сообщения: H.264, timing и
+metadata. Пустой JPEG не создаётся. Старый DTO `video` и старые callbacks
+остаются совместимыми. Для полного изображения нужен H.264-декодер;
+`osmo360_driver.archive.decode_h264_records()` сохраняет PTS и исходные времена
+при последующем построении кадров. Raw AU нужно подавать декодеру в порядке
+записи/sequence, а не сортировать по PTS. Сам контейнер должен сохранить
+метаданные и оригинальные времена вместе с видео и IMU.
+
+Порядок начала и завершения сессии:
+
+1. Открыть ограниченную очередь и приём данных своего recorder.
+2. Вызвать `details = owner.begin_archive(timeout=5)`.
+3. Сохранить `details` в манифесте; после возврата идут live AU.
+4. Вызвать `owner.end_archive()`, затем закрыть приём и дождаться записи очереди.
+
+SDK держит ограниченный preroll от последнего IDR: до 8 MiB и 256 AU.
+`begin_archive()` атомарно передаёт его и присоединяет live-поток без разрыва.
+Время preroll исходное и может предшествовать нажатию кнопки записи.
+Если GOP уже не помещается в бюджет, SDK один раз запрашивает новый IDR и
+ждёт границу в пределах timeout; отсутствие границы — ошибка начала записи.
+`details` содержит `first_stamp_ns`, `preroll_frames`, `codec_headers_hex`.
+Граница означает IDR с SPS/PPS; она не является проверкой отсутствия повреждений
+в последующих сетевых данных. H.264-декодер должен явно сообщать ошибки.
+
+В этом режиме медленный декодер/preview имеет отдельную очередь на 8 AU.
+При перегрузке preview дожидается нового IDR, сохраняя raw-поток. Запросы IDR
+объединяются по эпизоду восстановления, без периодического рестарта энкодера.
+`stats.preview.video.dropped_frames` и `preview_decoder.dropped_units` описывают
+потери **превью**, а `raw_callback_errors`, transport truncation и ошибки очереди
+записи относятся к полноте архива. Raw-режим не гарантирует физически безошибочный
+USB/UDP-канал и не скрывает исходные потери. Старый JPEG-путь ещё может терять
+кадры до recorder; его счётчик `dropped_frames` нельзя трактовать так же.
+
+### Общая подготовка, владение и диагностика
+
+`owner.prepare()` ожидает завершения проверки выбранной charging policy;
+`owner.start()` ожидает завершения команды и свежих видео/IMU в том же owner.
+Оба метода имеют общий deadline и не повторяют неизвестную native-операцию.
+Неблокирующий `owner.command(...)` по-прежнему возвращает только приём команды;
+её результат читается из `status()`.
+
+`Camera.prepare_stream()` сначала проверяет существующего RAM-владельца
+потока. Подтверждённый retained owner используется до попытки обычной проверки
+сервисов/установки helpers: спящая камера не обязана отвечать как бодрствующая.
+Неопределённое состояние не разрешает новый owner или повтор неизвестной задачи.
+Готовые helpers устанавливаются идемпотентно; перенос на другой экземпляр
+камеры не требует сохранённых настроек конкретного робота.
+
+Подтверждённый retained `SLEEP` возобновляется без установки helpers и без
+перезагрузки. Отдельно обрабатывается ручной сон после аварийного завершения
+хоста: RAM-owner может всё ещё хранить `AWAKE`, хотя свежий native GET показывает
+уровень 2/3. Это **не** превращается в фиктивную квитанцию SDK Sleep. После
+повторной проверки исходников, owner/service/nonce, терминального command ID,
+role inode и отсутствия pending/quarantined задач SDK один раз запрашивает
+восстановление через существующий source-pinned native `finalize` — штатную
+перезагрузку камеры. Успех отдельно требует наблюдения USB-disconnect и
+проверки helpers в другом boot через `previous_boot_id`; настройки видео
+применяются только после этой проверки. Потеря ответа не повторяет reboot:
+следующая подготовка может только разрешить старый точный RESULT (в том числе
+missing после reboot) и проверить новый boot. Неизвестный владелец, изменившаяся
+идентичность или незавершённая задача блокируют этот путь.
+
+При политике `disable` этот случай разрешён также до начального charging SET:
+только типизированное доказательство внешнего сна, отсутствие original receipt,
+staging intent и неопределённых задач позволяют восстановить камеру и один раз
+подготовить ту же нетронутую charging lease на проверенном соединении. Таймаут
+или неоднозначный результат зарядного SET такого права не даёт.
+
+Сценарий внешнего ручного сна покрыт тестами протокола и подменённого USB,
+включая потерянный ACK, исчезнувший после reboot task ID и запрет позднего START.
+На момент изменения документа аппаратный прогон именно ручного сна после
+аварийного завершения хоста ещё не завершён; обычный retained Sleep — отдельный
+сценарий и не заменяет эту проверку.
+
+Для завершения работы SDK предоставляет `commands.wait_idle(owner, timeout=...)`
+и `commands.prepare_shutdown(owner, timeout=...)`: существующая транзакция и
+подготовка сна используют один deadline без повторной команды. Остановка
+моторов, закрытие записи/вебки и выключение ОС остаются у приложения.
+
+Для свежего сеанса без retained owner подготовка вызывает
+`Camera.ensure_video_mode()`: проверяет `Record0`, PANORAMIC и VIDEO_PANO.
+Если камера была в фото или single-lens, SDK выполняет необходимые обычные
+SET с проверкой результата; после переключения объективов профиль читается
+повторно, поскольку firmware может автоматически выбрать фото. Нативная запись
+`Record1` не останавливается, а неподтверждённая настройка завершает подготовку
+ошибкой. У существующего retained Sleep/Awake профиль не меняется: изменение
+его вручную во время владения нестандартным потоком требует отдельной проверки,
+а не безусловного SET или автоматической перезагрузки. Полностью выключенная
+камера, исчезнувшая из USB, не считается пробуждаемой программно без данных
+о доступном аппаратном интерфейсе.
+
+Общая блокировка процесса находится в
+`osmo360_driver.process_ownership.process_ownership(path)`. Выбор пути блокировки
+остаётся у приложения; модуль не управляет моторами, ROS launch или питанием ОС.
+Общие CLI SDK доступны отдельно от робота:
+
+```sh
+python3 -m osmo360_driver.host_setup       # Linux systemd-networkd/udev USB ECM rules
+python3 -m osmo360_driver.diagnostics --help
+```
+
+`host_setup --root PATH` позволяет проверить установку правил на отдельном
+корне файловой системы. Эти новые API не вводят ENV-переменных; существующие
+переменные и параметры launch сохраняют прежнее назначение.
 
 ### Optional USB battery charging policy
 
@@ -459,8 +591,8 @@ synchronous callback must stop other USB capture consumers before charging
 changes or restoration. Queue `prepare_power` before enabling those consumers;
 wait for terminal actor status and `power.ready == True`. Start/wake transitions
 are checked before the parent releases its capture gate. The default `None`
-preserves the SDK's previous charging behavior. Rover opts into `False` and
-holds its webcam gate automatically; no extra web setting is required.
+preserves the SDK's previous charging behavior. The embedding application owns
+its persisted policy and any coordination with other USB consumers.
 
 Normal scope exit restores the original policy. Abrupt host termination cannot
 run that cleanup, so it must not be presented as a successful restoration.

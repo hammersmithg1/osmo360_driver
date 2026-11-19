@@ -34,6 +34,17 @@ def video_acquisition(frame, jpeg, stamp_ns, sequence):
             sequence, bytes(frame.raw_h264), bytes(jpeg), encoded)
 
 
+def raw_video_acquisition(frame, stamp_ns, sequence):
+    """Lossless encoded AU, native timing and metadata; never constructs JPEG."""
+    metadata = dict(frame.metadata, _rover_timing={
+        'valid_native': frame.timestamp_ns is not None,
+        'stamp_source': 'camera_native' if frame.timestamp_ns is not None else 'host_receive',
+    })
+    encoded = json.dumps(json_value(metadata), allow_nan=False, separators=(',', ':'))
+    return ('video_raw', stamp_ns, frame.timestamp_ns, frame.host_receive_monotonic_ns,
+            sequence, bytes(frame.raw_h264), encoded)
+
+
 def set_header(message, stamp_ns, frame_id):
     message.header.stamp.sec, message.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
     message.header.frame_id = frame_id
@@ -59,9 +70,12 @@ def materialize_acquisition(acquisition, topics=None, *, message_types=None):
     if not isinstance(acquisition, tuple) or not acquisition:
         raise ValueError('Expected an immutable Osmo acquisition tuple')
     kind = acquisition[0]
-    if kind not in ('imu', 'video') or len(acquisition) != (9 if kind == 'imu' else 8):
+    sizes = {'imu': 9, 'video': 8, 'video_raw': 7}
+    if kind not in sizes or len(acquisition) != sizes[kind]:
         raise ValueError('Unknown Osmo acquisition schema')
     selected = IMU_TOPICS if kind == 'imu' else VIDEO_TOPICS
+    if kind == 'video_raw':
+        selected = selected - {'/osmo360/image/compressed'}
     if kind == 'video' and acquisition[2] is None:
         selected = selected - {'/osmo360/image/compressed'}
     if topics is not None:
@@ -87,7 +101,11 @@ def materialize_acquisition(acquisition, topics=None, *, message_types=None):
             entries.append(('/osmo360/imu/timing', message_types['UInt64MultiArray'](
                 data=[stamp, native, host, ticks, accel_status, gyro_status]), stamp))
     else:
-        _, _, native, host, sequence, raw, jpeg, metadata_json = acquisition
+        if kind == 'video_raw':
+            _, _, native, host, sequence, raw, metadata_json = acquisition
+            jpeg = None
+        else:
+            _, _, native, host, sequence, raw, jpeg, metadata_json = acquisition
         if '/osmo360/image/compressed' in selected:
             entries.append(('/osmo360/image/compressed', compressed_image(
                 jpeg, stamp, 'osmo360_dual_fisheye', 'bgr8; jpeg compressed bgr8',

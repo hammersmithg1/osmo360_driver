@@ -30,6 +30,20 @@ class CameraClock:
             self.last[kind] = native_ns
             return native_ns + self.offset_ns
 
+    def map_unordered(self, native_ns, received_ns):
+        """Map an encoded AU PTS without assuming presentation/arrival order.
+
+        H.264 B-frames can arrive in decode order. The raw archive preserves
+        native PTS plus host arrival and sequence rather than rejecting these
+        access units or inventing strictly increasing presentation timestamps.
+        """
+        if type(native_ns) is not int or native_ns < 0:
+            raise ValueError('Camera sample has no native timestamp')
+        with self.lock:
+            if self.offset_ns is None:
+                self.offset_ns = received_ns + self.host_offset_ns - native_ns
+            return native_ns + self.offset_ns
+
     def status(self):
         with self.lock:
             return dict(epoch=self.epoch, offset_ns=self.offset_ns,

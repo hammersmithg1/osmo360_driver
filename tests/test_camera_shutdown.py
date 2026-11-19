@@ -227,5 +227,31 @@ class ShutdownCameraTests(unittest.TestCase):
         self.assertNotIn('os.kill', program)
 
 
+class ShutdownDeadlineTests(unittest.TestCase):
+    def test_slow_previous_result_cannot_deliver_late_boot_export_unlink_or_guard_query(self):
+        for operation in ('export', 'unlink', 'guard'):
+            now, calls, starts = [0], [0], []
+            def remaining():
+                if now[0] >= 1:
+                    raise TimeoutError('shutdown deadline')
+                return 1-now[0]
+            expired_call = 2 if operation == 'unlink' else 1
+            def run(command, **options):
+                calls[0] += 1
+                if calls[0] == expired_call:
+                    now[0] = 2
+                options['pre_send']()
+                starts.append(command)
+            control = SimpleNamespace(pending_command=None, pending_task=None, _unknown_task=False,
+                _run=run, bootstrap=SimpleNamespace(session=SimpleNamespace(quarantined=False),
+                    pull_bytes=Mock(return_value=json.dumps(dict(b=BOOT, i=[12,34])).encode())))
+            with self.subTest(operation=operation), self.assertRaises(TimeoutError):
+                if operation == 'guard':
+                    m._guard_cancelled(control, WORK, '0000000000000001', remaining)
+                else:
+                    m._fresh_boot(control, remaining)
+            self.assertEqual(len(starts), expired_call-1)
+
+
 if __name__ == '__main__':
     unittest.main()

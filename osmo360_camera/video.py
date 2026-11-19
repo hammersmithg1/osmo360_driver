@@ -1,7 +1,8 @@
 """Network preview only; USB setup and the camera lease belong to the facade.
 
-Every encoded access unit reaches the H.264 decoder. Only decoded pictures
-are dropped from the bounded consumer queue. PyAV is imported on start only
+With no raw callback every encoded AU reaches the decoder. With an archival
+callback, raw admission runs first and a separate bounded preview decoder may
+resynchronize at an IDR after overload. Preview loss never discards raw AUs. PyAV is imported on start only
 when decode=True; NumPy is needed only for the lazy .bgr conversion.
 """
 
@@ -225,6 +226,7 @@ class VideoStream:
         *,
         local_address=None,
         interface=None,
+        on_access_unit=None,
     ):
         if not isinstance(host, str) or not host or "\0" in host:
             raise ValueError("host must be a nonempty address")
@@ -232,12 +234,19 @@ class VideoStream:
             raise ValueError("decode must be a bool")
         if type(queue_size) is not int or not 1 <= queue_size <= 256:
             raise ValueError("queue_size must be an integer in1..256")
+        if on_access_unit is not None and not callable(on_access_unit):
+            raise ValueError("on_access_unit must be callable or None")
+        self.on_access_unit = on_access_unit
+        self._codec_headers = {}
+        self._preview_decoder = None
         self.host, self.decode, self.queue_size = host, decode, queue_size
         self.local_address, self.interface = local_address, interface
         self._condition = threading.Condition()
         self._pause_lock = threading.Lock()
         self._publication_paused = False
         self._publication_epoch = 0
+        self._raw_publication_epoch = 0
+        self._raw_inflight = 0
         self._queue = deque()
         self._pending = {}
         self._unstamped = deque()
@@ -264,6 +273,7 @@ class VideoStream:
             metadata_errors=0,
             suppressed_frames=0,
             paused_queue_discards=0,
+            raw_callback_units=0, raw_callback_errors=0, raw_suppressed_units=0,
         )
 
     @property
@@ -291,6 +301,7 @@ class VideoStream:
                 self._counts,
                 queued_frames=len(self._queue),
                 paused=self._publication_paused,
+                raw_callbacks_inflight=self._raw_inflight,
                 started=self._started,
                 stopped=self._done,
                 error=str(self._error) if self._error else None,
@@ -300,6 +311,7 @@ class VideoStream:
                 latest_video=deepcopy(self._latest_video),
                 first_missing_timestamp=deepcopy(self._first_missing_timestamp),
                 network=dict(self._link.stats) if self._link else {},
+                preview_decoder=self._preview_decoder.status() if self._preview_decoder else None,
                 decoder=dict(
                     self._decode_counts,
                     last_output_monotonic_ns=self._decode_last_output_ns,
@@ -336,6 +348,10 @@ class VideoStream:
                 raise VideoStreamError(
                     "Cannot bind preview socket: " + str(error)
                 ) from error
+            if self.decode and self.on_access_unit is not None:
+                from ._preview_decoder import PreviewDecoder
+                self._preview_decoder = PreviewDecoder(self)
+                self._preview_decoder.start()
             self._thread = threading.Thread(
                 target=self._run, name="osmo-video", daemon=True
             )
@@ -414,6 +430,7 @@ class VideoStream:
         raw = bytes(data)
         with self._condition:
             epoch = -1 if self._publication_paused else self._publication_epoch
+            raw_epoch = -1 if self._publication_paused else self._raw_publication_epoch
             self._counts["encoded_units"] += 1
             self._counts["encoded_bytes"] += len(raw)
         try:
@@ -467,12 +484,51 @@ class VideoStream:
                 self._missing_timestamp = diagnostic
                 if self._first_missing_timestamp is None:
                     self._first_missing_timestamp = deepcopy(diagnostic)
+        # Preserve exact encoded acquisition BEFORE decoding or either lossy
+        # preview queue. The callback may only admit immutable data to a bounded
+        # archival queue; no JPEG, ROS serialization or filesystem access here.
+        with self._condition:
+            raw_allowed = not self._publication_paused and raw_epoch == self._raw_publication_epoch
+            if self.on_access_unit is not None:
+                if raw_allowed:
+                    self._raw_inflight += 1
+                else:
+                    self._counts['raw_suppressed_units'] += 1
+        if self.on_access_unit is not None and raw_allowed:
+            for index, start in enumerate(starts := list(_START.finditer(raw))):
+                end = starts[index + 1].start() if index + 1 < len(starts) else len(raw)
+                if start.end() < end and raw[start.end()] & 31 in (7, 8):
+                    self._codec_headers[raw[start.end()] & 31] = raw[start.start():end]
+            kinds = [raw[start.end()] & 31 for start in starts if start.end() < len(raw)]
+            frame_metadata['h264_keyframe'] = 5 in kinds
+            frame_metadata['h264_codec_headers_complete'] = all(key in self._codec_headers for key in (7, 8))
+            frame_metadata['h264_codec_headers_hex'] = b''.join(
+                self._codec_headers[key] for key in (7, 8) if key in self._codec_headers).hex()
+            try:
+                self.on_access_unit(VideoFrame(stamp, received, None, raw, dict(frame_metadata)))
+                with self._condition:
+                    self._counts['raw_callback_units'] += 1
+            except Exception:
+                with self._condition:
+                    self._counts['raw_callback_errors'] += 1
+                raise
+            finally:
+                with self._condition:
+                    self._raw_inflight -= 1
+                    self._condition.notify_all()
         if not self.decode:
             self._publish(
                 VideoFrame(stamp, received, None, raw, frame_metadata), epoch=epoch
             )
             return
         metadata = (stamp, received, raw, frame_metadata, epoch)
+        if self._preview_decoder is not None:
+            self._preview_decoder.submit(metadata)
+        else:
+            self._decode_access_unit(metadata)
+
+    def _decode_access_unit(self, metadata, *, prefix=b''):
+        stamp, received, raw, frame_metadata, epoch = metadata
         if stamp is not None:
             self._pending.setdefault(stamp, deque()).append(metadata)
         else:
@@ -484,7 +540,7 @@ class VideoStream:
             self._decode_recent.append(event)
         self._decoder_backlog()
         try:
-            packet = self._av.Packet(_decoder_bytes(raw))
+            packet = self._av.Packet(prefix + _decoder_bytes(raw))
             packet.pts, packet.time_base = stamp, _TIME_BASE
             self._decode_packet(packet, event)
         except BaseException as error:
@@ -570,9 +626,18 @@ class VideoStream:
                     raise VideoStreamError("Pause requires a running VideoStream")
                 self._publication_paused = True
                 self._publication_epoch += 1
+                self._raw_publication_epoch += 1
                 self._counts["paused_queue_discards"] += len(self._queue)
                 self._queue.clear()
                 link = self._link
+                # Datalink.pause is an outbound DATA barrier; it does not join
+                # on_video callbacks. A successful native sleep must also wait
+                # for old raw callbacks before the next clock/archive reset.
+                while self._raw_inflight:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
             remaining = deadline - time.monotonic()
             return remaining > 0 and link.pause(
                 remaining, keep_answer_requests=keep_answer_requests
@@ -595,6 +660,7 @@ class VideoStream:
                     raise VideoStreamError("Resume requires a running VideoStream")
                 if self._publication_paused:
                     self._publication_epoch += 1
+                    self._raw_publication_epoch += 1
                     self._counts["paused_queue_discards"] += len(self._queue)
                     self._queue.clear()
                     self._publication_paused = False
@@ -605,6 +671,7 @@ class VideoStream:
                 with self._condition:
                     self._publication_paused = True
                     self._publication_epoch += 1
+                    self._raw_publication_epoch += 1
                     self._counts["paused_queue_discards"] += len(self._queue)
                     self._queue.clear()
                 raise
@@ -631,6 +698,14 @@ class VideoStream:
                     raise TimeoutError("No video frame before timeout")
                 self._condition.wait(None if math.isinf(remaining) else remaining)
 
+    def request_keyframe(self):
+        """Ask the running preview encoder for an IDR; arrival proves success."""
+        with self._condition:
+            if not self._started or self._closed or self._done or self._link is None:
+                raise VideoStreamError('Keyframe request requires a running VideoStream')
+            link = self._link
+        return link.request_keyframe()
+
     def stop(self, timeout=5):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("stop timeout must be finite and positive")
@@ -649,6 +724,8 @@ class VideoStream:
             thread.join(timeout)
         if thread.is_alive():
             raise VideoStreamError("Video worker did not stop before timeout")
+        if self._preview_decoder is not None:
+            self._preview_decoder.stop(timeout)
         if self._error:
             raise VideoStreamError(str(self._error)) from self._error
         return self.stats

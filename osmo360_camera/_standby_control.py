@@ -59,6 +59,19 @@ class NativeSleepObservationMismatch(ValueError):
         self.observation = deepcopy(observation)
 
 
+class ExternallySleepingOwnerError(ValueError):
+    """A verified cached AWAKE owner is currently at native level2/3.
+
+    This is an external state change, not a completed SDK Sleep command.
+    Only explicit exact-owner recovery may use it; it never authorizes Wake
+    input, a prepared plan, or fabrication of a Sleep receipt.
+    """
+
+    def __init__(self, observation):
+        super().__init__('Verified AWAKE owner is externally asleep at native level2/3')
+        self.observation = deepcopy(observation)
+
+
 def _token(value):
     return (
         type(value) is dict
@@ -235,6 +248,19 @@ def parse_snapshot(data, *, nonce, owner=None, service=None):
             _sleep_observation_identity(value, '/dev/shm/osmo-usb-standby-' + nonce, value['command_id'])
             if level in (0, 2, 3) and (level == 0 or value['shadow']['value'] != 'none'):
                 raise NativeSleepObservationMismatch(value)
+        if value['state'] == 'AWAKE' and level in (2, 3):
+            work = '/dev/shm/osmo-usb-standby-' + nonce
+            shadow = value.get('shadow')
+            target = '/sys/devices/platform/soc/a600000.ssusb/mode'
+            if (type(shadow) is not dict or shadow.get('source') != work + '/role.txt'
+                    or shadow.get('target') != target or type(shadow.get('inode')) is not list
+                    or len(shadow['inode']) != 2
+                    or any(type(n) is not int or n < 1 for n in shadow['inode'])
+                    or shadow.get('mount') != dict(fs='tmpfs', point=target,
+                        root='/' + work.rsplit('/', 1)[1] + '/role.txt')
+                    or shadow.get('value') not in ('peripheral', 'none', 'exit')):
+                raise ValueError('Externally sleeping owner has no exact owned role proof')
+            raise ExternallySleepingOwnerError(value)
         if level not in ((0,) if value["state"] == "AWAKE" else (2, 3)):
             raise ValueError("Cached owner state disagrees with current native manager")
     return deepcopy(value)

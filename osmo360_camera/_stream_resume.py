@@ -10,6 +10,7 @@ from copy import deepcopy
 from functools import partial
 import hashlib
 import json
+import math
 import re
 import secrets
 import shlex
@@ -20,7 +21,7 @@ from ._prepared_attachment import decode_metadata, export_prepared, restore_prep
 from ._prepared_plan import build_prepared_fast_plan
 from ._prepared_stream import preparation_run
 from ._standby_control import SOURCES, parse_snapshot, NativeSleepObservationMismatch, wait_sleep_observation
-from ._stream_defaults import build_stream_session
+from ._stream_defaults import build_stream_session, _capture_factories
 from ._stream_session import StreamSessionError
 from ._usb_bootstrap import BootstrapError
 
@@ -73,16 +74,34 @@ def _json(raw):
     )
 
 
-def _discover(control):
-    control._run(
+def _discover(control, *, deadline=None, clock=time.monotonic):
+    if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError('Discovery requires a finite absolute deadline')
+    def timely():
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError('Standby discovery deadline; no new diagnostic START')
+    def run(command):
+        timely()
+        if deadline is None:
+            return control._run(command)
+        budget = deadline - clock()
+        if budget < .1:
+            raise TimeoutError('Insufficient discovery diagnostic task budget')
+        result = control._run(command, timeout_ms=min(5000, int(budget * 1000)), pre_send=timely)
+        timely()
+        return result
+    run(
         _command(
             "from pathlib import Path;p=Path('/blackbox');assert p.is_dir() and p.resolve()==p;"
             "p=p/'export_tmp';p.mkdir(mode=448,exist_ok=True);assert p.is_dir() and not p.is_symlink() and p.resolve()==p"
         )
     )
     output = "/blackbox/export_tmp/osmo_resume_" + secrets.token_hex(6) + ".json"
-    control._run(_command(_discovery_program(output)))
-    value = _json(control.bootstrap.pull_bytes(output, max_bytes=16384))
+    run(_command(_discovery_program(output)))
+    timely()
+    value = _json(control.bootstrap.pull_bytes(output, max_bytes=16384,
+        **({} if deadline is None else {'timeout': min(10, deadline-clock())})))
+    timely()
     if (
         type(value) is not dict
         or set(value) != {"m", "w", "i"}
@@ -94,7 +113,7 @@ def _discover(control):
     ):
         raise ValueError("Malformed role discovery export")
     # Delete only the exclusive diagnostic file whose inode was exported.
-    control._run(
+    run(
         _command(
             "import os;p="
             + repr(output)
@@ -333,7 +352,7 @@ class ResumableUSBStream:
                 self._unknown_shadow = (
                     True  # Unknown discovery never authorizes a new owner.
                 )
-                work = _discover(control)
+                work = _discover(control, deadline=discovery_deadline, clock=manager.clock)
                 self.attachment["discovered"] = True
                 if work is not None:
                     snapshot = _status_at(control, work, deadline=discovery_deadline,
@@ -367,6 +386,7 @@ class ResumableUSBStream:
                             decode=self.options.get("decode", True),
                             queue_size=self.options.get("queue_size", 1),
                             imu_options=self._core.imu_options,
+                            **_capture_factories(self.options.get("on_access_unit")),
                             deadline=discovery_deadline,
                         )
                         self._core.prepared_factory.assets = backend.assets
@@ -480,6 +500,7 @@ def build_resumable_stream(
     timeout=60,
     fast_sleep=False,
     retain_ecm=False,
+    on_access_unit=None,
 ):
     return ResumableUSBStream(
         camera,
@@ -489,4 +510,5 @@ def build_resumable_stream(
         timeout=timeout,
         fast_sleep=fast_sleep,
         retain_ecm=retain_ecm,
+        **({"on_access_unit": on_access_unit} if on_access_unit is not None else {}),
     )

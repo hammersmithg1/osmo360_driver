@@ -6,9 +6,19 @@ from unittest.mock import Mock, patch
 
 from osmo360_camera import USBChargingError
 from osmo360_driver.runtime import OsmoCamera
+from osmo360_camera._standby_control import ExternallySleepingOwnerError
 
 
 class ChargingRuntimeTests(unittest.TestCase):
+    def external_sleep_lease(self):
+        self.lease.receipt = None
+        self.lease.uncertain = self.lease.stage_attempted = self.lease.staged = False
+        self.lease.control = SimpleNamespace(pending_command=None, pending_task=None,
+            _unknown_task=False, bootstrap=SimpleNamespace(session=SimpleNamespace(quarantined=False)))
+        error = USBChargingError('C1 unavailable; owner externally asleep')
+        error.__cause__ = ExternallySleepingOwnerError(dict(state='AWAKE', native_level=3))
+        return error
+
     def owner(self):
         self.events = []
         self.lease = SimpleNamespace(receipt={'original': 'unchanged'},
@@ -63,6 +73,68 @@ class ChargingRuntimeTests(unittest.TestCase):
             factory.assert_not_called()
         finally:
             owner.close()
+
+    def test_disable_policy_recovers_external_sleep_only_before_any_charging_set(self):
+        owner = self.owner()
+        failure = self.external_sleep_lease()
+        replies = iter((failure, dict(requested=False, ready=True, state='prepared', error='')))
+        def prepare(**options):
+            self.events.append('charging_prepare')
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            self.assertEqual(options, dict(verified_rebind=True))
+            return reply
+        self.lease.prepare.side_effect = prepare
+        owner.prepare_helpers = Mock(side_effect=lambda: self.events.append('sdk_recovery'))
+        with patch('osmo360_driver.runtime.attached_camera_count', return_value=1):
+            owner.prepare_power()
+        self.assertEqual(self.events, ['webcam_released', 'charging_prepare', 'sdk_recovery', 'charging_prepare'])
+        self.assertTrue(owner.power['ready'])
+        self.assertEqual(self.lease.prepare.call_count, 2)
+        owner.prepare_helpers.assert_called_once()
+        self.assertIs(owner._power_lease, self.lease)
+
+    def test_disable_policy_never_retries_uncertain_staged_or_owned_charging_operations(self):
+        for field, value in (('receipt', {'original': 'owned'}), ('uncertain', True),
+                             ('stage_attempted', True), ('staged', True),
+                             ('pending_task', 7), ('_unknown_task', True), ('quarantined', True)):
+            with self.subTest(field=field):
+                owner = self.owner()
+                error = self.external_sleep_lease()
+                target = (self.lease.control.bootstrap.session if field == 'quarantined' else
+                          self.lease.control if field in ('pending_task', '_unknown_task') else self.lease)
+                setattr(target, field, value)
+                self.lease.prepare.side_effect = error
+                owner.prepare_helpers = Mock()
+                with patch('osmo360_driver.runtime.attached_camera_count', return_value=1):
+                    with self.assertRaises(USBChargingError):
+                        owner.prepare_power()
+                self.lease.prepare.assert_called_once()
+                owner.prepare_helpers.assert_not_called()
+                self.assertFalse(owner.power['ready'])
+
+    def test_disable_policy_generic_timeout_does_not_authorize_recovery(self):
+        owner = self.owner()
+        self.external_sleep_lease()
+        self.lease.prepare.side_effect = USBChargingError('Lost SET acknowledgment')
+        owner.prepare_helpers = Mock()
+        with patch('osmo360_driver.runtime.attached_camera_count', return_value=1):
+            with self.assertRaises(USBChargingError):
+                owner.prepare_power()
+        self.lease.prepare.assert_called_once()
+        owner.prepare_helpers.assert_not_called()
+
+    def test_disable_policy_failed_native_recovery_never_retries_charging(self):
+        owner = self.owner()
+        self.lease.prepare.side_effect = self.external_sleep_lease()
+        owner.prepare_helpers = Mock(side_effect=RuntimeError('Native recovery unverified'))
+        with patch('osmo360_driver.runtime.attached_camera_count', return_value=1):
+            with self.assertRaisesRegex(RuntimeError, 'Native recovery unverified'):
+                owner.prepare_power()
+        self.lease.prepare.assert_called_once()
+        owner.prepare_helpers.assert_called_once()
+        self.assertFalse(owner.power['ready'])
 
     def test_only_complete_absence_allows_webcam_without_opening_camera(self):
         owner = self.owner()
