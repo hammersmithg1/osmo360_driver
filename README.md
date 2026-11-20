@@ -207,9 +207,75 @@ UDP-пакетом; остаток отправляется в конце тог
 Для SLAM нужны модель обоих объективов, IMU noise/bias, camera↔IMU extrinsics
 и временная калибровка. Раздельный API — `cam.usb_preview()`, затем `cam.imu()`;
 preview запускайте раньше IMU, поскольку его старт меняет USB-конфигурацию.
-У `USBPreview` доступен сырой блок `calibration`, который не является готовым
-Kalibr YAML. Точный момент экспозиции в timestamp, rolling shutter и синхронизация
+У `USBPreview` доступен блок `calibration`: исходные байты и типизированные
+заводские параметры, если версия поддерживается (см. ниже). Точный момент
+экспозиции в timestamp, rolling shutter и синхронизация
 с часами робота не откалиброваны. ROS-адаптер описан ниже; `ros2_control` hardware interface здесь отсутствует.
+
+### Заводская калибровка и проверка по Aprilgrid
+
+SDK декодирует исходный SEI type245/tag13, не меняя видео или настройки камеры.
+`calibration_decoded` содержит `fx/fy/cx/cy`, **все `k1..k9`, `p1/p2`, `xi`, `s`**
+двух объективов, исходные Euler-поля, размеры калибровки/сенсора/сеток и
+временные поля. В `OsmoCamera.status()` результат лежит в
+`calibration.calibration_decoded`; `calibration_available` означает, что
+поддерживаемый блок получен и разобран. Он сохраняется из raw-пути до потерь
+превью и попадает в снимок источников записи Rover.
+
+Структура проверена по установленному на камере `duml_wl_exteninfo.h`
+(SHA256 `b91d33e01871062ce7c630a70fcb6dfaf05de35624ea73606637707626e267e6`).
+Версия 1 объявляет 219 байт, но может передаваться в 287-байтном union: лишние 68
+байт сохраняются непрозрачно. Они не интерпретируются как кватернионы версии 2.
+Версия 2 имеет 287 байт и добавляет quaternion-поля `w,x,y,z` и temperature.
+Неизвестная/повреждённая калибровка оставляет исходные байты и
+`calibration_decode_error`; видео и IMU продолжают записываться.
+
+Экспорт без подключения камеры, из manifest/status/AU-index JSON или
+исходного H264, записанного с начала потока:
+
+```bash
+python3 -m osmo360_driver.calibration \
+  --input /path/to/session/manifest.json --output factory-native.json
+
+# Отдельное экспериментальное предположение о масштабировании, для проверки:
+python3 -m osmo360_driver.calibration \
+  --input video.h264 --output factory-from-video.json \
+  --resize-seed usb1024-seed.json --lens-width 1024 --lens-height 1024
+```
+
+Файлы не перезаписываются. Если запись началась после единственного tag13,
+используйте manifest: H264 середины потока может не содержать калибровку.
+
+Заводские intrinsics остаются в своей системе координат — в проверенном
+захвате это 3840×3840 на объектив. `sensorWidth/Height` и размеры сеток не
+являются автоматически размером USB-картинки. Crop, порядок объективов и
+pixel-centre convention из tag13 не установлены. Поэтому seed явно содержит
+допущения «без crop», `u_out=sx*u_cal`, `v_out=sy*v_cal`, «00 слева, 01 справа»;
+`stream_mapping_verified` и `aprilgrid_validated` остаются `false`.
+
+Интерпретация `camLensType=8` как KB5 + Brown tangential согласуется с
+[первичным Osmo-декодером telemetry-parser](https://github.com/AdrianEddy/telemetry-parser/blob/master/src/dji/rig.rs).
+Для `xi=s=k6..k9=0` доступен чистый математический `KB5Projection`:
+
+```python
+from osmo360_camera import KB5Projection
+
+# i — intrinsic одного объектива из factory-native.json.
+model = KB5Projection(i['fx'], i['fy'], i['cx'], i['cy'],
+                      tuple(i[f'k{n}'] for n in range(1, 6)), i['p1'], i['p2'])
+pixel = model.project((0.2, 0.1, 1.0))
+unit_ray = model.unproject(pixel)
+```
+
+Математика не подтверждает геометрию USB-потока. Не отбрасывайте `k5` и
+не копируйте коэффициенты в `Kalibr equi`/`OpenCV fisheye`: там только четыре
+радиальных члена, поэтому это не точная конверсия.
+[Поддерживаемые модели Kalibr](https://github.com/ethz-asl/kalibr/wiki/supported-models).
+По Aprilgrid нужно проверить обе физические картинки отдельно, масштаб/crop
+и выбранную модель; camera–IMU transform и временную привязку — отдельным
+этапом. Сшитая панорама и неподтверждённые Euler/quaternion-поля не заменяют
+эту проверку. Единицы `readOutTime`/`ITDValue`/`LROValue` и направление native
+extrinsics заголовок не задаёт; SDK сохраняет их без коррекции timestamps.
 
 ## Параметры камеры
 
@@ -353,6 +419,17 @@ an unknown pending camera operation. Restarting the Pi is not required.
 
 Standard compressed-image consumers should use the JPEG topic. The `h264` topic
 is an original-video archive channel; it needs an H.264 decoder, not compressed_image_transport.
+
+Here, **original/raw H.264 means the camera's received encoder bytes**. It is
+not sensor RAW and does not by itself establish that camera-side electronic
+stabilization is off. The SDK does not apply stabilization or use IMU/fusion
+quaternions to warp images. A dual-fisheye layout and SEI motion metadata also
+do not prove fixed image geometry. `OsmoCamera.status()['video_processing']`
+reports these distinctions explicitly; unverified ISP processing remains
+`unknown`, including when opaque calibration or motion metadata is present.
+Use calibrated physical lens images and camera/IMU timing/extrinsics for VIO;
+a stitched panorama with assumed optics is not a calibrated camera model.
+
 The default ROS adapter exposes independent JPEG images for ROS/SLAM.
 The raw-archive mode described below instead records original H.264 and IMU,
 and constructs playback images later. With the legacy callback path,

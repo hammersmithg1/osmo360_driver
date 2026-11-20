@@ -278,10 +278,10 @@ class VideoStream:
 
     @property
     def calibration(self):
-        """Copy of the first raw calibration_* SEI fields, or None if unseen.
+        """First factory calibration SEI fields, including a typed decode if supported.
 
         Retained independently of image queue drops. These are versioned raw
-        fields, not an asserted optical model or camera-to-IMU transform.
+        fields, not a validated USB image model or camera-to-IMU transform.
         """
         with self._condition:
             return deepcopy(self._calibration)

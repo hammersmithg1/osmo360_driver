@@ -4,6 +4,8 @@ Captured protocol boundaries are covered by tests/test_preview_metadata.py.
 """
 import re
 
+from ..calibration import CalibrationDecodeError, decode_factory_calibration
+
 START_CODE = re.compile(rb"\x00\x00\x00?\x01")
 
 
@@ -56,8 +58,21 @@ def records_from_video(data):
                 raise ValueError("Неполный заголовок TLV")
             tag, length = struct.unpack_from("<HH", payload, cursor)
             value = payload[cursor + 4:cursor + 4 + length]
-            if len(value) != length or len(value) < 5:
+            if len(value) != length:
                 raise ValueError(f"Неполный TLV {tag}")
+            if tag == 13:
+                # A repeated tag uses its last complete value. Do not combine
+                # an earlier successful decode with a later malformed body.
+                for key in tuple(record):
+                    if key.startswith('calibration_'):
+                        del record[key]
+            if len(value) < 5:
+                if tag != 13:
+                    raise ValueError(f"Неполный TLV {tag}")
+                record['calibration_value_hex'] = value.hex()
+                record['calibration_decode_error'] = 'Truncated factory calibration envelope'
+                cursor += 4 + length
+                continue
             version = value[0]
             body_length = struct.unpack_from("<I", value, 1)[0]
             body = value[5:]
@@ -71,6 +86,13 @@ def records_from_video(data):
                                "calibration_value_hex": value.hex()})
                 if body_length < len(body):
                     record["calibration_extension_hex"] = body[body_length:].hex()
+                # Calibration is diagnostic: an unknown version or invalid
+                # optical value must never discard an otherwise valid video
+                # AU or hide its independent motion timestamp.
+                try:
+                    record['calibration_decoded'] = decode_factory_calibration(value)
+                except CalibrationDecodeError as error:
+                    record['calibration_decode_error'] = str(error)
             elif tag == 12:
                 record.update({"motion_version": version,
                                "motion_declared_body_length": body_length,

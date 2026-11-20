@@ -17,6 +17,7 @@ from osmo360_camera import (
 from osmo360_camera.transport import CameraDisconnected, RequestTimeout
 from .clock import CameraClock
 from .jpeg import PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_QUALITY, PreviewEncoder
+from .video_processing import video_processing_contract
 from osmo360_camera._usb_charging import USBChargingError, attached_camera_count
 from osmo360_camera._standby_control import ExternallySleepingOwnerError
 
@@ -233,8 +234,10 @@ class OsmoCamera:
                         mode={'width': 2048, 'height': 1024, 'fps': 30},
                         preview={'width': PREVIEW_WIDTH, 'height': PREVIEW_HEIGHT,
                                  'jpeg_quality': PREVIEW_QUALITY},
-                        projection='dual_fisheye', settings=dict(self.settings), settings_error=self.settings_error,
-                        clock=self.clock.status(), calibration=self.calibration,
+                        projection='dual_fisheye', video_processing=video_processing_contract(),
+                        settings=dict(self.settings), settings_error=self.settings_error,
+                        clock=self.clock.status(), calibration=json_value(self.calibration),
+                        calibration_available='calibration_decoded' in self.calibration,
                         archive_format='h264_annex_b' if self.archive is not None else 'jpeg_h264_legacy',
                         archive=self.archive.status() if self.archive is not None else None,
                         raw_video_age_s=now - self.raw_at if self.raw_at else None,
@@ -615,6 +618,9 @@ class OsmoCamera:
         if archive is not None:
             archive.reset()
         if self.stream is None:
+            # A new camera/stream generation must not inherit another unit's
+            # factory parameters. Warm Sleep/Wake retains its owned session.
+            self.calibration = {}
             self.prepare_power()
             self.connect(wait_ready=False)
             self.prepare_helpers()
@@ -859,6 +865,9 @@ class OsmoCamera:
 
     def raw_video(self, frame):
         """Network producer callback: clock mapping and bounded raw admission."""
+        # Tag13 can occur only on the first AU. Observe it before any preview
+        # decoder/image queue is allowed to drop that picture.
+        self.observe_calibration(frame)
         if frame.timestamp_ns is not None:
             stamp = self.clock.map_unordered(frame.timestamp_ns, frame.host_receive_monotonic_ns)
         else:
@@ -880,6 +889,14 @@ class OsmoCamera:
             except Exception as callback_error:
                 error.add_note('Capture failure notification: ' + str(callback_error))
             raise
+
+    def observe_calibration(self, frame):
+        metadata = getattr(frame, 'metadata', None) or {}
+        calibration = {k: v for k, v in metadata.items() if k.startswith('calibration_')}
+        if calibration:
+            calibration['calibration_source_native_ns'] = frame.timestamp_ns
+            calibration['calibration_source_host_receive_monotonic_ns'] = frame.host_receive_monotonic_ns
+            self.calibration = json_value(calibration)
 
     def video_loop(self):
         try:
@@ -914,9 +931,7 @@ class OsmoCamera:
                     if callback is not _ignore_video:
                         callback(frame, jpegs.full(), stamp)
                 jpeg = jpegs.preview()
-                calibration = {k: v for k, v in frame.metadata.items() if k.startswith('calibration_')}
-                if calibration:
-                    self.calibration = json_value(calibration)
+                self.observe_calibration(frame)
                 last = time.monotonic()
                 # SDK stats include deep lifecycle reports. Snapshot once per
                 # second outside the frame condition, not on every video frame.

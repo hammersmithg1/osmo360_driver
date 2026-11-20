@@ -36,8 +36,14 @@ from ._helper_lifecycle import HelperLifecycleError
 from ._helper_install import HelperInstallError
 from ._startup import StartupError
 from ._usb_charging import USBChargingLease, USBChargingError
+from .calibration import CalibrationDecodeError, decode_factory_calibration
+from .calibration_geometry import CalibrationGeometryError, KB5Projection
 
 __all__ = [
+    "CalibrationDecodeError",
+    "decode_factory_calibration",
+    "CalibrationGeometryError",
+    "KB5Projection",
     "StartupError",
     "Camera",
     "CameraState",
