@@ -26,6 +26,32 @@ class VideoStreamError(RuntimeError):
     """Preview network, metadata, decoder or shutdown failure."""
 
 
+class VideoCaptureStoppedError(VideoStreamError):
+    """Capture failed, but this owner's local link and workers are closed.
+
+    This exception preserves the public stop() error while distinguishing a
+    historical capture cause from a failed shutdown. Its receipt says nothing
+    about camera USB, native leases or DIAG restoration.
+    """
+
+    def __init__(self, stream, capture_error):
+        self._stream = stream
+        self.capture_error = capture_error
+        self._cleanup_receipt = (
+            ('link_stop_succeeded', True), ('video_worker_stopped', True),
+            ('decoder_worker_stopped', True), ('local_cleanup_complete', True),
+        )
+        super().__init__(str(capture_error))
+
+    @property
+    def stream(self):
+        return self._stream
+
+    @property
+    def cleanup_receipt(self):
+        return dict(self._cleanup_receipt)
+
+
 @dataclass
 class VideoFrame:
     timestamp_ns: int | None
@@ -253,6 +279,8 @@ class VideoStream:
         self._calibration = None
         self._started = self._closed = self._stop_requested = self._done = False
         self._thread = self._link = self._decoder = self._av = self._error = None
+        self._capture_error = None
+        self._local_close_receipt = None
         self._metadata_error = None
         self._missing_timestamp = self._first_missing_timestamp = None
         self._latest_video = None
@@ -368,6 +396,7 @@ class VideoStream:
                 raise VideoStreamError("Preview datalink stopped unexpectedly")
         except BaseException as error:
             if not (self._stop_requested and isinstance(error, OSError)):
+                self._capture_error = error
                 self._error = error
         finally:
             try:
@@ -709,26 +738,62 @@ class VideoStream:
     def stop(self, timeout=5):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("stop timeout must be finite and positive")
+        deadline = time.monotonic() + timeout
         with self._condition:
             self._closed = self._stop_requested = True
             link, thread = self._link, self._thread
             if not self._started:
                 self._done = True
                 return self.stats
+        link_error = None
         try:
             link.stop()
         except Exception as error:
+            link_error = error
             if self._error is None:
                 self._error = error
         if thread is not threading.current_thread():
-            thread.join(timeout)
+            thread.join(max(0, deadline - time.monotonic()))
         if thread.is_alive():
             raise VideoStreamError("Video worker did not stop before timeout")
+        if self._done is not True:
+            raise VideoStreamError("Video worker termination was not confirmed")
         if self._preview_decoder is not None:
-            self._preview_decoder.stop(timeout)
+            self._preview_decoder.stop(max(0, deadline - time.monotonic()))
+            if self._preview_decoder.thread.is_alive():
+                raise VideoStreamError("Preview decoder worker did not stop before timeout")
+        if link_error is not None:
+            raise VideoStreamError("Video datalink stop failed: " + str(link_error)) from link_error
+        if self._capture_error is not None and self._error is self._capture_error:
+            raise VideoCaptureStoppedError(self, self._capture_error) from self._capture_error
         if self._error:
             raise VideoStreamError(str(self._error)) from self._error
         return self.stats
+
+    def close_local(self, *, timeout=5):
+        """Prove host link/worker closure without camera or lease restoration.
+
+        Recovery may use this before finalizing an uncertain native owner. The
+        original producer failure remains in stats/read()/stop(); only its
+        strictly typed successful local cleanup is accepted here.
+        """
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('Finite positive local close timeout required')
+        if self._local_close_receipt is not None:
+            return deepcopy(self._local_close_receipt)
+        try:
+            self.stop(timeout=timeout)
+        except VideoCaptureStoppedError as error:
+            if type(error) is not VideoCaptureStoppedError or error.stream is not self:
+                raise
+            receipt = dict(error.cleanup_receipt, capture_failure=dict(
+                type=type(error.capture_error).__name__, message=str(error.capture_error)))
+        else:
+            receipt = dict(link_stop_succeeded=True, video_worker_stopped=True,
+                           decoder_worker_stopped=True, local_cleanup_complete=True)
+        receipt.update(host_only=True, camera_restoration_performed=False)
+        self._local_close_receipt = deepcopy(receipt)
+        return receipt
 
     def __enter__(self):
         return self.start()

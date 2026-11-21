@@ -165,6 +165,10 @@ class OsmoCamera:
         self.enabled = False
         self.busy = self.error = self.capture_error = ''
         self._capture_failure = None
+        self._capture_secondary = []
+        self._capture_failure_lock = threading.RLock()
+        self.previous_capture_failure = self.archive_boundary = None
+        self.recovery = dict(state='idle')
         self._close_failure_sequence = 0
         self.command_started_at = None
         self.preparation = {}
@@ -240,8 +244,11 @@ class OsmoCamera:
                         calibration_available='calibration_decoded' in self.calibration,
                         archive_format='h264_annex_b' if self.archive is not None else 'jpeg_h264_legacy',
                         archive=self.archive.status() if self.archive is not None else None,
+                        archive_boundary=json_value(getattr(self, 'archive_boundary', None)),
+                        previous_capture_failure=json_value(getattr(self, 'previous_capture_failure', None)),
+                        recovery=json_value(getattr(self, 'recovery', dict(state='idle'))),
                         raw_video_age_s=now - self.raw_at if self.raw_at else None,
-                        stats=self.capture_stats)
+                        stats=json_value(self.capture_stats))
 
     def latest(self, after=-1, timeout=0):
         with self.condition:
@@ -524,7 +531,121 @@ class OsmoCamera:
     def require_session_state(self):
         if self.stream is not None and self.stream.state not in ('AWAKE', 'SLEEP'):
             raise RuntimeError('SDK не подтвердил состояние USB-сессии (' + self.stream.state +
-                               '). Выключи и включи только Osmo 360, затем перезапусти драйвер')
+                               '). Запуск потока или перезагрузка выполнят проверяемое восстановление')
+
+    def _recover_session(self):
+        """Ask this exact SDK owner to recover once; never discard uncertainty."""
+        stream = self.stream
+        if stream is None or stream.state in ('AWAKE', 'SLEEP'):
+            return False
+        if stream.state not in ('RECOVERY_REQUIRED', 'RECOVERY_PENDING'):
+            self.require_session_state()
+        recover = getattr(stream, 'recover_and_wait', None)
+        if not callable(recover):
+            raise RuntimeError('SDK не предоставляет проверяемое восстановление USB-сессии')
+        self._interrupt_archive('Восстановление Osmo завершило текущий сегмент записи')
+        self.hold_power('recovering')
+        self.stop_readers()
+        self.state = 'recovering'
+        self.recovery = dict(state='recovering', session_state=stream.state)
+        try:
+            receipt = recover(timeout=120)
+            if (type(receipt) is not dict or receipt.get('state') != 'DETACHED'
+                    or receipt.get('new_boot_verified') is not True or stream.state != 'DETACHED'
+                    or receipt.get('local_retired') is not True or receipt.get('old_boot_extinct') is not True
+                    or not isinstance(receipt.get('boot_id_before'), str)
+                    or not isinstance(receipt.get('boot_id_after'), str)
+                    or receipt['boot_id_before'] == receipt['boot_id_after']):
+                raise RuntimeError('SDK не подтвердил новый boot и освобождение прежней USB-сессии')
+        except Exception as error:
+            self.capture_stats = self.failure_stats(error)
+            self.state = 'error'
+            self.recovery = dict(state='error', session_state=stream.state, causes=error_chain(error),
+                                 report=json_value(getattr(error, 'report', {})))
+            raise RuntimeError('Восстановление USB-сессии Osmo не завершено: ' + str(error)) from error
+        # SDK has already retired Camera's old resources using independent
+        # new-boot proof. Do not run Camera.close/reboot against that new boot.
+        self.recovery = dict(json_value(receipt), state='recovered')
+        self.capture_stats = dict(self.capture_stats, recovery=json_value(receipt))
+        self.stream = None
+        self.helpers_ready = False
+        self._helpers_previous_boot_id = receipt['boot_id_before']
+        self.preparation = dict(recovery=json_value(receipt), boot_id_before=receipt['boot_id_before'],
+                                reboot_attempted=receipt.get('reboot_attempted', True))
+        self._power_rebind_allowed = True
+        with self._capture_failure_lock:
+            # SDK proved all old producers retired; only now can the new camera
+            # boot have a new clock. Historical failure/recording evidence stays.
+            self.clock = CameraClock(self.host_offset_ns)
+            self.raw_at = None
+            self.capture_error = ''
+        return True
+
+    def _begin_capture_epoch(self):
+        # Raw AUs may arrive during SDK start/wake, before start_readers().
+        # Reset the latch now, never after those first producer callbacks.
+        if not hasattr(self, '_capture_failure_lock'):
+            self._capture_failure_lock = threading.RLock()
+        with self._capture_failure_lock:
+            if getattr(self, '_capture_failure', None) is not None:
+                self.previous_capture_failure = dict(
+                    **self._capture_evidence(), epoch=self._capture_failure.get('epoch'),
+                    archive_boundary=json_value(getattr(self, 'archive_boundary', None)))
+            self._capture_failure, self._capture_secondary, self.capture_error = None, [], ''
+            self.capture_stats = {}
+            self.raw_at = None
+
+    def _capture_evidence(self):
+        return dict(capture=json_value(getattr(self, '_capture_failure', None)),
+                    secondary_capture=json_value(getattr(self, '_capture_secondary', [])))
+
+    def _interrupt_archive(self, reason):
+        archive = getattr(self, 'archive', None)
+        if archive is None:
+            return
+        before = archive.status()
+        if before.get('active') or before.get('starting'):
+            self._latch_capture_failure(RuntimeError(reason))
+        # Also fence a begin() that races the snapshot, before any new epoch
+        # can publish an IDR. end() cancels waiters even without active data.
+        archive.end()
+
+    def _latch_capture_failure(self, error, current=None):
+        """Freeze the first cause per epoch; producers never query USB here."""
+        message = (usb_capture_error(current) if current is not None else None) or str(error)
+        failure = dict(message=message, causes=error_chain(error), epoch=self.clock.epoch)
+        with self._capture_failure_lock:
+            first = self._capture_failure is None
+            if first:
+                self._capture_failure = failure
+                self.capture_error = message
+            elif failure != self._capture_failure and failure not in self._capture_secondary:
+                self._capture_secondary = (self._capture_secondary + [failure])[-8:]
+            self.capture_stats = dict(current if current is not None else self.capture_stats,
+                                      failure=self._capture_evidence())
+            self.reader_stop.set()
+            self.enabled = False
+        if first:
+            archive = getattr(self, 'archive', None)
+            if archive is not None:
+                try:
+                    before = archive.status()
+                    if before.get('active') or before.get('starting') or before.get('error'):
+                        self.archive_boundary = dict(reason=message, failure=json_value(failure),
+                            epoch=self.clock.epoch, archive=archive.end(), continuation_requires_new_archive=True)
+                except Exception as boundary_error:
+                    with self._capture_failure_lock:
+                        self._capture_secondary = (self._capture_secondary + [dict(
+                            message='Archive failure boundary', causes=error_chain(boundary_error))])[-8:]
+                        self.capture_stats = dict(self.capture_stats, failure=self._capture_evidence())
+            try:
+                self.on_error(message)
+            except Exception as callback_error:
+                # A notification failure cannot replace the acquisition cause.
+                with self._capture_failure_lock:
+                    self._capture_secondary = (self._capture_secondary + [dict(
+                        message='Capture failure notification', causes=error_chain(callback_error))])[-8:]
+                    self.capture_stats = dict(self.capture_stats, failure=self._capture_evidence())
 
     def stop_readers(self):
         self.reader_stop.set()
@@ -538,12 +659,16 @@ class OsmoCamera:
         with self.condition:
             self.condition.notify_all()
         if self.stream is not None:
-            self.capture_stats = json_value(self.stream.stats)
+            current = json_value(self.stream.stats)
+            with self._capture_failure_lock:
+                self.capture_stats = current
+                if getattr(self, '_capture_failure', None) is not None:
+                    self.capture_stats['failure'] = self._capture_evidence()
 
     def start_readers(self):
+        if getattr(self, '_capture_failure', None) is not None:
+            raise RuntimeError(self._capture_failure['message'])
         self.reader_stop.clear()
-        self.capture_error = ''
-        self._capture_failure = None
         self.frame_times = []
         self.imu_at = None
         self.stats_at = 0
@@ -566,8 +691,7 @@ class OsmoCamera:
             # failed cleanup and final collector cause instead, including a
             # failure reading those pre-close stats before cleanup can begin.
             current = self.failure_stats(error)
-            current['failure'] = dict(capture=getattr(self, '_capture_failure', None),
-                                      close=error_chain(error))
+            current['failure'] = dict(**self._capture_evidence(), close=error_chain(error))
             self.capture_stats = current
             self._close_failure_sequence = getattr(self, '_close_failure_sequence', 0) + 1
             raise
@@ -576,7 +700,7 @@ class OsmoCamera:
             # result, including the collector's final DIAG/transport report.
             self.capture_stats = dict(self.capture_stats, state=self.stream.state, report=json_value(report))
             if getattr(self, '_capture_failure', None) is not None:
-                self.capture_stats['failure'] = dict(capture=self._capture_failure)
+                self.capture_stats['failure'] = self._capture_evidence()
             # Camera.close clears SDK ownership only after verified cleanup.
             self.camera.close()
             self.stream = None
@@ -604,13 +728,41 @@ class OsmoCamera:
             current['state'] = state
         elif isinstance(report, dict) and isinstance(report.get('state'), str):
             current['state'] = report['state']
+        if getattr(self, '_capture_failure', None) is not None:
+            current['failure'] = dict(current.get('failure', {}), **self._capture_evidence())
         return current
 
     def activate(self):
+        # One recovery budget belongs to this user activation. A fresh SDK
+        # start/wake may discover the failure itself; its replacement is tried
+        # once, and a second failure retains that new owner for inspection.
+        recovered = self._recover_session()
+        while True:
+            try:
+                return self._activate_once()
+            except Exception as error:
+                if self.stream is None or getattr(self.stream, 'state', None) not in (
+                        'RECOVERY_REQUIRED', 'RECOVERY_PENDING'):
+                    raise
+                self._latch_capture_failure(error, self.failure_stats(error))
+                if recovered:
+                    raise
+                self._recover_session()
+                recovered = True
+
+    def _activate_once(self):
         self.require_session_state()
+        if (getattr(self, '_capture_failure', None) is not None
+                and self.stream is not None and self.stream.state == 'AWAKE'):
+            # A runtime timeout can latch before the SDK detects transport
+            # failure. Join/close this producer before resetting its epoch;
+            # a failed close retains it for activate()'s recovery budget.
+            self.close_stream()
         # The resumable SDK owns readiness, standby discovery and wake.
         if self.enabled:
             return
+        self._interrupt_archive('Новый запуск Osmo завершил текущий сегмент записи')
+        self._begin_capture_epoch()
         # Raw acquisition can start inside SDK start()/wake(), before the
         # Python reader threads exist. Its clock/GOP must already be current.
         self.clock = CameraClock(self.host_offset_ns)
@@ -714,13 +866,32 @@ class OsmoCamera:
                 self.recheck_power(sleeping=True)
             self.state = 'sleeping'
         elif action == 'reboot':
+            self._interrupt_archive('Перезагрузка Osmo завершила текущий сегмент записи')
+            if self._recover_session():
+                if self.usb_charging is not None:
+                    self.prepare_power(verified_rebind=True)
+                self.read_settings(strict=False)
+                self.state = 'idle'
+                return
             self.require_session_state()
             self.hold_power('usb_transition')
             verified_helpers = getattr(self, '_verified_helpers', None)
-            if self.stream is not None and self.stream.state == 'SLEEP':
-                self.state = 'waking'
-                self.stream.wake()
-            self.close_stream()
+            try:
+                if self.stream is not None and self.stream.state == 'SLEEP':
+                    self.state = 'waking'
+                    self.stream.wake()
+                self.close_stream()
+            except Exception:
+                # Wake or close can discover deferred recovery here.
+                # This explicit reboot is still one request to its SDK owner.
+                if self.stream is None or self.stream.state not in ('RECOVERY_REQUIRED', 'RECOVERY_PENDING'):
+                    raise
+                self._recover_session()
+                if self.usb_charging is not None:
+                    self.prepare_power(verified_rebind=True)
+                self.read_settings(strict=False)
+                self.state = 'idle'
+                return
             self.connect()
             self.state = 'rebooting'
             self.helpers_ready = False
@@ -734,6 +905,8 @@ class OsmoCamera:
                 self.prepare_power(verified_rebind=True)
             self.clock = CameraClock(self.host_offset_ns)
             self.read_settings(strict=False)
+            with self._capture_failure_lock:
+                self.capture_error = ''
             self.state = 'idle'
         elif action == 'configure':
             self.apply_settings(settings)
@@ -753,8 +926,9 @@ class OsmoCamera:
                 try:
                     action, settings = self.commands.get(timeout=0.1)
                 except queue.Empty:
-                    if self.capture_error:
+                    with self._capture_failure_lock:
                         error, self.capture_error = self.capture_error, ''
+                    if error:
                         self.error = error
                         try:
                             self.close_stream()
@@ -774,11 +948,12 @@ class OsmoCamera:
                         self.error += ': ' + str(cause)
                     if self.stream is not None and self._close_failure_sequence == close_failure_sequence:
                         try:
-                            self.capture_stats = json_value(self.stream.stats)
+                            self.capture_stats = self.failure_stats(exc)
                         except Exception:
                             pass  # Preserve the command's original failure.
                     self.state = 'error'
-                    self.on_error(self.error)
+                    if not self.capture_error:
+                        self.on_error(self.error)
                 finally:
                     with self.condition:
                         self.busy = ''
@@ -818,13 +993,7 @@ class OsmoCamera:
 
     def failed(self, error):
         current = self.failure_stats()
-        self.capture_error = usb_capture_error(current) or str(error)
-        self._capture_failure = dict(message=self.capture_error, causes=error_chain(error))
-        current['failure'] = dict(capture=self._capture_failure)
-        self.capture_stats = current
-        self.reader_stop.set()
-        self.enabled = False
-        self.on_error(self.capture_error)
+        self._latch_capture_failure(error, current)
 
     def configure_raw_archive(self, callback):
         """Install a recorder adapter before opening this owner's capture epoch.
@@ -867,27 +1036,19 @@ class OsmoCamera:
         """Network producer callback: clock mapping and bounded raw admission."""
         # Tag13 can occur only on the first AU. Observe it before any preview
         # decoder/image queue is allowed to drop that picture.
-        self.observe_calibration(frame)
-        if frame.timestamp_ns is not None:
-            stamp = self.clock.map_unordered(frame.timestamp_ns, frame.host_receive_monotonic_ns)
-        else:
-            stamp = frame.host_receive_monotonic_ns + self.host_offset_ns
-            self.timestamp_missing_frames += 1
-        self.raw_at = time.monotonic()
         try:
+            self.observe_calibration(frame)
+            if frame.timestamp_ns is not None:
+                stamp = self.clock.map_unordered(frame.timestamp_ns, frame.host_receive_monotonic_ns)
+            else:
+                stamp = frame.host_receive_monotonic_ns + self.host_offset_ns
+                self.timestamp_missing_frames += 1
+            self.raw_at = time.monotonic()
             self.archive.append(frame, stamp)
         except Exception as error:
             # This runs on the network producer. Do not read lifecycle/USB
             # stats here: start() may still be waiting for its first picture.
-            self.capture_error = str(error)
-            self._capture_failure = dict(message=self.capture_error, causes=error_chain(error))
-            self.capture_stats = dict(self.capture_stats, failure=dict(capture=self._capture_failure))
-            self.reader_stop.set()
-            self.enabled = False
-            try:
-                self.on_error(self.capture_error)
-            except Exception as callback_error:
-                error.add_note('Capture failure notification: ' + str(callback_error))
+            self._latch_capture_failure(error)
             raise
 
     def observe_calibration(self, frame):
@@ -936,7 +1097,7 @@ class OsmoCamera:
                 # SDK stats include deep lifecycle reports. Snapshot once per
                 # second outside the frame condition, not on every video frame.
                 if last - self.stats_at >= 1:
-                    self.capture_stats = json_value(self.stream.stats)
+                    self.capture_stats = self.failure_stats()
                     self.stats_at = last
                 with self.condition:
                     self.frame = (jpeg, stamp, last)

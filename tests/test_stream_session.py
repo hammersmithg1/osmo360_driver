@@ -4,6 +4,7 @@ from collections import deque
 import threading
 import types
 import unittest
+from unittest.mock import Mock
 
 from osmo360_camera import _app
 from osmo360_camera import _stream_session as m
@@ -455,9 +456,12 @@ class SessionTests(unittest.TestCase):
         self.assertNotIn("owner.detach", self.env.events)
         self.assertTrue(self.s.owns_camera_resources)
         self.assertFalse(self.s.cleanup_safe)
-        self.s.recover()
-        self.assertIn("owner.finalize", self.env.events)
-        self.assertEqual(self.s.state, "RECOVERY_PENDING")
+        # Explicit recovery now delegates to the shared, separately exercised
+        # reboot coordinator; this fixture has no real D1/host-only producers.
+        coordinator = self.s._recovery_context = Mock()
+        coordinator.run.return_value = dict(state='RECOVERY_PENDING')
+        self.assertEqual(self.s.recover(), dict(state='RECOVERY_PENDING'))
+        coordinator.run.assert_called_once_with(timeout=120, wait=False)
 
     def test_unknown_late_control_uses_local_abandon_not_normal_usb_stop(self):
         self.s.start()

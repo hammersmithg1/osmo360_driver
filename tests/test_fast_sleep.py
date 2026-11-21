@@ -308,10 +308,16 @@ class FastSleepTests(unittest.TestCase):
         self.assertTrue(session._prepare_done.is_set())
         with self.assertRaises(m.StreamSessionError):
             session.close()
+        # This fixture only models Sleep orchestration. Exact D1/source/host
+        # retirement prerequisites live in test_stream_recovery; keep this
+        # regression focused on the failed-to-start worker and delegation.
+        coordinator = session._recovery_context = Mock()
+        coordinator.run.return_value = dict(reboot_requested=True, state='RECOVERY_PENDING')
         result = session.recover()
         self.assertTrue(result["reboot_requested"])
+        coordinator.run.assert_called_once_with(timeout=120, wait=False)
         self.assertEqual(env.events.count("owner.sleep"), 1)
-        self.assertEqual(env.events.count("owner.finalize"), 1)
+        self.assertEqual(env.events.count("owner.finalize"), 0)
 
 
 if __name__ == "__main__":

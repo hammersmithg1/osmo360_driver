@@ -458,6 +458,13 @@ class ResumableUSBStream:
         with self._lock:
             return self._core.recover()
 
+    def recover_and_wait(self, *, timeout=120):
+        with self._lock:
+            result = self._core.recover_and_wait(timeout=timeout)
+            if result.get('state') == 'DETACHED' and result.get('new_boot_verified') is True:
+                self._unknown_shadow = False
+            return result
+
     def close(self):
         with self._lock:
             if self._unknown_shadow:

@@ -133,8 +133,11 @@ S0 не считается завершённым пробуждением. По
 `retain_ecm=True` требует `fast_sleep=True` и проверен на Linux. Для обычного
 пути на macOS используйте `cam.usb_stream()` без этих опций. При завершении
 библиотека проверяет восстановление своей USB-конфигурации и исходной
-DIAG-маски IMU. Не обходите ошибки cleanup принудительным убийством сборщика
+DIAG-маски IMU. Не обходите ошибки cleanup ручным убийством сборщика
 или повтором перехода: исключения и `stream.stats` сохраняют сведения об операции.
+Для неопределённой сессии используйте проверяемое восстановление SDK,
+описанное ниже; оно отдельно подтверждает остановку локальных ресурсов
+и новую загрузку камеры.
 Полное выключение и включение из off в API не входят. `connect(timeout=...)`
 только ждёт уже включённую камеру; `reboot()` выполняет тёплую перезагрузку.
 
@@ -402,10 +405,30 @@ diagnostic snapshots are copied once per second, outside the video frame lock.
 Failed wake reports include the actual prepared backend report and original
 exception chain in `stats.report.wake_failure`.
 
-If the SDK reports `RECOVERY_REQUIRED`, ordinary transitions are blocked:
-the driver must not label an uncertain session as sleeping or repeat wake.
-Stop the driver, power-cycle only the camera, and restart the driver to clear
-an unknown pending camera operation. Restarting the Pi is not required.
+If the SDK reports `RECOVERY_REQUIRED`, start/wake and the explicit reboot
+command use the same bounded recovery path. Ordinary sleep and configuration
+remain blocked until the old session is resolved. Recovery checks the exact
+pending diagnostic task, source hashes and native owner before requesting one
+camera reboot. It never repeats an uncertain wake or diagnostic task. A lost
+reboot acknowledgement leaves the same recovery context available for
+verification; another command does not send a second reboot.
+
+At the lower level, call `stream.recover_and_wait(timeout=120)`. Success returns
+`state='DETACHED'`, different `boot_id_before`/`boot_id_after` and
+`new_boot_verified=True`; only then may the application create a fresh stream.
+`stream.recover()` preserves its request-only contract and returns before
+verification; complete it with `recover_and_wait()` on the same stream.
+Recovery stops the exact owned host collector without its old mask-restoring
+handler, then retires the old USB/network resources only after a different
+camera boot and the installed helper cache are verified. It never writes an
+old boot's DIAG mask or USB configuration into the new boot.
+
+Unknown or still-running diagnostic tasks, changed ownership and unverified
+reboots retain the session and report the specific cause. Physical recovery
+is still necessary when the camera cannot supply this evidence. An automatic
+recovery attempt occurs only on an activation command, not in an idle retry
+loop. Capture failures retain their first cause and end an active archive;
+recording across a camera reboot requires a new archive.
 
 | Topic | Type / contents |
 | --- | --- |
@@ -489,8 +512,9 @@ The earlier `batch_sink` and per-message `sink` remain supported, with archival
 priority `acquisition_sink` → `batch_sink` → `sink` to prevent duplicate delivery.
 A recorder can store full IMU without depending on subscription QoS. Video and
 IMU readers stop and join before any sleep/wake/close transition. Errors retain
-the SDK's verified cleanup behavior; there is no forced collector kill or
-automatic reboot/retry of an uncertain USB owner.
+the SDK's verified cleanup behavior. Normal cleanup never kills the collector.
+The separate uncertain-owner recovery path above can quiesce that exact host
+process before one verified reboot; it does not claim normal mask restoration.
 
 The live JPEG returned by `OsmoCamera.latest()` is a 1024×512, quality-75
 preview. `status()['mode']` still describes the 2048×1024 capture; `preview`

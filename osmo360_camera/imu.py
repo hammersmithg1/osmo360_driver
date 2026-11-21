@@ -297,6 +297,12 @@ class IMUStream:
         self.report_path: Path | None = None
         self._report = None
         self._process = None
+        self._owned_process = None
+        self._local_quiesce_report = None
+        self._reboot_retirement_report = None
+        self._retirement_lock = threading.Lock()
+        self._signal_lock = threading.Lock()
+        self._host_quiescence_selected = False
         self._socket = None
         self._rxq_option = None
         self._socket_report = dict(
@@ -370,6 +376,10 @@ class IMUStream:
             result['collector_live_age_s'] = (max(0, time.monotonic() - self._collector_live_at)
                                                if self._collector_live_at is not None else None)
             result['collector_events'] = [dict(event) for event in self._collector_events]
+            if self._local_quiesce_report is not None:
+                result['host_quiescence'] = deepcopy(self._local_quiesce_report)
+            if self._reboot_retirement_report is not None:
+                result['reboot_retirement'] = deepcopy(self._reboot_retirement_report)
             # stop() has already read this final host-local report. Keep its
             # separate mask/drain proof visible even when IMUStopError stops
             # the outer lifecycle before it can publish last_imu_stop.
@@ -475,6 +485,7 @@ class IMUStream:
                 bufsize=1,
                 start_new_session=True,
             )
+            self._owned_process = self._process
         except BaseException:
             sock.close()
             self._closed = True
@@ -614,9 +625,11 @@ class IMUStream:
                     self._put_many_recent(self._callbacks, samples, "callback_drops")
         except OSError as error:
             self._receiver_error = str(error)
-            if self._process.poll() is None and not self._stop_requested:
-                self._stop_requested = True
-                self._process.send_signal(signal.SIGINT)
+            with self._signal_lock:
+                if (not self._host_quiescence_selected and not self._stop_requested
+                        and self._process.poll() is None):
+                    self._stop_requested = True
+                    self._process.send_signal(signal.SIGINT)
         finally:
             self._socket.close()
             self._receiver_done.set()
@@ -699,6 +712,8 @@ class IMUStream:
         On timeout the process is deliberately left alive to finish restoring;
         call stop again to wait longer. No SIGTERM/SIGKILL escalation occurs.
         """
+        if self._local_quiesce_report is not None and not self._closed:
+            raise IMUStopError('Host-only quiescence replaced normal restoration; verified reboot retirement required')
         if self._closed:
             if self._stop_error:
                 raise IMUStopError(self._stop_error)
@@ -710,13 +725,16 @@ class IMUStream:
             timeout = self.stop_timeout
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("stop timeout must be finite and positive")
-        if not self._stop_requested:
-            self._stop_requested = True
-            if self._process.poll() is None:
-                try:
-                    self._process.send_signal(signal.SIGINT)
-                except ProcessLookupError:
-                    pass
+        with self._signal_lock:
+            if self._host_quiescence_selected:
+                raise IMUStopError('Host-only quiescence forbids the normal restore signal')
+            if not self._stop_requested:
+                self._stop_requested = True
+                if self._process.poll() is None:
+                    try:
+                        self._process.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
         try:
             code = self._process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as error:
@@ -742,6 +760,118 @@ class IMUStream:
                 f"DIAG restoration/quiescence/clean exit not verified (returncode={code})"
             )
             raise IMUStopError(self._stop_error)
+        return report
+
+    def quiesce_local(self, *, timeout=5):
+        """Kill only this owned host collector, without its restore handler.
+
+        Explicit uncertain-owner recovery uses this before a verified reboot.
+        SIGKILL deliberately cannot execute the collector's native DIAG-mask
+        finally. This proves host silence only, never camera restoration.
+        Normal stop() retains its existing non-killing restoration behavior.
+        """
+        return self._quiesce_local(timeout=timeout, kill_owned=True)
+
+    def _quiesce_local(self, *, timeout, kill_owned):
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('Finite positive host quiescence timeout required')
+        deadline = time.monotonic() + timeout
+
+        def remaining():
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise IMUStopError('Host-only collector quiescence deadline; no native recovery allowed')
+            return budget
+
+        if not self._retirement_lock.acquire(timeout=remaining()):
+            raise IMUStopError('Host-only collector quiescence is already running')
+        try:
+            process = self._process
+            if process is not None and process is not self._owned_process:
+                raise IMUStopError('Collector ownership changed; no host signal sent')
+            report = dict(host_only=True, collector_exited=False, workers_stopped=False,
+                          mask_restored=False, native_cleanup_replayed=False,
+                          collector_pid=process.pid if process is not None else None,
+                          kill_sent=False)
+            self._local_quiesce_report = report
+            if not self._signal_lock.acquire(timeout=remaining()):
+                raise IMUStopError('Collector signal selection did not finish before quiescence deadline')
+            try:
+                if self._process is not process or process is not None and self._owned_process is not process:
+                    raise IMUStopError('Collector ownership changed before host quiescence')
+                # Only signal selection/delivery holds this lock. Never wait
+                # for a process or receiver thread while holding it.
+                self._host_quiescence_selected = self._stop_requested = True
+                if process is not None and process.poll() is None:
+                    if not kill_owned:
+                        raise IMUStopError('Live collector after camera reboot; retirement cannot signal or restore it')
+                    remaining()
+                    try:
+                        process.kill()  # Exact owned Popen PID, never a process-name/group search.
+                        report['kill_sent'] = True
+                    except ProcessLookupError:
+                        pass
+            finally:
+                self._signal_lock.release()
+            if process is not None:
+                try:
+                    code = process.wait(timeout=remaining())
+                except subprocess.TimeoutExpired as error:
+                    raise IMUStopError('Owned collector did not exit after host kill; no native recovery allowed') from error
+                if process.poll() is None:
+                    raise IMUStopError('Owned collector exit was not confirmed')
+                report['collector_returncode'] = code
+            report['collector_exited'] = True
+            if self._socket is not None:
+                self._socket.close()
+            for thread in self._threads:
+                if thread is not threading.current_thread():
+                    thread.join(timeout=remaining())
+                if thread.is_alive():
+                    raise IMUStopError('Owned IMU host worker did not stop; no native recovery allowed')
+            output = getattr(process, 'stdout', None) if process is not None else None
+            if output is not None:
+                output.close()
+            remaining()
+            if self._process is not process:
+                raise IMUStopError('Collector ownership changed during host quiescence')
+            self._receiver_done.set()
+            report['workers_stopped'] = True
+            return deepcopy(report)
+        except BaseException as error:
+            if isinstance(self._local_quiesce_report, dict):
+                self._local_quiesce_report['error'] = type(error).__name__ + ': ' + str(error)
+            raise
+        finally:
+            self._retirement_lock.release()
+
+    def retire_after_reboot(self, proof, *, timeout=5):
+        """Retire extinct-boot host state using an exact coordinator proof.
+
+        A live collector is rejected here. Quiescing it must precede reboot;
+        retirement must never invoke its normal mask-restoring stop handler.
+        """
+        from ._stream_recovery import _VerifiedRebootProof
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('Finite positive retirement timeout required')
+        if not isinstance(proof, _VerifiedRebootProof):
+            raise IMUStopError('Verified different-boot proof required for IMU retirement')
+        proof.validate()
+        if not proof.owns_imu(self):
+            raise IMUStopError('Different-boot proof does not own this IMU stream')
+        process = self._process
+        if process is not None and (process is not self._owned_process or process.poll() is None):
+            raise IMUStopError('Collector is live or ownership changed; no post-reboot signal allowed')
+        if self._reboot_retirement_report is not None:
+            return deepcopy(self._reboot_retirement_report)
+        report = self._quiesce_local(timeout=timeout, kill_owned=False)
+        proof.validate()
+        if not proof.owns_imu(self):
+            raise IMUStopError('IMU ownership changed during retirement')
+        report.update(boot_id_before=proof.boot_id_before, boot_id_after=proof.boot_id_after,
+                      old_mask_obsolete_after_verified_reboot=True)
+        self._closed = True
+        self._reboot_retirement_report = deepcopy(report)
         return report
 
     close = stop

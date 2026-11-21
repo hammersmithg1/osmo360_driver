@@ -45,6 +45,7 @@ class RuntimeTests(unittest.TestCase):
         # Replay the hardware GET snapshot, including Program + shutter DF.
         native = json.loads((Path(__file__).parent / 'fixtures/camera_controls_native.json').read_text())['current_gets']
         owner = OsmoCamera.__new__(OsmoCamera)
+        owner._capture_failure_lock = threading.RLock()
         owner.usb_charging = None
         owner.power = dict(requested=None, state='unmanaged', ready=True, error='')
         owner._power_lease = None
@@ -315,12 +316,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(owner.state, 'streaming')
         self.assertEqual(owner.settings['frame_rate'], int(controls.FrameRate.FPS30))
 
-    def test_unknown_session_is_not_reported_as_asleep_or_retried(self):
+    def test_unknown_session_blocks_non_recovery_settings_and_sleep_actions(self):
         owner = self.settings_owner()
         owner.state = 'error'
         owner.stream = Mock(state='RECOVERY_REQUIRED')
         owner.stop_readers = Mock()
-        for action in ('start', 'stop', 'sleep', 'wake', 'reboot', 'refresh', 'configure'):
+        for action in ('stop', 'sleep', 'refresh', 'configure'):
             with self.subTest(action=action), self.assertRaisesRegex(RuntimeError, 'RECOVERY_REQUIRED'):
                 owner.execute(action, {})
         self.assertEqual(owner.state, 'error')

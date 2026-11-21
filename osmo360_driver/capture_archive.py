@@ -12,6 +12,10 @@ import threading
 import time
 
 
+class ArchiveBeginCancelled(RuntimeError):
+    """A stopped/reset archive boundary cannot admit a replacement epoch."""
+
+
 class ArchiveVideo:
     def __init__(self, sink, *, max_bytes=8 * 1024 * 1024):
         if not callable(sink) or type(max_bytes) is not int or max_bytes <= 0:
@@ -26,6 +30,8 @@ class ArchiveVideo:
         self.preroll_units = 0
         self.first_native_ns = self.first_stamp_ns = None
         self.codec_headers_hex = ''
+        self._boundary_generation = 0
+        self._pending_begin = None
 
     def append(self, frame, stamp):
         with self.condition:
@@ -61,51 +67,80 @@ class ArchiveVideo:
         with self.condition:
             if self.active:
                 raise ValueError('Raw archive is already active')
+            if self._pending_begin is not None:
+                raise ValueError('Raw archive is already waiting for its start boundary')
+            generation = self._boundary_generation
+            token = self._pending_begin = object()
             needs_keyframe = not self.valid or not self.cache
-        if needs_keyframe:
-            request_keyframe()
-        with self.condition:
-            while not self.valid or not self.cache:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError('No decodable H.264 IDR boundary before archive deadline')
-                self.condition.wait(remaining)
-            # Holding the same lock as append makes preroll and subsequent live
-            # delivery one ordered sequence: no duplicates or admission gap.
-            self.error = ''
-            self.units = 0
-            self.preroll_units = len(self.cache)
-            self.first_native_ns = self.cache[0][0].timestamp_ns
-            self.first_stamp_ns = self.cache[0][1]
-            self.codec_headers_hex = self.cache[0][0].metadata['h264_codec_headers_hex']
-            try:
-                for frame, stamp in self.cache:
-                    self.sink(frame, stamp)
-                    self.units += 1
-            except Exception as error:
-                self.error = str(error)
-                raise
-            self.active = True
-            self.sessions += 1
-            return self.status()
+
+        def check_boundary():
+            if self._boundary_generation != generation or self._pending_begin is not token:
+                raise ArchiveBeginCancelled('Archive start was cancelled by end/reset; capture boundary changed')
+
+        try:
+            if needs_keyframe:
+                request_keyframe()
+            with self.condition:
+                while True:
+                    check_boundary()
+                    if self.valid and self.cache:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('No decodable H.264 IDR boundary before archive deadline')
+                    self.condition.wait(remaining)
+                # Holding the same lock as append makes preroll and subsequent
+                # live delivery ordered, with no duplicates or admission gap.
+                self.error = ''
+                self.units = 0
+                self.preroll_units = len(self.cache)
+                self.first_native_ns = self.cache[0][0].timestamp_ns
+                self.first_stamp_ns = self.cache[0][1]
+                self.codec_headers_hex = self.cache[0][0].metadata['h264_codec_headers_hex']
+                try:
+                    for frame, stamp in self.cache:
+                        check_boundary()
+                        self.sink(frame, stamp)
+                        check_boundary()
+                        self.units += 1
+                except Exception as error:
+                    if self._boundary_generation == generation:
+                        self.error = str(error)
+                    raise
+                self.active = True
+                self.sessions += 1
+                self._pending_begin = None
+                return self.status()
+        finally:
+            with self.condition:
+                if self._pending_begin is token:
+                    self._pending_begin = None
+                self.condition.notify_all()
 
     def reset(self):
         """Call before a new capture epoch; never reuse pre-reboot GOP bytes."""
         with self.condition:
+            self._boundary_generation += 1
+            self._pending_begin = None
             self.active = self.valid = False
             self.cache.clear()
             self.cache_bytes = self.units = self.preroll_units = 0
             self.first_native_ns = self.first_stamp_ns = None
             self.codec_headers_hex = self.error = ''
+            self.condition.notify_all()
 
     def end(self):
         with self.condition:
+            self._boundary_generation += 1
+            self._pending_begin = None
             self.active = False
+            self.condition.notify_all()
             return self.status()
 
     def status(self):
         with self.condition:
-            return dict(format='h264_annex_b', active=self.active, error=self.error,
+            return dict(format='h264_annex_b', active=self.active,
+                        starting=self._pending_begin is not None, error=self.error,
                         units=self.units, preroll_units=self.preroll_units,
                         first_native_ns=self.first_native_ns, first_stamp_ns=self.first_stamp_ns,
                         codec_headers_hex=self.codec_headers_hex, preroll_frames=self.preroll_units,

@@ -1301,6 +1301,17 @@ class USBStreamSession:
 
     @_lifecycle
     def close(self):
+        with self._lock:
+            if self._state == 'DETACHED':
+                return deepcopy(self.report)
+            if getattr(self, '_recovery_context', None) is not None:
+                # A request-only/lost-ACK recovery owns these exact resource
+                # pins. Normal abandon/rollback must not change them while
+                # the same coordinator is still verifying the reboot.
+                self.report['cleanup_deferred'] = True
+                raise StreamSessionError(
+                    'Owned recovery is incomplete; continue recover_and_wait on this stream',
+                    self.report)
         preparation_deadline = self.clock() + 90
         with self._lock:
             if (
@@ -1424,22 +1435,30 @@ class USBStreamSession:
 
     @_lifecycle
     def recover(self):
-        """Explicit recovery request; does not claim reboot/restoration completed."""
-        self._wait_preparation(timeout=90, allow_error=True)
-        with self._lock:
-            if self._wake_thread is not None:
-                self._wake_thread.join(15)
-                if self._wake_thread.is_alive():
-                    raise StandbyUncertain(
-                        "Wake task still active; no new recovery START",
-                        command_id=self._wake_id,
-                    )
-            if self.reconnect_control is not None:
-                self.control.bind_bootstrap(self.reconnect_control(self.camera))
-            value = self.control.finalize()
-            self.report["explicit_recovery"] = value
-            self._set_state("RECOVERY_PENDING")
-            return value
+        """Request one safe reboot; use recover_and_wait to verify completion.
+
+        The same retained coordinator serves both methods. Calling this method
+        again never resends a possibly delivered finalize request.
+        """
+        return self._recovery_coordinator().run(timeout=120, wait=False)
+
+    def _recovery_coordinator(self):
+        context = getattr(self, '_recovery_context', None)
+        if context is None:
+            from ._stream_recovery import StreamRecovery
+            context = StreamRecovery(self)
+            self._recovery_context = context
+        return context
+
+    @_lifecycle
+    def recover_and_wait(self, *, timeout=120):
+        """Quiesce owned host capture, reboot once, then prove a new boot.
+
+        Timeout/lost ACK retains the exact coordinator. A later call performs
+        verification only; no old USB rollback is applied to the new boot.
+        Success returns DETACHED and permits a fresh camera stream.
+        """
+        return self._recovery_coordinator().run(timeout=timeout)
 
     def __enter__(self):
         return self.start()

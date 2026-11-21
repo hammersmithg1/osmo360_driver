@@ -1,6 +1,7 @@
 """Owned USB live preview: RAM bootstrap, ECM lease, decoded frames, rollback."""
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict
 import importlib.util
 import math
@@ -12,7 +13,7 @@ from ._usb_bootstrap import USBBootstrap
 from ._usb_plan import build_usb_plan
 from . import _host_network
 from .imu import IMUStopError
-from .video import VideoStream
+from .video import VideoCaptureStoppedError, VideoStream
 
 
 class USBPreviewError(RuntimeError):
@@ -314,6 +315,16 @@ class USBPreview:
             if self._stream:
                 try:
                     self._stream.stop()
+                except VideoCaptureStoppedError as error:
+                    if type(error) is VideoCaptureStoppedError and error.stream is self._stream:
+                        # Local producer failure is already reported by read().
+                        # Its exact typed receipt permits normal restoration,
+                        # without claiming native USB or IMU cleanup succeeded.
+                        self.report['video_capture_failure'] = dict(
+                            type=type(error.capture_error).__name__, message=str(error.capture_error),
+                            local_cleanup=error.cleanup_receipt)
+                    else:
+                        errors.append('Video: ' + str(error))
                 except Exception as error:
                     errors.append("Video: " + str(error))
                 finally:
@@ -427,6 +438,52 @@ class USBPreview:
             return self.report
 
     close = stop
+
+    def retire_after_reboot(self, proof, *, timeout=5):
+        """Release extinct-boot host resources without replaying native cleanup.
+
+        Only the recovery coordinator can mint the different-boot proof. The
+        caller retains Camera ownership references until every pinned resource
+        has been retired and the coordinator validates the new generation.
+        """
+        from ._stream_recovery import _VerifiedRebootProof
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('Finite positive retirement timeout required')
+        if not isinstance(proof, _VerifiedRebootProof):
+            raise USBPreviewError('Verified different-boot proof required for host retirement', self.report)
+        deadline = time.monotonic() + timeout
+
+        def check():
+            proof.validate(self.camera)
+            if not proof.owns_preview(self):
+                raise USBPreviewError('Different-boot proof does not own this preview', self.report)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Host preview retirement deadline')
+            return remaining
+
+        check()
+        previous = self.report.get('retired_after_reboot')
+        if previous is not None:
+            return deepcopy(previous)
+        receipt = dict(host_only=True, native_cleanup_replayed=False,
+                       native_restored=False, boot_id_before=proof.boot_id_before,
+                       boot_id_after=proof.boot_id_after)
+        if self._stream is not None:
+            receipt['video'] = self._stream.close_local(timeout=check())
+            check()
+        if self._lease is not None:
+            check()
+            receipt['lease'] = self._lease.stop(close_camera=False)
+            check()
+        check()
+        self._cleanup_host_network()
+        check()
+        receipt['host_network'] = deepcopy(self.report.get('host_network_cleanup'))
+        self._closed = True
+        self.report['restored'] = False
+        self.report['retired_after_reboot'] = deepcopy(receipt)
+        return receipt
 
     def __enter__(self):
         return self.start()
